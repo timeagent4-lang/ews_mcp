@@ -1,0 +1,24 @@
+# Local source photographs (not part of the deliverable)
+/images/
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Deployment secrets and runtime data
+.env
+.env.*
+*.pem
+*.key
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+/data/
+/exports/
+/dist/
