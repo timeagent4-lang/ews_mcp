@@ -1,0 +1,47 @@
+# 本地补全的部署参考配置；未与内网配置逐字核对。
+services:
+  ews-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      secrets:
+        - pip_conf
+    image: ews-mcp:dev
+    container_name: ews-mcp-dev
+    restart: unless-stopped
+    ports:
+      - "7712:7805"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request, sys; response = urllib.request.urlopen('http://127.0.0.1:7805/healthz', timeout=3); status = response.status; response.close(); sys.exit(0 if status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    env_file:
+      - .env
+    environment:
+      EWS_MCP_HOST: "0.0.0.0"
+      EWS_MCP_PORT: "7805"
+      EWS_MCP_DATA_DIR: /data/ews_mcp
+    volumes:
+      - ./.env:/app/.env:ro
+      - ews_mcp_data:/data/ews_mcp
+    networks:
+      - genie
+
+networks:
+  genie:
+    external: true
+    name: joyagent-jdgenie_liamleo_genie-network
+
+volumes:
+  ews_mcp_data:
+
+# 部署机提供的 pip 配置，仅供构建时挂载。
+secrets:
+  pip_conf:
+    file: ./secrets/pip.conf

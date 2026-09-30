@@ -11,6 +11,9 @@ venv/
 # Deployment secrets and runtime data
 .env
 .env.*
+!.env.example
+/secrets/*
+!/secrets/pip.conf.example
 *.pem
 *.key
 *.db
@@ -20,5 +23,13 @@ venv/
 *.sqlite3
 *.log
 /data/
+/.data/
 /exports/
 /dist/
+
+# Local tooling outputs
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+/build/

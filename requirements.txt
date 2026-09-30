@@ -11,3 +11,8 @@ PyMySQL==1.2.0
 pycryptodome==3.23.0
 json-repair==0.63.2
 mcp==1.29.0
+# Imported directly by mcp_server.py / attachment_downloads.py. They arrive
+# transitively through mcp today, but pin them so a transitive change cannot
+# break the image at import time.
+jsonschema==4.26.0
+starlette==1.6.0

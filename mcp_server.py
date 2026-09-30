@@ -17,8 +17,9 @@ import mcp.types as mcp_types
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 from fastmcp.server.middleware import Middleware
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools.tool import FunctionTool, ParsedFunction, ToolResult
 from jsonschema import Draft202012Validator
+from starlette.middleware import Middleware as HTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -38,6 +39,7 @@ from confirmation import (
     get_store,
 )
 from outlook_client import OutlookClient
+import team_directories
 from tool_specs import READ_TOOLS, SPECS, TOOL_NAMES
 from tool_support import ToolOperationError, is_definite_rejection, sanitize
 from utils.audit import (
@@ -48,6 +50,7 @@ from utils.audit import (
 from utils.lanid_email import (
     IdentityNameMismatchError,
     IdentityResolutionError,
+    normalize_lanid,
     resolve_identity_by_lanid,
 )
 
@@ -69,16 +72,45 @@ _INPUT_VALIDATORS = {
 }
 
 
+_SCHEMA_ERROR_MESSAGES = {
+    "INVALID_DATETIME": "时间格式无效，请使用 ISO 日期时间。",
+    "INVALID_PAGINATION": "分页参数无效，请检查 offset／limit 的类型与范围。",
+    "INVALID_FOLDER": "文件夹参数无效，请使用 list_folders 返回的别名。",
+    "INVALID_BODY_FORMAT": "正文格式无效：body_format 仅支持 text 或 html（create_draft 的 html 仅限 mode=new；update_draft 的 html 用于 replace 整体替换或 prepend 前置片段，但 prepend+html 要求目标草稿本身已是 HTML）。",
+    "INVALID_BODY_ACTION": "正文处理方式无效：body_action 仅支持 replace 或 prepend。",
+    "BODY_PARAM_REQUIRES_BODY": "body_format/body_action 仅在提供 body 时生效；只改收件人或主题时请省略 body 及这两个参数。",
+    "INVALID_PARAMS": "参数不符合公开 schema：请检查必填字段、类型、范围及预览／确认／仅回执查询的参数组合。",
+}
+
+
+def _schema_error_code(schema, error):
+    """Map a JSON-schema violation to a public error code.
+
+    Only fields annotated with ``x-error-code`` in the tool spec keep a
+    fine-grained code. Identity fields, unknown properties and the
+    preview/confirm/query ``oneOf`` combinations fall through to
+    INVALID_PARAMS, so a schema failure is never reported as an identity or a
+    business rejection.
+    """
+    node = schema
+    for part in error.absolute_path:
+        properties = node.get("properties") if isinstance(node, dict) else None
+        node = (properties or {}).get(str(part))
+        if node is None:
+            return "INVALID_PARAMS"
+    code = node.get("x-error-code") if isinstance(node, dict) else None
+    return code if code in _SCHEMA_ERROR_MESSAGES else "INVALID_PARAMS"
+
+
 def _validate_arguments(tool_name, arguments):
     validator = _INPUT_VALIDATORS.get(tool_name)
     if validator is None:
         raise ToolOperationError("UNKNOWN_TOOL", "该工具未注册或已禁用。")
-    if not validator.is_valid(arguments):
+    error = next(validator.iter_errors(arguments), None)
+    if error is not None:
+        code = _schema_error_code(validator.schema, error)
         # Never echo the invalid instance: it may contain a confirmation token.
-        raise ToolOperationError(
-            "INVALID_PARAMS",
-            "参数不符合公开 schema：请检查必填字段、类型、范围及预览／确认／仅回执查询的参数组合。",
-        )
+        raise ToolOperationError(code, _SCHEMA_ERROR_MESSAGES[code])
 
 
 class ToolInputValidationMiddleware(Middleware):
@@ -164,12 +196,27 @@ def _resolve_mailbox(params: dict, ctx: Context | None) -> str:
     return mailbox
 
 
+def requester_lanid(params: dict) -> str:
+    """The OA-verified employee LANID, used only to match directory allow-lists.
+
+    ``config.lanid`` is the fixed service account, never an employee identity, so
+    it must not be used for authorization. An unusable value returns "" - the
+    shared directory then stays closed instead of guessing who is calling.
+    """
+    try:
+        return normalize_lanid(params.get("lanid"))
+    except IdentityResolutionError:
+        return ""
+
+
 def initialize_outlook_client(params: dict, ctx: Context | None, *, mailbox=None) -> OutlookClient:
     """Connect via fixed DELEGATE creds after OA resolution."""
     if mailbox is None:
         mailbox = _resolve_mailbox(params, ctx)
     config = OutlookConfig.from_service_env(mailbox)
-    return OutlookClient(config)
+    client = OutlookClient(config)
+    client.requester_lanid = requester_lanid(params)
+    return client
 
 
 # Errors that mean the server answered but the payload could not be parsed:
@@ -388,8 +435,50 @@ def _require_record_scope(tool_name, mailbox, record):
         )
 
 
-def _receipt(tool_name: str, record, *, mailbox, replay=False) -> ToolResult:
+def _require_directory_read(record, lanid) -> None:
+    """Re-check shared-directory read permission before a stored record is returned.
+
+    A record can outlive the authorization it was created under. Receipts,
+    completed replays and idempotency replays all read the directory context from
+    the record, so every one of them passes through here: once an employee is
+    removed from the allow-list, no replay can hand the shared data back.
+    """
+    directory_id = ((record or {}).get("business_params") or {}).get("directory_id")
+    if not directory_id:
+        return
+    spec = team_directories.get_directory(directory_id)
+    team_directories.authorize(spec, lanid, write=False)
+
+
+def _verified_directory_target(record, params):
+    """Confirm-time re-check of a shared-directory write; returns the target to use.
+
+    Takes the raw ``params`` (not ``_business(params)``), because the LANID that
+    the directory allow-list matches on is a control field.
+
+    Two things must still hold when the confirmation is presented: the employee
+    keeps create permission, and the configured target is byte-for-byte the one
+    the preview resolved. If an administrator has re-pointed the directory (or the
+    registration version changed), the old confirmation is refused rather than
+    writing into the new folder. ``None`` means "not a shared-directory write".
+    """
+    directory_id = params.get("directory_id")
+    if not directory_id:
+        return None
+    spec = team_directories.get_directory(directory_id)
+    team_directories.authorize(spec, requester_lanid(params), write=True)
+    persisted = (record["details"] or {}) if record is not None else {}
+    if persisted.get("target") != spec.identity():
+        raise ConfirmationError(
+            "DIRECTORY_TARGET_CHANGED",
+            "目标目录配置已变更，本次确认不会执行；请重新预览后再确认。",
+        )
+    return spec
+
+
+def _receipt(tool_name: str, record, *, mailbox, lanid=None, replay=False) -> ToolResult:
     _require_record_scope(tool_name, mailbox, record)
+    _require_directory_read(record, lanid)
     status = record["status"]
     result = record["result"]
     if result is None and status not in (STATUS_COMPLETED, STATUS_PARTIAL):
@@ -457,14 +546,14 @@ def _receipt(tool_name: str, record, *, mailbox, replay=False) -> ToolResult:
     structured = {**payload, **({"note": note} if note else {})}
     return ToolResult(content=f"{tool_name} {status}", structured_content=structured)
 
-def _query_receipt(tool_name: str, operation_id: str, mailbox: str) -> ToolResult:
+def _query_receipt(tool_name: str, operation_id: str, mailbox: str, lanid=None) -> ToolResult:
     record = get_store().get(operation_id)
     if record is None:
         return _tool_failure(
             tool_name, error_code="OPERATION_UNKNOWN", results=None,
             operation_id=operation_id,
         )
-    return _receipt(tool_name, record, mailbox=mailbox)
+    return _receipt(tool_name, record, mailbox=mailbox, lanid=lanid)
 
 
 def _preview_expired(record) -> bool:
@@ -493,13 +582,14 @@ def _require_unexpired_preview(record):
         )
 
 
-def _preview_replay(tool_name: str, record, *, mailbox) -> ToolResult:
+def _preview_replay(tool_name: str, record, *, mailbox, lanid=None) -> ToolResult:
     """Replay a still-valid, unexecuted preview: same details, same token.
 
     Nothing is written and the caller may confirm with this exact
     operation_id / confirm_token pair.
     """
     _require_record_scope(tool_name, mailbox, record)
+    _require_directory_read(record, lanid)
     return ToolResult(
         content=f"{tool_name} 待确认（预览返回）",
         structured_content={
@@ -532,6 +622,7 @@ def _classify_write_result(result):
 
 def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
     mailbox = _resolve_mailbox(params, ctx)
+    lanid = requester_lanid(params)
     store = get_store()
     operation_id = params.get("operation_id")
     confirm_token = params.get("confirm_token")
@@ -540,7 +631,7 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
 
     # (1) operation_id alone is a query; never executes.
     if operation_id and not confirm_token:
-        return _query_receipt(tool_name, operation_id, mailbox)
+        return _query_receipt(tool_name, operation_id, mailbox, lanid=lanid)
 
     # (2) idempotency replay: a known key returns its receipt and never
     #     re-executes. Skipped when a confirm_token is present: that is an
@@ -556,11 +647,11 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
             if status != STATUS_PENDING:
                 # Terminal/in-flight for this key: replay the receipt and never
                 # reactivate it, whatever it was.
-                return _receipt(tool_name, record, mailbox=mailbox, replay=True)
+                return _receipt(tool_name, record, mailbox=mailbox, lanid=lanid, replay=True)
             if not _preview_expired(record):
                 # Still-valid unexecuted preview: hand back its details and the
                 # same token so the caller can confirm it.
-                return _preview_replay(tool_name, record, mailbox=mailbox)
+                return _preview_replay(tool_name, record, mailbox=mailbox, lanid=lanid)
             # Expired preview: fall through to build a fresh preview. The stale
             # row is left untouched and the new one is a distinct operation, so
             # nothing executing/unknown/completed is ever revived.
@@ -583,33 +674,43 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
             STATUS_UNKNOWN,
             STATUS_EXECUTING,
         ):
-            return _receipt(tool_name, existing, mailbox=mailbox, replay=True)
+            return _receipt(tool_name, existing, mailbox=mailbox, lanid=lanid, replay=True)
         if existing is not None and _is_batch_result(existing["result"]):
             # A batch that already ran reported per-item outcomes. Re-claiming it
             # would re-run the WHOLE batch - the "整批重试" we must never do. The
             # per-item receipt tells the caller what to retry instead.
-            return _receipt(tool_name, existing, mailbox=mailbox, replay=True)
+            return _receipt(tool_name, existing, mailbox=mailbox, lanid=lanid, replay=True)
         try:
             _require_unexpired_preview(existing)
+            # Re-check the shared-directory target and create permission BEFORE
+            # connecting or claiming: a stale confirmation must never write into
+            # a re-pointed folder, and the record stays pending so a re-preview is
+            # the only way forward.
+            verified_target = _verified_directory_target(existing, params)
             # Connect before claiming, so connection failure leaves pending.
             # Connection setup may cross the TTL; check again before execution.
             client = initialize_outlook_client(params, ctx, mailbox=mailbox)
             _require_unexpired_preview(existing)
             store.begin_confirm(operation_id, confirm_token, business)
-        except ConfirmationError as exc:
-            if exc.code == "CONFIRMATION_NOT_EXECUTABLE":
+        except (ConfirmationError, ToolOperationError) as exc:
+            if isinstance(exc, ConfirmationError) and exc.code == "CONFIRMATION_NOT_EXECUTABLE":
                 current = store.get(operation_id)
                 if current is not None:
-                    return _receipt(tool_name, current, mailbox=mailbox, replay=True)
+                    return _receipt(tool_name, current, mailbox=mailbox, lanid=lanid, replay=True)
             return _tool_failure(tool_name, exc=exc, operation_id=operation_id)
         try:
-            result = getattr(client, tool_name)(
-                **business, confirm=True, confirmation_id=confirm_token
-            )
-            status, final_result = _classify_write_result(result)
-            store.mark(operation_id, status, result=final_result)
-            record = store.get(operation_id)
-            return _receipt(tool_name, record, mailbox=mailbox)
+            execute = {**business, "confirm": True, "confirmation_id": confirm_token}
+            recorded_version = (existing.get("details") or {}).get("version")
+            if recorded_version is not None:
+                # The preview snapshotted the target's version; hand the server's
+                # own copy back so the handler can refuse a draft that was edited
+                # between preview and confirm. Callers never supply this value.
+                execute["expected_version"] = recorded_version
+            if verified_target is not None:
+                # Execute against the target that was just verified, not a second
+                # resolution that could disagree with it.
+                execute["directory_target"] = verified_target
+            result = getattr(client, tool_name)(**execute)
         except Exception as exc:
             # Default is UNKNOWN: only a named, definite rejection proves nothing
             # was written. Ambiguous outcomes are never auto-retried.
@@ -620,6 +721,12 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
                 result=_failure_record(exc),
             )
             return _tool_failure(tool_name, exc=exc, operation_id=operation_id)
+        # Bookkeeping and the receipt stay OUTSIDE that handler: the write has
+        # already happened, so no later failure here may rewrite its terminal
+        # status (that would invite a duplicate create).
+        status, final_result = _classify_write_result(result)
+        store.mark(operation_id, status, result=final_result)
+        return _receipt(tool_name, store.get(operation_id), mailbox=mailbox, lanid=lanid)
 
     # (3) preview: run the handler read-only, persist a pending operation.
     client = initialize_outlook_client(params, ctx, mailbox=mailbox)
@@ -653,7 +760,7 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
 
 def _dispatch(tool_name: str, params: dict, ctx: Context) -> ToolResult:
     try:
-        _validate_arguments(tool_name, {"params": params})
+        _validate_arguments(tool_name, params)
         if tool_name in READ_TOOLS:
             return _invoke_read(tool_name, params, ctx)
         return _run_write(tool_name, params, ctx)
@@ -663,7 +770,7 @@ def _dispatch(tool_name: str, params: dict, ctx: Context) -> ToolResult:
 
 # ---- register the current enabled tools with the unified schema ----
 def _make_handler(tool_name):
-    def handler(params: dict = None, ctx: Context = None) -> ToolResult:
+    def handler(ctx: Context = None, **params) -> ToolResult:
         return _dispatch(tool_name, params, ctx)
 
     handler.__name__ = f"tool_{tool_name}"
@@ -673,8 +780,11 @@ def _make_handler(tool_name):
 def _register_all():
     for name in TOOL_NAMES:
         spec = SPECS[name]
-        tool = mcp.tool(name=name, description=spec["description"])(_make_handler(name))
-        tool.parameters = spec["inputSchema"]
+        parsed = ParsedFunction.from_function(_make_handler(name), validate=False)
+        mcp.add_tool(FunctionTool(
+            fn=parsed.fn, name=name, description=spec["description"],
+            parameters=spec["inputSchema"], output_schema=parsed.output_schema,
+        ))
 
 
 _register_all()
@@ -694,6 +804,34 @@ async def healthz(request: Request):
     )
 
 
+class MCPKeyAuthMiddleware:
+    """Gate every HTTP request to the MCP endpoint behind a shared key.
+
+    Deliberately scoped to ``/mcp`` only: ``/healthz`` (liveness probe) and the
+    signed ``/downloads/{identifier}`` routes stay open, so the container
+    healthcheck and attachment links keep working.
+    """
+
+    def __init__(self, app, api_key: str):
+        self.app = app
+        self.api_key = api_key.encode("utf-8")
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"].rstrip("/") == "/mcp":
+            request = Request(scope)
+            keys = request.query_params.getlist("key")
+            if len(keys) != 1 or not secrets.compare_digest(
+                keys[0].encode("utf-8"), self.api_key
+            ):
+                response = JSONResponse(
+                    {"error": "Invalid or missing API key"},
+                    status_code=401,
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 def main():
     # Persistent confirmation store lives under the data dir (required).
     store = configure_store(os.path.join(data_dir(), "operations.db"))
@@ -702,8 +840,21 @@ def main():
     atexit.register(store.close)
     host = os.getenv("EWS_MCP_HOST", "127.0.0.1")
     port = int(os.getenv("EWS_MCP_PORT", "7805"))
+    api_key = os.getenv("EWS_MCP_API_KEY", "")
+    if not api_key.strip():
+        raise ValueError("缺少 EWS_MCP_API_KEY")
     logger.info("EWS MCP listening on %s:%s", host, port)
-    mcp.run(transport="sse", host=host, port=port)
+    mcp.run(
+        transport="streamable-http",
+        host=host,
+        port=port,
+        path="/mcp",
+        middleware=[
+            HTTPMiddleware(MCPKeyAuthMiddleware, api_key=api_key),
+        ],
+        # Avoid writing the key, which travels in the query string, to the log.
+        uvicorn_config={"access_log": False},
+    )
 
 
 if __name__ == "__main__":

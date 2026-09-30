@@ -2,9 +2,10 @@
 
 import hashlib
 import re
+from html import escape as _html_escape
 
-from exchangelib import Mailbox, Message
-from exchangelib.items.base import MOVE_TO_DELETED_ITEMS
+from exchangelib import HTMLBody, Mailbox, Message
+from exchangelib.items.base import MOVE_TO_DELETED_ITEMS, NEVER_OVERWRITE
 
 from tool_support import (
     ToolOperationError,
@@ -98,6 +99,150 @@ def _failure(item_id, exc):
     return result
 
 
+def _new_body(text, source_body):
+    """Serialize caller-supplied plain text with ``source_body``'s BodyType.
+
+    A bare Python ``str`` reaches ``BodyField.clean()``, which coerces it to
+    ``Body`` -> ``BodyType="Text"``. Exchange then flattens the *whole* composed
+    item to plain text, so a quoted HTML original loses its tables and its
+    inline images lose the ``cid:`` reference that kept them out of the
+    attachment list. Mirroring the source item's BodyType keeps an HTML thread
+    HTML.
+
+    The caller string is never treated as trusted HTML: it is escaped, and
+    newlines become ``<br>`` so they survive HTML whitespace collapsing. The
+    quoted original is left to Exchange's native reply/forward (reference item
+    id) -- we only supply the new content.
+    """
+    text = str(text or "")
+    if isinstance(source_body, HTMLBody):
+        return HTMLBody(_html_escape(text).replace("\n", "<br>"))
+    return text
+
+
+# The opening <body ...> tag. Only used to find a splice anchor, never to pick
+# apart the markup: everything between anchors is copied through untouched.
+_BODY_OPEN_RE = re.compile(r"<body\b[^>]*>", re.IGNORECASE)
+
+
+def _body_sha256(value):
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def _prepend_html(existing, snippet):
+    """Splice ``snippet`` in at the top of an HTML body's content.
+
+    The markup that is already there is never parsed and re-serialized -- the
+    new fragment is inserted straight after the opening ``<body ...>`` tag (or
+    in front of a bare fragment), so tables, inline ``style=`` attributes,
+    ``cid:`` image references and their attachment ContentIds survive byte for
+    byte. A full document with no locatable ``<body>`` is refused rather than
+    guessed at: rebuilding the body would silently drop Outlook's own markup.
+    """
+    existing = str(existing or "")
+    if not existing.strip():
+        return snippet
+    match = _BODY_OPEN_RE.search(existing)
+    if match:
+        if not match.group(0).rstrip().endswith("/>"):
+            return existing[:match.end()] + snippet + existing[match.end():]
+    elif not re.search(r"<html\b|<!doctype", existing, re.IGNORECASE):
+        # No <body> and not a document: a bare fragment. Prefix it verbatim.
+        return snippet + existing
+    raise ToolOperationError(
+        "BODY_PREPEND_UNSUPPORTED",
+        "无法在现有 HTML 正文中可靠定位插入位置，已拒绝写入；请改用 body_action=replace。",
+    )
+
+
+def _prepend_body(source_body, text):
+    """Existing body with ``text`` added at its start, BodyType preserved.
+
+    Only the new text is escaped; whatever is already in the draft is carried
+    through as is, in the BodyType it already has, so an HTML thread stays HTML
+    and a plain-text one stays plain text.
+    """
+    text = str(text or "")
+    if isinstance(source_body, HTMLBody):
+        snippet = _html_escape(text).replace("\n", "<br>")
+        return HTMLBody(_prepend_html(str(source_body or ""), snippet))
+    existing = str(source_body or "")
+    if not existing.strip():
+        return text
+    return f"{text}\n{existing}"
+
+
+# Anything that marks a whole document rather than a fragment. A full document
+# is refused instead of having its <body> extracted: the <head> can carry the
+# styles, and silently dropping it would change how the content renders.
+_DOCUMENT_MARKER_RE = re.compile(r"<\s*(!doctype|html|head|body)\b", re.IGNORECASE)
+# cid: URL references to inline images, e.g. src="cid:logo@contoso".
+_CID_REF_RE = re.compile(r"""cid:\s*([^"'\s)>]+)""", re.IGNORECASE)
+
+
+def _validate_html_fragment(fragment):
+    """Refuse a whole HTML document where a fragment is required."""
+    text = str(fragment or "")
+    if not text.strip():
+        raise ToolOperationError("HTML_FRAGMENT_REQUIRED", "前置 HTML 片段不能为空。")
+    if _DOCUMENT_MARKER_RE.search(text):
+        raise ToolOperationError(
+            "HTML_FRAGMENT_REQUIRED",
+            "前置内容只接受 HTML 片段（如 <p>、<table>、<div>），不支持含 html/head/body/doctype "
+            "的完整文档；请只提交片段本身，本次不自动提取 body，以免 <head> 中的样式被静默丢弃。",
+        )
+    return text
+
+
+def _missing_cid_refs(fragment, attachments):
+    """ContentIds referenced by ``fragment`` that no existing attachment provides.
+
+    The new fragment is submitted as-is, so an inline image reference it makes
+    must resolve to an attachment already on the draft. This version never
+    uploads images, so a dangling reference is refused rather than written out
+    as a broken image.
+    """
+    referenced = {
+        match.group(1).strip().strip("<>").lower()
+        for match in _CID_REF_RE.finditer(str(fragment or ""))
+    }
+    if not referenced:
+        return set()
+    available = {
+        str(content_id).strip().strip("<>").lower()
+        for content_id in (
+            getattr(attachment, "content_id", None) for attachment in attachments or []
+        )
+        if content_id
+    }
+    return referenced - available
+
+
+def _html_prepend_body(draft, fragment):
+    """Existing HTML body with a raw HTML ``fragment`` spliced in at its start.
+
+    Unlike ``_prepend_body`` the fragment is not escaped -- it is HTML the
+    caller authored. The original body is still carried through byte for byte
+    by ``_prepend_html``; only a draft that is already HTML can receive it, and
+    any inline image the fragment references must already exist on the draft.
+    """
+    if not isinstance(draft.body, HTMLBody):
+        raise ToolOperationError(
+            "INVALID_BODY_FORMAT",
+            "纯文本草稿不支持前置 HTML 片段；请改传纯文本新增内容，或先用 body_action=replace "
+            "把草稿正文转为 HTML（本次不做隐式格式转换）。",
+        )
+    missing = _missing_cid_refs(fragment, draft.attachments)
+    if missing:
+        raise ToolOperationError(
+            "CID_ATTACHMENT_MISSING",
+            "新增片段引用的内嵌图片在草稿现有附件中不存在："
+            + ", ".join(sorted(missing))
+            + "；本次不提供图片上传，请改为引用草稿中已有内嵌图片的 ContentId，或不引用内嵌图片。",
+        )
+    return HTMLBody(_prepend_html(str(draft.body or ""), fragment))
+
+
 def _ordinary_message(item):
     # Meeting requests/cancellations are separate SDK classes and have other side effects.
     if type(item) is not Message:
@@ -160,12 +305,22 @@ class WriteOperations:
         cc_emails="",
         bcc_emails="",
         mode="new",
+        body_format="text",
         reply_to=None,
         confirm=False,
         confirmation_id=None,
     ):
         if mode not in ("new", "reply", "reply_all", "forward"):
             raise ToolOperationError("INVALID_DRAFT_MODE", "不支持的草稿类型。")
+        if body_format not in ("text", "html"):
+            raise ToolOperationError("INVALID_BODY_FORMAT", "body_format 仅支持 text 或 html。")
+        if body_format == "html" and mode != "new":
+            # 回复/转发的新增文本始终按纯文本转义；引用原文自带格式。若把调用方
+            # 的字符串直接当 HTML，等于让调用方替换掉整封信的标记与引文。
+            raise ToolOperationError(
+                "INVALID_BODY_FORMAT",
+                "HTML 正文仅支持 mode=new；回复/转发请传纯文本，引用原文的格式由 Exchange 保留。",
+            )
         author = Mailbox(email_address=self.config.email)
         recipients = [_recipients(to_emails), _recipients(cc_emails), _recipients(bcc_emails)]
         folder = self._tool_folder("drafts")
@@ -178,7 +333,10 @@ class WriteOperations:
                 folder=folder,
                 author=author,
                 subject=subject,
-                body=body,
+                # html is used verbatim by explicit request; the default text path
+                # keeps handing exchangelib a plain str (coerced to Body/Text), so
+                # nothing changes for callers that never ask for HTML.
+                body=HTMLBody(body) if body_format == "html" else body,
                 to_recipients=to,
                 cc_recipients=cc,
                 bcc_recipients=bcc,
@@ -195,7 +353,7 @@ class WriteOperations:
                 to, cc, bcc = _deduplicate(recipients)
                 draft = original.create_forward(
                     subject=target_subject,
-                    body=body,
+                    body=_new_body(body, original.body),
                     to_recipients=to,
                     cc_recipients=cc,
                     bcc_recipients=bcc,
@@ -232,13 +390,15 @@ class WriteOperations:
                         "REPLY_RECIPIENT_REQUIRED", "原邮件没有可用的回复收件人，请明确指定。"
                     )
                 if mode == "reply_all":
-                    draft = original.create_reply_all(subject=target_subject, body=body, author=author)
+                    draft = original.create_reply_all(
+                        subject=target_subject, body=_new_body(body, original.body), author=author
+                    )
                     # SDK defaults copy Bcc and ignore Reply-To; replace all recipient fields.
                     draft.to_recipients, draft.cc_recipients, draft.bcc_recipients = to, cc, bcc
                 else:
                     draft = original.create_reply(
                         subject=target_subject,
-                        body=body,
+                        body=_new_body(body, original.body),
                         to_recipients=to,
                         cc_recipients=cc,
                         bcc_recipients=bcc,
@@ -256,6 +416,7 @@ class WriteOperations:
                 "cc": cc_emails,
                 "bcc": bcc_emails,
                 "mode": mode,
+                "body_format": body_format,
                 "reply_to": reply_to,
             }],
             confirm=confirm,
@@ -277,15 +438,58 @@ class WriteOperations:
         to_emails=None,
         cc_emails=None,
         bcc_emails=None,
+        body_format=None,
+        body_action=None,
         confirm=False,
         confirmation_id=None,
+        expected_version=None,
     ):
+        if body_format is not None and body_format not in ("text", "html"):
+            raise ToolOperationError("INVALID_BODY_FORMAT", "body_format 仅支持 text 或 html。")
+        if body_action is not None and body_action not in ("replace", "prepend"):
+            raise ToolOperationError("INVALID_BODY_ACTION", "body_action 仅支持 replace 或 prepend。")
+        if body is None and (body_format is not None or body_action is not None):
+            # 静默忽略比拒绝更危险：调用方以为提交了 HTML 或前置，实际什么都没发生。
+            raise ToolOperationError(
+                "BODY_PARAM_REQUIRES_BODY",
+                "body_format/body_action 仅在提供 body 时生效；只改收件人或主题时请一并省略。",
+            )
+        action = body_action or "replace"
+        html_prepend = action == "prepend" and body_format == "html"
+        if html_prepend:
+            # 只在前置时才校验片段形态；replace+html 提交的是完整正文，不是片段。
+            _validate_html_fragment(body)
+
         draft = self._write_draft(draft_id)
-        updates = {
-            name: value
-            for name, value in (("subject", subject), ("body", body))
-            if value is not None
-        }
+        if expected_version is not None:
+            # 预览时服务器快照了本草稿的 changekey 与正文哈希，确认时重新读取并对照，
+            # 若预览后被 Outlook 或其它操作改动过则拒绝，而不是照着新状态覆盖。
+            current = {"changekey": draft.changekey, "body_sha256": _body_sha256(draft.body)}
+            if current != expected_version:
+                raise ToolOperationError(
+                    "DRAFT_CHANGED",
+                    "草稿在预览后被其他操作修改，本次未执行；请重新预览后再确认。",
+                )
+
+        updates = {}
+        if subject is not None:
+            updates["subject"] = subject
+        if body is not None:
+            if action == "prepend":
+                # 只新增一段内容：读完整现有正文，在开头插入；原正文（表格/样式/
+                # 引用邮件/内嵌图片）不重建、不截断，附件与 cid 引用保持不动。
+                # html 分支提交的是调用方自写的片段，不转义，但要求目标草稿本身是 HTML。
+                updates["body"] = (
+                    _html_prepend_body(draft, body) if html_prepend
+                    else _prepend_body(draft.body, body)
+                )
+            elif body_format == "html":
+                # 显式 HTML 且整体替换：整段按 HTML 提交，不做转义。
+                updates["body"] = HTMLBody(body)
+            else:
+                # 旧调用（未传新参数）走这里，行为与原有版本完全一致：按草稿当前
+                # BodyType 序列化纯文本，避免更新正文时把 HTML 草稿降级回 Text。
+                updates["body"] = _new_body(body, draft.body)
         for field, value in (
             ("to_recipients", to_emails),
             ("cc_recipients", cc_emails),
@@ -302,13 +506,21 @@ class WriteOperations:
                 "draft_id": draft_id,
                 "subject": draft.subject,
                 "author": _address(draft.author),
+                "body_action": action,
+                "body_format": body_format or "text",
+                "body_preview": str(body or "")[:500],
             }],
             details={
                 "subject": subject,
                 "body_length": (len(body) if body is not None else None),
+                "body_action": action,
+                "body_format": body_format,
                 "to": to_emails,
                 "cc": cc_emails,
                 "bcc": bcc_emails,
+                # 版本快照存在服务端；确认时由 mcp_server._run_write 取回并重新校验，
+                # 不依赖调用方回传的版本号。
+                "version": {"changekey": draft.changekey, "body_sha256": _body_sha256(draft.body)},
             },
             confirm=confirm,
             confirmation_id=confirmation_id,
@@ -319,7 +531,9 @@ class WriteOperations:
             setattr(draft, field, value)
         if updates:
             try:
-                draft.save(update_fields=list(updates))
+                # NeverOverwrite 是 EWS 侧的乐观并发：ChangeKey 已随 ItemId 发出，
+                # 若在本次读取之后、写入之前又被改动，Exchange 会拒绝而不是覆盖。
+                draft.save(update_fields=list(updates), conflict_resolution=NEVER_OVERWRITE)
             except Exception as exc:
                 raise ToolOperationError(
                     "DRAFT_UPDATE_FAILED", "更新草稿失败，请检查草稿权限或重新读取草稿。"

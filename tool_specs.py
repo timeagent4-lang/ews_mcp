@@ -39,6 +39,22 @@ _ID_FIELDS = frozenset(
 # FolderId and reach outside this employee's own mailbox.
 _FOLDER_FIELDS = frozenset({"folder", "to_folder"})
 
+# Fine-grained error codes for public-schema validation failures. Only these
+# fields carry one; everything else - identity fields, unknown properties and
+# the preview/confirm/query oneOf combinations - stays INVALID_PARAMS, so a
+# schema failure is never reported as an identity or a business rejection.
+_FIELD_ERROR_CODES = {}
+for _code, _names in (
+    ("INVALID_DATETIME", ("start", "end", "start_date", "due_date", "since", "until")),
+    ("INVALID_PAGINATION", ("limit", "offset")),
+    ("INVALID_FOLDER", tuple(sorted(_FOLDER_FIELDS))),
+    ("INVALID_BODY_FORMAT", ("body_format",)),
+    ("INVALID_BODY_ACTION", ("body_action",)),
+):
+    for _name in _names:
+        _FIELD_ERROR_CODES[_name] = _code
+del _code, _names, _name
+
 _ID_HINT = (
     "Use the exact mailbox-scoped ID returned by this service, or a raw EWS ID. "
     "Cross-mailbox / unscoped short aliases are rejected."
@@ -147,7 +163,8 @@ TOOLS: dict[str, list[dict]] = {
     "create_draft": [
         _s("mode", "string", "Draft mode; reply/reply_all/forward require reply_to; new forbids reply_to.", default="new", enum=["new", "reply", "reply_all", "forward"]),
         _s("subject", "string", "Subject; omitted for reply/forward uses RE:/FW: prefix.", default=""),
-        _s("body", "string", "Draft body.", default="", max_length=65536),
+        _s("body", "string", "With mode=reply/reply_all/forward this is only your new text: Exchange appends the quoted original natively, so do not paste the original back and do not pass a cleaned plain-text copy of it; an HTML original keeps its formatting. With mode=new it is the complete body of the new message.", default="", max_length=65536),
+        _s("body_format", "string", "How to read body. text (default) submits it as plain text. html submits it verbatim as an HTML body so tables and inline style= attributes render - use inline CSS, not a <style> block. html is only accepted with mode=new: a reply/forward body is plain text, and the quoted original keeps its own formatting.", default="text", enum=["text", "html"]),
         _s("to_emails", "string", "To recipients, ; separated.", default=""),
         _s("cc_emails", "string", "Cc recipients, ; separated.", default=""),
         _s("bcc_emails", "string", "Bcc recipients, ; separated.", default=""),
@@ -157,7 +174,9 @@ TOOLS: dict[str, list[dict]] = {
     "update_draft": [
         _s("draft_id", "string", "Scoped draft ID.", required=True),
         _s("subject", "string", "New subject; omit to leave unchanged.", default=None),
-        _s("body", "string", "New body; omit to leave unchanged.", default=None, max_length=65536),
+        _s("body", "string", "Body content, read according to body_action and body_format. Omit it to leave the body untouched, which is what you want when changing only recipients or subject; supplying body_format or body_action without body is rejected rather than ignored. With prepend+html this is an HTML fragment only (e.g. <p>, <table>); a full document containing html/head/body/doctype is refused, not trimmed.", default=None, max_length=65536),
+        _s("body_format", "string", "How to read body. With body_action=replace (default): text submits plain text keeping the draft's body type, html submits body verbatim as the complete replacement body so tables and inline style= render. With body_action=prepend: text (default) adds escaped plain text, html adds a raw HTML fragment at the start of the existing body -- fragment only, the draft must already be HTML, and any cid: image it references must match an existing attachment (no image upload).", default=None, enum=["text", "html"]),
+        _s("body_action", "string", "replace (default) makes body the whole new body, including any quoted original. prepend treats body as one new piece inserted at the start of the server-read existing body, keeping that body's tables, styles, quoted mail and inline images, so the original is never resubmitted. prepend takes plain text, or an HTML fragment with body_format=html.", default=None, enum=["replace", "prepend"]),
         _s("to_emails", "string", "New to recipients; omit to leave unchanged.", default=None),
         _s("cc_emails", "string", "New cc recipients; omit to leave unchanged.", default=None),
         _s("bcc_emails", "string", "New bcc recipients; omit to leave unchanged.", default=None),
@@ -240,16 +259,43 @@ TOOLS: dict[str, list[dict]] = {
         _s("query", "string", "Search text.", required=True),
         _s("source", "string", "gal, contacts, or auto.", default="auto", enum=["auto", "gal", "contacts"]),
         _s("limit", "integer", "Max per source.", default=20, maximum=100),
+        _s(
+            "directory_id",
+            "string",
+            "Administrator-configured team shared directory; optional and requires source=contacts, which must be passed explicitly. Searches only that directory. Omit for the employee's own Contacts folder.",
+            default=None,
+            min_length=1,
+        ),
     ],
     "get_contact": [
         _s("contact_id", "string", "Scoped Contacts item ID, or exact GAL email.", required=True),
+        _s(
+            "directory_id",
+            "string",
+            "Administrator-configured team shared directory; optional. With it, contact_id is read as an item ID inside that directory only and an email address never resolves through GAL. Omit to read the employee's own Contacts.",
+            default=None,
+            min_length=1,
+        ),
     ],
     "create_contact": [
-
+        _s(
+            "display_name",
+            "string",
+            "Name saved on the contact itself; not the requester's name (that is the top-level name field) and it never selects a mailbox.",
+            required=True,
+            min_length=1,
+        ),
         _s("email", "string", "Single contact email address; never selects the target mailbox.", required=True),
         _s("phone", "string", "Business phone.", default=None),
         _s("company_name", "string", "Company name.", default=None),
         _s("job_title", "string", "Job title.", default=None),
+        _s(
+            "directory_id",
+            "string",
+            "Administrator-configured team shared directory to create in; optional. Only employees with create permission for that directory may use it, and the preview shows the resolved target. Omit to create in the employee's own Contacts.",
+            default=None,
+            min_length=1,
+        ),
     ],
     # --- tasks ---
     "list_tasks": [
@@ -294,8 +340,8 @@ DESCRIPTIONS = {
     "get_attachment": "List attachment metadata or read supported text files; the 5 MiB input and 20000-character output limits apply to text reading, not metadata listing. Other file types return metadata only. To download an original file, use prepare_attachment_download and then HTTP GET its URL from the employee execution environment.",
     "prepare_attachment_download": "Prepare an original file attachment for HTTP download after checking its message and mailbox scope. Returns download_url, filename, content_type, size, sha256 and expires_at; no file bytes or server paths. The URL is a temporary bearer credential: download into the task workspace, verify SHA-256, and do not publish it. Retry GET while valid; call this tool again after expiry. Requires server download configuration; item attachments are unsupported.",
     "get_mailbox_overview": "Read Inbox total/unread counts and recent unread messages only.",
-    "create_draft": "Create a new draft or native EWS reply/reply_all/forward draft without sending; use an original message ID, not a consumed draft ID.",
-    "update_draft": "Update supplied draft fields and align the draft author with the OA employee when needed; empty values clear supported fields. Confirmation re-reads the draft and does not lock its state between preview and execution.",
+    "create_draft": "Create a new draft or native EWS reply/reply_all/forward draft without sending; use an original message ID, not a consumed draft ID. A new draft takes real HTML with body_format=html; reply/forward bodies are always plain text and keep the quoted original's own formatting.",
+    "update_draft": "Update supplied draft fields and align the draft author with the OA employee when needed; empty values clear supported fields. body_action=replace (default) makes body the whole new body, including any quoted original. body_action=prepend adds body as one new piece of content at the start of the server-read existing body, keeping that body's tables, styles, quoted mail and inline images, so the original is never resubmitted; prepend takes plain text, or an HTML fragment with body_format=html when the draft is already HTML (fragment only, no html/head/body, and any cid: image it references must already exist on the draft). To change only recipients or subject, omit body (and do not pass body_format/body_action). The preview snapshots the draft version, confirm refuses a draft that was edited since preview, and the save itself uses EWS conflict detection.",
     "delete_draft": "Move one draft to DeletedItems; requires DeletedItems access; never permanently deletes or falls back to hard delete.",
     "send_draft": "Send one existing employee draft and save a copy in employee Sent; source draft ID is consumed, not a sent/received ID; no auto resend; idempotency_key persists across restarts.",
     "update_messages": "Update read status/categories of ordinary mail only; meeting request/cancellation objects are rejected per item.",
@@ -310,9 +356,9 @@ DESCRIPTIONS = {
     "respond_to_event": "Accept, decline or tentatively respond as an attendee, sending a response after confirmation and the send switch check; organizer-owned and recurring-master objects are rejected.",
     "cancel_event": "Cancel an organizer-owned event: meetings send native EWS cancellation notices and require the send switch; only a non-meeting appointment with no attendees is moved to Deleted Items without a notice. Omitting message does not suppress cancellation notices; recurring masters rejected.",
     "check_availability": "Query directory free/busy and suggest shared slots; any unavailable or NoData attendee prevents claiming a mutually free slot.",
-    "find_people": "Search the organization directory (GAL) and/or the OA mailbox Contacts folder independently; different sources with separate permissions and coverage.",
-    "get_contact": "Read a scoped Contacts item, or resolve an exact unique email in the organization directory; directory address cannot switch the target mailbox.",
-    "create_contact": "Create one contact in the OA employee's own Contacts folder; never touches the GAL and sends no mail.",
+    "find_people": "Search the organization directory (GAL) and/or the OA mailbox Contacts folder independently; different sources with separate permissions and coverage. With directory_id, search only that administrator-configured team shared directory using source=contacts; gal/auto cannot be combined with it and are rejected.",
+    "get_contact": "Read a scoped Contacts item, or resolve an exact unique email in the organization directory; directory address cannot switch the target mailbox. With directory_id, read an item ID inside that team shared directory only: the employee's directory permission is checked first, the item's parent folder must be that directory, and an email address never falls through to GAL. The result names the directory it came from.",
+    "create_contact": "Create one contact in the OA employee's own Contacts folder, or in an administrator-configured team shared directory when directory_id is given; never touches the GAL and sends no mail. A shared-directory create requires create permission for that directory, and the preview and receipt both name the resolved target; the confirmed target is re-verified, so a re-pointed directory requires a fresh preview.",
     "list_tasks": "Read scoped Exchange tasks live, incomplete by default; use returned IDs for update_task.",
     "create_task": "Create one task in the OA employee's own Tasks folder; sends no mail and invites nobody.",
     "update_task": "Update a scoped task completion/due date using a checked change key; no fields means no write.",
@@ -392,6 +438,10 @@ def _business_schema(fields):
             for key in ("minimum", "maximum"):
                 if key in field:
                     schema[key] = field[key]
+        if name in _FIELD_ERROR_CODES:
+            # public-schema failures on this field report this code instead of
+            # the blanket INVALID_PARAMS (see mcp_server._validate_arguments).
+            schema["x-error-code"] = _FIELD_ERROR_CODES[name]
         desc = field["description"]
         if name in _ID_FIELDS:
             desc = desc + " " + _ID_HINT
@@ -481,6 +531,38 @@ def public_tools():
                     "then": {"required": ["reply_to"]},
                     "else": {"not": {"required": ["reply_to"]}},
                 },
+            }, {
+                # An HTML body only makes sense for a brand-new message: a reply's
+                # body is "your new text" and the quoted original supplies the
+                # formatting. Omitting mode defaults to new, so only an explicit
+                # reply mode conflicts.
+                "not": {
+                    "required": ["body_format", "mode"],
+                    "properties": {
+                        "body_format": {"const": "html"},
+                        "mode": {"enum": ["reply", "reply_all", "forward"]},
+                    },
+                },
+            }]
+        elif name == "update_draft":
+            params["allOf"] = [{
+                # Both only mean something alongside body; silently ignoring them
+                # would read as a successful edit that never happened.
+                "dependentRequired": {
+                    "body_format": ["body"],
+                    "body_action": ["body"],
+                },
+            }]
+        elif name == "find_people":
+            # A team shared directory is a third, explicit source: it is never
+            # folded into auto and never combined with gal, so the source must be
+            # stated rather than inherited from the default.
+            params["allOf"] = [{
+                "if": {"required": ["directory_id"]},
+                "then": {
+                    "required": ["source"],
+                    "properties": {"source": {"const": "contacts"}},
+                },
             }]
         elif name == "find_message":
             params["allOf"] = [{
@@ -496,12 +578,7 @@ def public_tools():
             {
                 "name": name,
                 "description": description,
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {"params": params},
-                    "required": ["params"],
-                    "additionalProperties": False,
-                },
+                "inputSchema": params,
             }
         )
     return result
