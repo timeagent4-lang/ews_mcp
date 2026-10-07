@@ -44,7 +44,7 @@ Copy-Item .env.example .env
 | 日历（6） | `list_events`、`get_event`、`create_event`、`update_event`、`respond_to_event`、`cancel_event` |
 | 状态（1） | `get_server_status` |
 
-`create_draft` 支持 new/reply/reply_all/forward；保存后用 `send_draft` 发送。日历保留组织者／参与者和重复主项限制。空闲时间、自动回复、任务、本地镜像均未注册。完整参数约束由 `tool_specs.py` 的公开 schema 定义，可通过 MCP `tools/list` 获取。
+`create_draft` 支持 new/reply/reply_all/forward；保存后用 `send_draft` 发送。日历保留组织者／参与者和重复主项限制。空闲时间、自动回复、任务、本地镜像均未注册。平台通过 MCP `tools/list` 获取完整参数约束和工具描述；每个描述都包含公邮代理、个人凭据两种 JSON 参数示例，并说明 ID 来源。回复、转发和联系人编辑等场景另有示例，参数直接作为工具 `arguments`，不包 `params`。
 
 ## 联系人
 

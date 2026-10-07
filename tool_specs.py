@@ -1,6 +1,8 @@
 """已确认的 29 工具，顶层凭据参数与严格 JSON Schema。"""
 from copy import deepcopy
+import json
 from contact_fields import CONTACT_SCHEMA
+from tool_examples import TOOL_EXAMPLES, TOOL_GUIDANCE
 
 SIDE_READ = "read"
 SIDE_WRITE = "write"
@@ -277,6 +279,27 @@ TOOL_NAMES = list(TOOLS)
 assert len(TOOL_NAMES) == 29
 READ_TOOLS = frozenset(['list_folders', 'find_message', 'get_message', 'get_thread', 'get_attachment', 'prepare_attachment_download', 'get_mailbox_overview', 'list_events', 'get_event', 'find_people', 'get_contact', 'list_contact_folders', 'list_contacts', 'get_server_status', 'list_flagged_messages'])
 
+
+def _tool_description(name):
+    lines = [DESCRIPTIONS[name],
+             "参数直接放在本工具 arguments 的顶层，不要包 params。mailbox 始终是要操作的用户邮箱。"
+             "省略 password、传 null 或空字符串使用公邮代理，此时忽略 username；非空 password 使用个人凭据，username 省略默认 mailbox。"
+             "个人认证失败不会切换公邮。示例中的邮箱、登录名、密码及 <...> ID 占位值须替换为实际值；不需要的可选参数直接省略。"]
+    if name not in READ_TOOLS:
+        lines.append("直接执行，无二次确认；返回 unknown 时先核对实际邮箱，不重复提交。")
+    if name in TOOL_GUIDANCE:
+        lines.append(TOOL_GUIDANCE[name])
+    for index, (label, business) in enumerate(TOOL_EXAMPLES[name]):
+        arguments = {"mailbox": "user@example.com", **business}
+        lines.extend([f"调用示例（公邮代理，{label}）：", "```json",
+                      json.dumps(arguments, ensure_ascii=False, separators=(",", ":")), "```"])
+        if index == 0:
+            personal = {"mailbox": "user@example.com", "username": r"DOMAIN\user",
+                        "password": "<个人邮箱密码>", **business}
+            lines.extend([f"调用示例（个人凭据，{label}）：", "```json",
+                          json.dumps(personal, ensure_ascii=False, separators=(",", ":")), "```"])
+    return "\n".join(lines)
+
 def _business_schema(fields):
     properties = {}
     required = []
@@ -361,9 +384,7 @@ def public_tools():
                 "properties": {"query": {"const": ""}},
                 "not": {"anyOf": [{"required": [key]} for key in ("since", "until", "is_unread", "has_attachments")]},
             }}]
-        description = DESCRIPTIONS[name] + " 每次传 mailbox；可选 username/password。"
-        if name not in READ_TOOLS:
-            description += " 直接执行，无二次确认；结果未知时先核对实际邮箱。"
+        description = _tool_description(name)
         result.append({"name": name, "description": description, "inputSchema": schema})
     return result
 
