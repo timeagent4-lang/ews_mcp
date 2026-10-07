@@ -1,12 +1,13 @@
 """目标邮箱中的普通联系人文件夹与 GAL 查询，直接执行资料修改。"""
-from exchangelib import Contact, FileAttachment
-from exchangelib.errors import ErrorNameResolutionNoResults
+from exchangelib import Contact, FileAttachment, Mailbox
+from exchangelib.errors import ErrorFolderNotFound, ErrorItemNotFound, ErrorNameResolutionNoResults
 from exchangelib.folders import Contacts, Folder, MsgFolderRoot, Root
 from exchangelib.folders.base import BaseFolder
 from exchangelib.folders.collections import FolderCollection
 from exchangelib.items import NEVER_OVERWRITE
-from exchangelib.properties import FieldPath
+from exchangelib.properties import DistinguishedFolderId, FieldPath
 from exchangelib.services import DeleteAttachment, GetFolder
+from exchangelib.version import EXCHANGE_2016
 
 from contact_fields import build_contact_values, contact_photo, serialize_contact, validate_contact
 from tool_support import ToolOperationError, error_details
@@ -14,7 +15,8 @@ from tool_support import ToolOperationError, error_details
 
 SEARCH_SCOPE_ACTIVE_DIRECTORY = "ActiveDirectory"
 _FOLDER_FIELDS = ("name", "folder_class", "parent_folder_id", "total_count", "child_folder_count")
-_SYSTEM_CONTACT_FOLDERS = {"PersonMetadata", "RecipientCache", "QuickContacts", "IMContactList", "OrganizationalContacts", "PeopleCentricConversationBuddies"}
+# 旧服务器没有 personmetadata 身份查询；保留原有歧义目录的保守限制。
+_LEGACY_AMBIGUOUS_CONTACT_FOLDERS = {"PersonMetadata", "RecipientCache", "QuickContacts", "IMContactList", "OrganizationalContacts", "PeopleCentricConversationBuddies"}
 _MAX_FOLDER_ANCESTORS = 256
 
 
@@ -28,7 +30,7 @@ def _parent_id(folder):
 
 
 def _regular_contacts(folder):
-    return getattr(folder, "folder_class", None) == "IPF.Contact" and type(folder).__name__ not in _SYSTEM_CONTACT_FOLDERS
+    return getattr(folder, "folder_class", None) == "IPF.Contact"
 
 
 def _folder_row(folder):
@@ -44,6 +46,9 @@ def _pagination(offset, limit):
 
 def _directory_row(mailbox, contact):
     row = serialize_contact(contact) if contact is not None else {}
+    # ResolveNames 的目录补充资料使用只读 Notes；私人联系人仍以 Body 存储备注。
+    if contact is not None and row.get("notes") is None:
+        row["notes"] = getattr(contact, "notes", None)
     row.update({"source": "gal", "email": getattr(mailbox, "email_address", None),
                 "display_name": getattr(mailbox, "name", None) or getattr(contact, "display_name", None)})
     return row
@@ -71,8 +76,16 @@ class PeopleOperations:
             rows[folder.id] = _folder_row(folder)
             if _regular_contacts(folder):
                 folders.append(folder)
+        metadata_id = self._person_metadata_folder_id(root) if folders else ""
+        unclassified = []
         items = []
         for folder in folders:
+            if metadata_id is None and type(folder).__name__ in _LEGACY_AMBIGUOUS_CONTACT_FOLDERS:
+                unclassified.append({"id": folder.id, "name": folder.name,
+                                     "reason": "当前 Exchange 版本无法可靠区分同名自定义目录与系统联系人目录。"})
+                continue
+            if metadata_id and folder.id == metadata_id:
+                continue
             row = dict(rows[folder.id])
             names, visited = [], set()
             current = folder.id
@@ -83,7 +96,10 @@ class PeopleOperations:
             row["path"] = "/" + "/".join(reversed(names))
             row["path_complete"] = current == ipm.id
             items.append(row)
-        return {"items": sorted(items, key=lambda row: (row["path"], row["id"]))}
+        result = {"items": sorted(items, key=lambda row: (row["path"], row["id"]))}
+        if unclassified:
+            result["unclassified_folders"] = unclassified
+        return result
 
     def _contact_folder(self, folder_id=None):
         root = Root(account=self.account)
@@ -99,7 +115,34 @@ class PeopleOperations:
             raise ToolOperationError("INVALID_CONTACT_FOLDER", "指定文件夹不是普通联系人文件夹。")
         if folder_id is not None:
             self._require_folder_scope(folder, root)
+            metadata_id = self._person_metadata_folder_id(root)
+            if metadata_id is None and type(folder).__name__ in _LEGACY_AMBIGUOUS_CONTACT_FOLDERS:
+                raise ToolOperationError(
+                    "CONTACT_FOLDER_CLASSIFICATION_UNSUPPORTED",
+                    "当前 Exchange 版本无法可靠区分同名自定义目录与系统联系人目录；精确识别需要 Exchange 2016 或更新版本。",
+                )
+            if metadata_id and folder.id == metadata_id:
+                raise ToolOperationError("INVALID_CONTACT_FOLDER", "指定文件夹是系统联系人目录，不能作为普通联系人文件夹使用。")
         return folder
+
+    def _person_metadata_folder_id(self, root):
+        # None 表示旧版本不支持身份查询；空字符串仅表示服务端明确报告目录不存在。
+        build = self.account.version.build
+        if build is None or build < EXCHANGE_2016:
+            return None
+        template = Folder(root=root, _distinguished_id=DistinguishedFolderId(
+            id="personmetadata", mailbox=Mailbox(email_address=self.account.primary_smtp_address),
+        ))
+        folder = next(iter(GetFolder(account=self.account).call(
+            folders=[template], additional_fields=set(), shape="IdOnly",
+        )), None)
+        if isinstance(folder, (ErrorFolderNotFound, ErrorItemNotFound)):
+            return ""
+        if isinstance(folder, Exception):
+            raise folder
+        if folder is None or not folder.id:
+            raise ToolOperationError("CONTACT_FOLDER_CLASSIFICATION_FAILED", "系统联系人目录查询缺少完整的文件夹标识，未继续读写。")
+        return folder.id
 
     def _folder_metadata(self, root, folder_id):
         folder = next(iter(GetFolder(account=self.account).call(

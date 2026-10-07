@@ -113,12 +113,17 @@ class ContactOperationsTests(unittest.TestCase):
         self.ops.account.primary_smtp_address = "user@example.com"
         from exchangelib.version import Build, Version
         self.ops.account.version = Version(build=Build(15, 1, 0, 0))
+        from tests.test_direct_operations import offline_account
+        self.ops.account.protocol = offline_account().protocol
         root = Root(account=self.ops.account)
         self.ipm = MsgFolderRoot(root=root, id="ipm-A", name="Top")
         self.folder = Contacts(root=root, id="folder1", name="客户", folder_class="IPF.Contact", parent_folder_id=ParentFolderId(id=self.ipm.id))
 
     def metadata_response(self, rows):
         def respond(*, folders, **kwargs):
+            if getattr(folders[0], "_distinguished_id", None) is not None:
+                from exchangelib.errors import ErrorFolderNotFound
+                return iter([ErrorFolderNotFound("PersonMetadata absent")])
             result = rows.get(folders[0].id)
             return iter([] if result is None else [result])
         return respond
@@ -151,7 +156,9 @@ class ContactOperationsTests(unittest.TestCase):
                 Folder(root=root, id="c", name="客户", folder_class="IPF.Contact", parent_folder_id=ParentFolderId(id="a")),
                 Folder(root=root, id="d", name="客户", folder_class="IPF.Contact", parent_folder_id=ParentFolderId(id="b")),
                 Folder(root=root, id="cache", name="缓存", folder_class="IPF.Contact.RecipientCache", parent_folder_id=ParentFolderId(id="ipm"))]
-        with patch.object(MsgFolderRoot, "get_distinguished", return_value=ipm), patch("people_operations.FolderCollection.find_folders", return_value=iter(rows)) as find:
+        from exchangelib.errors import ErrorFolderNotFound
+        with patch.object(MsgFolderRoot, "get_distinguished", return_value=ipm), patch("people_operations.FolderCollection.find_folders", return_value=iter(rows)) as find, \
+                patch("people_operations.GetFolder.call", return_value=iter([ErrorFolderNotFound("PersonMetadata absent")])):
             result = self.ops.list_contact_folders()
         self.assertEqual({v["path"] for v in result["items"]}, {"/工作/客户", "/家庭/客户"})
         self.assertEqual(find.call_args.kwargs["depth"], "Deep")
@@ -163,15 +170,15 @@ class ContactOperationsTests(unittest.TestCase):
         item = self.contact()
         self.ops.account.fetch.return_value = iter([item])
         with patch("people_operations.GetFolder") as get, patch.object(MsgFolderRoot, "get_distinguished", return_value=self.ipm):
-            get.return_value.call.return_value = iter([self.folder])
+            get.return_value.call.side_effect = self.metadata_response({self.folder.id: self.folder})
             result = self.ops.get_contact("contact1", folder_id="folder1")
-            template = get.return_value.call.call_args.kwargs["folders"][0]
+            template = get.return_value.call.call_args_list[0].kwargs["folders"][0]
             self.assertEqual(template.id, "folder1")
         self.assertEqual(result["folder_id"], "folder1")
         item.parent_folder_id = ParentFolderId(id="other")
         self.ops.account.fetch.return_value = iter([item])
         with patch("people_operations.GetFolder") as get, patch.object(MsgFolderRoot, "get_distinguished", return_value=self.ipm), self.assertRaisesRegex(ValueError, "指定联系人文件夹"):
-            get.return_value.call.return_value = iter([self.folder])
+            get.return_value.call.side_effect = self.metadata_response({self.folder.id: self.folder})
             self.ops.get_contact("contact1", folder_id="folder1")
 
     def test_real_get_folder_payload_only_distinguished_id_carries_target_mailbox(self):
@@ -204,7 +211,9 @@ class ContactOperationsTests(unittest.TestCase):
             get.return_value.call.side_effect = self.metadata_response({self.folder.id: self.folder, "nested": nested, "parent": parent})
             result = self.ops.get_contact("contact1", folder_id=self.folder.id)
         self.assertEqual(result["folder_id"], self.folder.id)
-        self.assertEqual([call.kwargs["folders"][0].id for call in get.return_value.call.call_args_list], ["folder1", "nested", "parent"])
+        calls = get.return_value.call.call_args_list
+        self.assertEqual([call.kwargs["folders"][0].id for call in calls], ["folder1", "nested", "parent", None])
+        self.assertEqual(calls[-1].kwargs["folders"][0]._distinguished_id.id, "personmetadata")
         for call in get.return_value.call.call_args_list:
             self.assertEqual(call.kwargs["shape"], "IdOnly")
             self.assertIsNone(call.kwargs["folders"][0].root._subfolders)

@@ -29,6 +29,8 @@
 
 以绑定目标邮箱的新鲜 Root 和 MsgFolderRoot 调用 `FolderCollection.find_folders(depth="Deep")`，分页读取名称、类型、ID、父 ID 等轻量元数据。用这些元数据自行拼路径，避免访问会触发全树缓存的 `walk/parent/absolute`。筛选普通 `IPF.Contact` 文件夹，排除明确的系统联系人缓存或元数据目录。
 
+复审补充：SDK 会根据名称猜测 PersonMetadata 类，不能据此排除同名自定义目录。Exchange 2016+ 每次发现或自定义目录访问用一次绑定目标邮箱的 `personmetadata` distinguished 查询获取实际 ID，按 ID 排除系统目录；默认 Contacts 无额外查询。仅 FolderNotFound/ItemNotFound 代表明确缺失，其他错误保留，空响应不等于缺失。旧版不发送不支持的查询，普通目录保持可用；原来无法可靠分类的歧义目录维持限制，发现结果明确列为 `unclassified_folders`，访问返回分类不支持错误，不冒充可靠识别。
+
 新增 `list_contact_folders` 和 `list_contacts`，扩展现有 `find_people/get_contact/create_contact`，新增 `update_contact`。使用 `folder_id` 选择目标；省略时使用标准 Contacts。文件夹名称和路径用于展示，后续读写按 ID 定位。联系人搜索保留现有 GAL 读取能力；指定 `folder_id` 时只搜索该联系人文件夹，不混入 GAL；未指定时保留 `source=auto/contacts/gal` 的来源选择。GAL 不提供编辑操作。
 
 按 ID 定位使用直接 GetFolder；读取或编辑联系人时检查 Contact 类型及其父文件夹。默认只查询指定文件夹中的联系人，不隐式扫描其子文件夹。
@@ -53,6 +55,8 @@
 显示名称新建时必填，编辑时可省略但不能清空。生日与纪念日使用 `YYYY-MM-DD`，不填不生成日期。`file_as_mapping` 传空时清除该选填字段；`postal_address_index` 清空为字符串 `"None"`，不能用删除字段的方式清空。非空枚举值必须属于官方允许值。Exchange 必须保留的内部状态属性使用其规定默认值，不作为联系人资料统一置空。
 
 公开 `notes` 使用纯文本，映射到联系人实际 `body`。`photo` 使用文件名、媒体类型与 base64 内容，通过 `FileAttachment(is_contact_photo=True)` 添加或替换；`photo=null` 删除现有联系人照片，保留其他附件，`""/{}` 不是合法照片参数。系统 ID、ChangeKey、时间戳、来源、拼音等只读属性仅在查询时返回。非原生的自定义 MAPI 属性不在本次标准字段范围内。
+
+GAL 读取补充：ResolveNames 可在只读 Notes 字段返回目录备注，仅在 Body 缺失时回落读取；Body 空字符串保留空。私人联系人备注写入规则不变。
 
 联系人保存和照片附件处理属于多个 EWS 写入步骤。联系人已保存、照片明确失败时返回 `partial` 及已创建/更新的联系人 ID；后续附件提交结果不明时返回 `unknown`，同时保留已确定成功部分，不自动重做整个操作。
 

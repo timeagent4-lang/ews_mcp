@@ -50,6 +50,12 @@ Copy-Item .env.example .env
 
 先用 `list_contact_folders` 获取已有文件夹 ID；支持嵌套和同名文件夹，展示路径，后续按 ID 操作。自定义文件夹会用轻量父 ID 查询核对目标邮箱归属。工具不创建文件夹。`folder_id` 省略使用默认 Contacts，仅查询所选文件夹；`find_people` 未指定文件夹可选 auto/contacts/gal，指定文件夹只查其中联系人。GAL 只读。
 
+Exchange 2016 或更新版本使用一次轻量 `personmetadata` 查询取得系统文件夹实际 ID，再按 ID 排除；同名自定义文件夹可用，重命名的系统文件夹仍会被排除。该查询的权限、网络及其他错误原样进入现有错误处理，只有明确的目录不存在错误才按缺失处理。默认 Contacts 不增加该查询。
+
+旧版 Exchange 不支持这个系统标识，因此维持对无法可靠分类目录的限制：发现结果中的 `unclassified_folders` 会说明原因，按 ID 使用这些目录返回 `CONTACT_FOLDER_CLASSIFICATION_UNSUPPORTED`；其他普通自定义目录和默认 Contacts 仍可使用。[微软版本行为说明](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxwscdata/e5ec9563-0491-486d-9bec-50585fa2a2c6)
+
+GAL 详情和搜索在没有 Body 备注时补充返回目录只读 Notes；私人联系人新增和编辑的 `notes` 继续存入 Body。
+
 `create_contact`／`update_contact` 使用 `contact` 对象。新增必填 `display_name`，其余未传为空；编辑未传保留，明确空值才清空，递归应用于标签和地址子字段。文本和日期用 `null`／`""` 清空，列表用 `[]`，索引对象用 `{}`／`null`；display_name 不能清空。
 
 | 资料 | 字段 |
