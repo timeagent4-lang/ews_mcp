@@ -9,6 +9,7 @@ mcp==1.29.0
 # Imported directly by mcp_server.py / attachment_downloads.py. They arrive
 # transitively through mcp today, but pin them so a transitive change cannot
 # break the image at import time.
+anyio==4.15.1
 jsonschema==4.26.0
 starlette==1.6.0
 tzdata==2026.5

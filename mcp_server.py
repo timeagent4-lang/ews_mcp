@@ -7,6 +7,7 @@ import traceback
 from pathlib import Path
 
 import mcp.types as mcp_types
+from anyio import to_thread
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 from fastmcp.server.middleware import Middleware
@@ -158,8 +159,9 @@ def _dispatch(tool_name, params, ctx=None):
 
 
 def _make_handler(tool_name):
-    def handler(ctx: Context = None, **params) -> ToolResult:
-        return _dispatch(tool_name, params, ctx)
+    async def handler(ctx: Context = None, **params) -> ToolResult:
+        # 已开始的 SDK 调用等待真实结果；取消请求不丢弃后台写入结果。
+        return await to_thread.run_sync(_dispatch, tool_name, params, ctx)
     handler.__name__ = f"tool_{tool_name}"
     return handler
 
