@@ -1,20 +1,24 @@
-"""Calendar operations limited to the OA-resolved employee's own calendar."""
+"""当前目标邮箱日历的查询和直接写入。"""
 
 from datetime import date, datetime, time, timedelta
 
 from exchangelib import Attendee, CalendarItem, EWSDate, EWSDateTime, HTMLBody, Mailbox
+from exchangelib.errors import ErrorInvalidRecipients, ErrorMissingRecipients
 from exchangelib.items import SEND_TO_ALL_AND_SAVE_COPY, SEND_TO_NONE
 from exchangelib.items.calendar_item import EXCEPTION, OCCURRENCE, RECURRING_MASTER, SINGLE
+from exchangelib.items.base import NEVER_OVERWRITE
 
 from mail_operations import _page
 from tool_support import (
     LOCAL_TIMEZONE,
     ToolOperationError,
+    error_details,
+    move_to_deleted_items,
     iso_datetime,
     parse_datetime,
     parse_local_datetime,
-    require_confirmation,
     require_send,
+    validate_item_fields,
 )
 
 
@@ -114,6 +118,8 @@ def _require_single_or_occurrence(event):
         raise ToolOperationError(
             "INVALID_EVENT_TYPE", "无法确认日程为单次事件或明确的 occurrence，请重新查询日程。"
         )
+    if not event.id or not event.changekey:
+        raise ToolOperationError("INVALID_ITEM_ID", "日程响应缺少 ID 或 ChangeKey，本次未提交写入。")
 
 
 def _is_organizer(event, email):
@@ -123,7 +129,7 @@ def _is_organizer(event, email):
 
 def _require_organizer(event, email):
     if not _is_organizer(event, email):
-        raise ToolOperationError("NOT_ORGANIZER", "只有当前员工组织的日程才能更新或取消。")
+        raise ToolOperationError("NOT_ORGANIZER", "只有目标邮箱组织的日程才能更新或取消。")
 
 
 def _require_attendee(event, email):
@@ -134,7 +140,7 @@ def _require_attendee(event, email):
             address = attendee.mailbox.email_address if attendee.mailbox is not None else None
             if address and address.strip().casefold() == email.strip().casefold():
                 return
-    raise ToolOperationError("NOT_ATTENDEE", "无法确认当前员工在该日程的参会人列表中，不能响应。")
+    raise ToolOperationError("NOT_ATTENDEE", "无法确认目标邮箱在该日程的参会人列表中，不能响应。")
 
 
 class CalendarOperations:
@@ -144,7 +150,7 @@ class CalendarOperations:
         )
         if not isinstance(event, CalendarItem):
             raise ToolOperationError(
-                "INVALID_EVENT", "指定项目不是当前员工日历中的日程。"
+                "INVALID_EVENT", "指定项目不是目标邮箱日历中的日程。"
             )
         return event
 
@@ -160,8 +166,6 @@ class CalendarOperations:
         end=None,
         location=None,
         notify_attendees=False,
-        confirm=False,
-        confirmation_id=None,
     ):
         event = self._calendar_item(event_id)
         _require_single_or_occurrence(event)
@@ -211,47 +215,31 @@ class CalendarOperations:
                 "changekey": event.changekey,
                 "updated_fields": [],
             }
-        # notify_attendees only controls notification, never the confirmation
-        # gate: the preview must be read-only on BOTH paths.
-        preview = require_confirmation(
-            mailbox=self.config.email,
-            action="update_event",
-            items=[_event_detail(event)],
-            details={
-                "changes": {
-                    name: (
-                        _event_time(value)
-                        if name in ("start", "end")
-                        else value
-                    )
-                    for name, value in changes.items()
-                },
-                "notify_attendees": bool(notify_attendees),
-            },
-            confirm=confirm,
-            confirmation_id=confirmation_id,
-        )
-        if preview is not None:
-            return preview
         if notify_attendees:
             require_send("发送日程更新通知")
         for name, value in changes.items():
             setattr(event, name, value)
-        event.save(
-            update_fields=list(changes),
-            send_meeting_invitations=(
-                SEND_TO_ALL_AND_SAVE_COPY if notify_attendees else SEND_TO_NONE
-            ),
-        )
+        validate_item_fields(event, fields=list(changes))
+        try:
+            event.save(
+                update_fields=list(changes),
+                conflict_resolution=NEVER_OVERWRITE,
+                send_meeting_invitations=(
+                    SEND_TO_ALL_AND_SAVE_COPY if notify_attendees else SEND_TO_NONE
+                ),
+            )
+        except Exception as exc:
+            raise ToolOperationError(
+                "EVENT_UPDATE_FAILED", "更新日程失败。",
+                status=error_details(exc, submitted=True)["status"],
+            ) from exc
         return {
             "id": event.id,
             "changekey": event.changekey,
             "updated_fields": list(changes),
         }
 
-    def respond_to_event(
-        self, event_id, response, message=None, confirm=False, confirmation_id=None
-    ):
+    def respond_to_event(self, event_id, response, message=None):
         methods = {
             "accept": "accept",
             "tentative": "tentatively_accept",
@@ -264,26 +252,23 @@ class CalendarOperations:
         event = self._calendar_item(event_id)
         _require_single_or_occurrence(event)
         _require_attendee(event, self.config.email)
-        preview = require_confirmation(
-            mailbox=self.config.email,
-            action="respond_to_event",
-            items=[_event_detail(event)],
-            details={"response": response, "message": message},
-            confirm=confirm,
-            confirmation_id=confirmation_id,
-        )
-        if preview is not None:
-            return preview
         require_send("发送日程响应")
+        validate_item_fields(event, fields=())
         # SDK 5.6.0 reply objects have no author/from field. The scoped employee
         # account and exact event reference determine the represented identity;
         # sender remains server-managed. Do not invent unsupported reply fields.
-        getattr(event, methods[response])(
-            **({"body": message} if message is not None else {})
-        )
+        try:
+            getattr(event, methods[response])(
+                **({"body": message} if message is not None else {})
+            )
+        except Exception as exc:
+            raise ToolOperationError(
+                "EVENT_RESPONSE_FAILED", "响应日程失败。",
+                status=error_details(exc, submitted=True)["status"],
+            ) from exc
         return {"id": event_id, "response": response, "responded": True}
 
-    def cancel_event(self, event_id, message=None, confirm=False, confirmation_id=None):
+    def cancel_event(self, event_id, message=None):
         event = self._calendar_item(event_id)
         _require_single_or_occurrence(event)
         _require_organizer(event, self.config.email)
@@ -303,24 +288,11 @@ class CalendarOperations:
             )
         )
         is_meeting = bool(event.is_meeting) or attendee_count > 0
-        preview = require_confirmation(
-            mailbox=self.config.email,
-            action="cancel_event",
-            items=[_event_detail(event)],
-            details={
-                "message": message,
-                "delivery": "cancel_notice" if is_meeting else "delete",
-                "attendee_count": attendee_count,
-            },
-            confirm=confirm,
-            confirmation_id=confirmation_id,
-        )
-        if preview is not None:
-            return preview
         if is_meeting:
             # Only a real notice leaves the mailbox, so only this branch needs the
             # send gate; deleting an own appointment notifies nobody.
             require_send("发送日程取消通知")
+            validate_item_fields(event, fields=())
             # CancelCalendarItem explicitly excludes author in SDK 5.6.0. The
             # organizer check and scoped reference preserve the employee identity.
             try:
@@ -330,24 +302,32 @@ class CalendarOperations:
                 # cancellation to the ITEM and then fail only on delivering the
                 # notice. So an ErrorInvalidRecipients here does not prove nothing
                 # changed - observed in practice. Report it as an uncertain
-                # outcome (never a retryable failure) so the original confirmation
-                # cannot run a second time.
+                # outcome; the caller must inspect the calendar before repeating.
+                uncertain = (
+                    isinstance(exc, (ErrorInvalidRecipients, ErrorMissingRecipients))
+                    or error_details(exc, submitted=True)["status"] == "unknown"
+                )
                 raise ToolOperationError(
-                    "CANCEL_OUTCOME_UNKNOWN",
-                    "取消请求已发出但结果不确定：EWS 可能已取消该日程，仅在通知环节失败。"
-                    "请重新获取日程确认状态，勿重复确认。",
+                    "CANCEL_OUTCOME_UNKNOWN" if uncertain else "EVENT_CANCEL_FAILED",
+                    "取消日程的请求未获得完整成功响应，请先重新获取日程检查状态。",
+                    status="unknown" if uncertain else "failed",
                 ) from exc
             return {
-                "id": event.id,
+                "id": event_id,
                 "cancelled": True,
                 "deleted": False,
             }
-        # Personal appointment: soft-delete to 已删除邮件, matching delete_messages.
-        # move_to_trash() 是 MOVE_TO_DELETED_ITEMS（可恢复）；Item.delete() 是
-        # HARD_DELETE（永久删除），语义不符，弃用。
-        event.move_to_trash(send_meeting_cancellations=SEND_TO_NONE)
+        # 个人日程只移动到已删除邮件；直接读取 DeleteItem 结果，避免 SDK 后置查 trash。
+        validate_item_fields(event, fields=())
+        try:
+            move_to_deleted_items(event)
+        except Exception as exc:
+            raise ToolOperationError(
+                "EVENT_DELETE_FAILED", "移除个人日程失败。",
+                status=error_details(exc, submitted=True)["status"],
+            ) from exc
         return {
-            "id": event.id,
+            "id": event_id,
             "cancelled": True,
             "deleted": True,
         }
@@ -366,6 +346,9 @@ class CalendarOperations:
         calendar = self._tool_folder("calendar")
         query = calendar.view(start=start_dt, end=end_dt).order_by("start")
         page = list(query[offset : offset + limit])
+        for event in page:
+            if isinstance(event, Exception):
+                raise event
         return {
             "items": [_event_detail(event) for event in page],
             "offset": offset,
@@ -382,8 +365,6 @@ class CalendarOperations:
         location=None,
         attendees=None,
         send_invitations=False,
-        confirm=False,
-        confirmation_id=None,
     ):
         if not subject or not str(subject).strip():
             raise ToolOperationError("INVALID_EVENT_SUBJECT", "日程主题不能为空。")
@@ -413,24 +394,9 @@ class CalendarOperations:
             location=location,
             required_attendees=attendee_objects,
         )
-        preview = require_confirmation(
-            mailbox=self.config.email,
-            action="create_event",
-            items=[{
-                "subject": subject,
-                "start": _event_time(start_dt),
-                "end": _event_time(end_dt),
-                "location": location,
-                "attendees": sorted(seen),
-                "send_invitations": bool(send_invitations),
-            }],
-            confirm=confirm,
-            confirmation_id=confirmation_id,
-        )
-        if preview is not None:
-            return preview
         if send_invitations:
             require_send("发送会议邀请")
+        validate_item_fields(event)
         try:
             if send_invitations:
                 event.save(
@@ -439,7 +405,15 @@ class CalendarOperations:
             else:
                 event.save()
         except Exception as exc:
-            raise ToolOperationError("EVENT_CREATE_FAILED", "创建日程失败，请检查邮箱权限。") from exc
+            raise ToolOperationError(
+                "EVENT_CREATE_FAILED", "创建日程失败。",
+                status=error_details(exc, submitted=True)["status"],
+            ) from exc
+        if not event.id or not event.changekey:
+            raise ToolOperationError(
+                "EVENT_SAVE_RESULT_UNKNOWN", "保存响应缺少日程 ID 或 ChangeKey，请先查询日历。",
+                status="unknown",
+            )
         return {
             "id": event.id,
             "changekey": event.changekey,

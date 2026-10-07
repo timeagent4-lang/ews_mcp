@@ -78,15 +78,12 @@ class DownloadHTTPTests(unittest.IsolatedAsyncioTestCase):
             async with download_lifespan(self.server):
                 self.assertFalse(Path(expired["saved_path"]).exists())
 
-    async def test_tool_registry_and_parameter_model(self):
+    async def test_tool_registry_and_flat_parameters(self):
         from tool_specs import SPECS, READ_TOOLS
-        from tool_params import PrepareAttachmentDownloadParams
         self.assertIn("prepare_attachment_download", READ_TOOLS)
-        params = SPECS["prepare_attachment_download"]["inputSchema"]["properties"]["params"]
-        self.assertEqual(set(params["required"]), {"lanid", "name", "message_id", "attachment_id"})
+        params = SPECS["prepare_attachment_download"]["inputSchema"]
+        self.assertEqual(set(params["required"]), {"mailbox", "message_id", "attachment_id"})
         self.assertNotIn("save", params["properties"])
-        model = PrepareAttachmentDownloadParams(lanid="test123", name="测试", message_id="m1", attachment_id="a1")
-        self.assertEqual(model.attachment_id, "a1")
 
     async def test_access_log_does_not_record_bearer_token(self):
         payload = self.store.issue(self.record["download_id"])

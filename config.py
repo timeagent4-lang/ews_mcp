@@ -6,18 +6,39 @@ from urllib.parse import urlsplit
 
 @dataclass
 class OutlookConfig:
-    """Exchange 连接配置。凭据来自服务器，邮箱来自 OA 校验后的可信身份。"""
+    """单次请求的 Exchange 配置，不保存凭据。"""
 
-    lanid: Optional[str] = None
+    lanid: Optional[str] = field(default=None, repr=False)
     email: Optional[str] = None
-    password: Optional[str] = None
+    password: Optional[str] = field(default=None, repr=False)
     server: Optional[str] = None
     autodiscover: bool = False
     access_type: str = "delegate"
+    credential_mode: str = "delegate"
+
+    @classmethod
+    def from_tool_params(cls, mailbox: str, username=None, password=None) -> "OutlookConfig":
+        from tool_support import ToolOperationError
+
+        email = mailbox.strip().lower() if isinstance(mailbox, str) else ""
+        if not email or email.count("@") != 1 or any(c.isspace() for c in email):
+            raise ToolOperationError("INVALID_MAILBOX", "目标邮箱地址无效。")
+        if password is not None and not isinstance(password, str):
+            raise ToolOperationError("INVALID_PARAMS", "密码必须是字符串或 null。")
+        server = os.getenv("OUTLOOK_SERVER") or os.getenv("outlook_host")
+        if not server or not server.strip():
+            raise ToolOperationError("CONFIG_ERROR", "缺少 Exchange 服务账号配置: OUTLOOK_SERVER")
+        if password is not None and password != "":
+            login = (username or email).strip()
+            if not login:
+                raise ToolOperationError("INVALID_PARAMS", "个人登录账号不能为空。")
+            return cls(lanid=login, email=email, password=password, server=server.strip(), credential_mode="personal")
+        return cls.from_service_env(email)
 
     @classmethod
     def from_service_env(cls, target_email: str) -> "OutlookConfig":
-        """使用固定服务凭据连接当前请求者的邮箱。"""
+        """使用公邮凭据代理访问指定邮箱。"""
+        from tool_support import ToolOperationError
 
         lanid = os.getenv("OUTLOOK_ADMIN_LANID")
         password = os.getenv("OUTLOOK_ADMIN_PASSWORD")
@@ -33,9 +54,9 @@ class OutlookConfig:
             name for name, value in required.items() if not value or not value.strip()
         ]
         if missing:
-            raise ValueError("缺少 Exchange 服务账号配置: " + ", ".join(missing))
+            raise ToolOperationError("CONFIG_ERROR", "缺少 Exchange 服务账号配置: " + ", ".join(missing))
         if not email or "@" not in email:
-            raise ValueError("缺少或无效的目标邮箱")
+            raise ToolOperationError("INVALID_MAILBOX", "缺少或无效的目标邮箱")
 
         return cls(
             lanid=lanid.strip(),
@@ -48,7 +69,7 @@ class OutlookConfig:
 
 
 def data_dir() -> str:
-    """本机绝对路径，服务账号独占；用于镜像与确认数据库。"""
+    """附件临时下载存储目录，仅启用下载时需要。"""
     value = os.getenv("EWS_MCP_DATA_DIR", "").strip()
     if not value:
         raise ValueError("缺少 EWS_MCP_DATA_DIR（本机绝对路径）")
@@ -60,17 +81,8 @@ def _flag(name: str) -> bool:
 
 
 def send_enabled() -> bool:
-    """默认禁止真实发送/会议通知/OOF 执行，仍允许预览。"""
+    """默认禁止真实发送和会议通知，部署时明确启用。"""
     return _flag("EWS_MCP_SEND_ENABLED")
-
-
-def cache_enabled() -> bool:
-    """默认不镜像正文；启用后仅同步明确列出的文件夹。"""
-    return _flag("EWS_MCP_CACHE_ENABLED")
-
-
-def operations_db_path() -> str:
-    return os.path.join(data_dir(), "operations.db")
 
 
 def http_timeout() -> int:
@@ -79,14 +91,6 @@ def http_timeout() -> int:
         return int(os.getenv("EWS_MCP_HTTP_TIMEOUT", "300"))
     except (TypeError, ValueError):
         return 300
-
-
-def preview_ttl_seconds() -> int:
-    """未执行预览的有效期（秒），默认 1800。<=0 表示预览不过期。"""
-    try:
-        return int(os.getenv("EWS_MCP_PREVIEW_TTL_SECONDS", "1800"))
-    except (TypeError, ValueError):
-        return 1800
 
 
 def downloads_enabled() -> bool:

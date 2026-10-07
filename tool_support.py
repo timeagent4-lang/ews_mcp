@@ -1,7 +1,6 @@
 """Small shared helpers for Exchange tool operations; no authentication state."""
 
-import hashlib
-import json
+import os
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -26,7 +25,16 @@ def sanitize(text, limit: int = 300):
     """
     if not text:
         return None
-    cleaned = _EMAIL_RE.sub("<email>", str(text))
+    secrets = [os.getenv(key, "") for key in ("OUTLOOK_ADMIN_PASSWORD", "OUTLOOK_ADMIN_LANID", "EWS_MCP_API_KEY", "EWS_MCP_DOWNLOAD_SECRET")]
+    try:
+        from utils.audit import request_secrets
+        secrets.extend(request_secrets())
+    except ImportError:
+        pass
+    cleaned = str(text)
+    for secret in sorted(set(s for s in secrets if s), key=len, reverse=True):
+        cleaned = cleaned.replace(secret, "<redacted>")
+    cleaned = _EMAIL_RE.sub("<email>", cleaned)
     cleaned = _LONG_TOKEN_RE.sub("<redacted>", cleaned)
     cleaned = _WS_RE.sub(" ", cleaned).strip()
     if len(cleaned) > limit:
@@ -37,10 +45,45 @@ def sanitize(text, limit: int = 300):
 class ToolOperationError(ValueError):
     """An expected operation failure with a safe, caller-visible explanation."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, *, status="failed", results=None):
         self.code = code
         self.public_message = message
+        self.status = status
+        self.results = results
         super().__init__(message)
+
+
+def validate_item_fields(item, fields=None):
+    """SDK 字段清理在提交 try 之前运行，避免本地拒绝误报结果未知。"""
+    if fields is not None and (not getattr(item, "id", None) or not getattr(item, "changekey", None)):
+        raise ToolOperationError("ITEM_IDENTIFIER_INCOMPLETE", "项目 ID 或 ChangeKey 不完整，本次未提交写入。")
+    # 版本协商可能读取服务器，但仍在实际写入之前。
+    account = getattr(item, "account", None)
+    version = account.version if account is not None else None
+    try:
+        if fields is None:
+            item.clean(version=version)
+        else:
+            for name in fields:
+                field = item.get_field_by_fieldname(name)
+                field.clean(getattr(item, name), version=version)
+    except (TypeError, ValueError) as exc:
+        raise ToolOperationError("INVALID_PARAMS", "参数不符合 Exchange 字段约束，本次未提交写入。") from exc
+
+
+def move_to_deleted_items(item):
+    """明确 MoveToDeletedItems，直接消费删除结果，不执行后置 trash 查找。"""
+    from exchangelib.items import MOVE_TO_DELETED_ITEMS, SEND_TO_NONE
+
+    results = item.account.bulk_delete(
+        ids=[item], delete_type=MOVE_TO_DELETED_ITEMS, send_meeting_cancellations=SEND_TO_NONE,
+    )
+    if len(results) != 1:
+        raise ToolOperationError("DELETE_RESULT_UNKNOWN", "删除响应不完整，请先核对已删除邮件。", status="unknown")
+    if isinstance(results[0], Exception):
+        raise results[0]
+    if results[0] is not True:
+        raise ToolOperationError("DELETE_RESULT_UNKNOWN", "删除结果无法确认，请先核对已删除邮件。", status="unknown")
 
 
 def parse_datetime(value):
@@ -77,17 +120,13 @@ def iso_datetime(value):
 
 
 def require_send(action_desc: str) -> None:
-    """Block real sends/notifications/OOF unless EWS_MCP_SEND_ENABLED=true.
-
-    Previews remain allowed; only the confirmed execution is gated. This is the
-    default-off safety switch, not a global read-only toggle.
-    """
+    """Block sends/notifications unless EWS_MCP_SEND_ENABLED=true."""
     from config import send_enabled
 
     if not send_enabled():
         raise ToolOperationError(
             "SEND_DISABLED",
-            f"{action_desc} 未启用（须 EWS_MCP_SEND_ENABLED=true 且经两阶段确认）。",
+            f"{action_desc} 未启用（须 EWS_MCP_SEND_ENABLED=true）。",
         )
 
 
@@ -98,11 +137,8 @@ UNKNOWN_OUTCOME_CODES = frozenset(
     {
         "SEND_FAILED_OR_UNKNOWN",
         "CANCEL_OUTCOME_UNKNOWN",
-        "AVAILABILITY_UNAVAILABLE",
-        "OOF_WRITE_UNAVAILABLE",
         "CONTACT_RECEIPT_INCOMPLETE",
-        "TASK_RECEIPT_INCOMPLETE",
-        "CONFIRMATION_MISMATCH",
+        "WRITE_OUTCOME_UNKNOWN",
     }
 )
 
@@ -126,6 +162,10 @@ _DEFINITE_REJECTION_ERRORS = frozenset(
         "ErrorInvalidId",
         "ErrorInvalidIdEmpty",
         "ErrorInvalidIdMalformed",
+        "ErrorInvalidChangeKey",
+        "ErrorIrresolvableConflict",
+        "ErrorChangeKeyRequiredForWriteOperations",
+        "UnauthorizedError",
         # calendar response/cancel preconditions
         "ErrorCalendarIsNotOrganizer",
         "ErrorCalendarIsCancelledForAccept",
@@ -142,8 +182,6 @@ _DEFINITE_REJECTION_ERRORS = frozenset(
         "ErrorCalendarIsOrganizerForRemove",
         "ErrorNotOrganizer",
         "ErrorNotDelegate",
-        # OOF settings rejected outright
-        "ErrorInvalidUserOofSettings",
     }
 )
 
@@ -154,9 +192,13 @@ def is_definite_rejection(exc) -> bool:
     Unknown errors default to False (ambiguous) on purpose: re-executing an
     ambiguous write can duplicate a send.
     """
+    from exchangelib.errors import InvalidEnumValue, InvalidTypeError, NaiveDateTimeNotAllowed
+
+    if isinstance(exc, (InvalidEnumValue, InvalidTypeError, NaiveDateTimeNotAllowed)):
+        return True
     code = getattr(exc, "code", None)
-    if code is not None and exc.__class__.__name__ == "ToolOperationError":
-        if code in UNKNOWN_OUTCOME_CODES:
+    if isinstance(exc, ToolOperationError):
+        if code in UNKNOWN_OUTCOME_CODES or exc.status in ("unknown", "partial"):
             return False
         cause = getattr(exc, "__cause__", None)
         # No cause -> raised by our own pre-submit validation.
@@ -178,44 +220,52 @@ def classify_submission_failure(exc, *, action, unknown_code, rejected_code):
         )
     return (
         unknown_code,
-        f"{action}失败或结果未知；请先查询原操作号确认结果，勿重复提交。",
+        f"{action}结果未知；请先核对邮箱中的实际结果，勿重复提交。",
         True,
     )
 
 
-def require_confirmation(
-    *,
-    mailbox,
-    action,
-    items,
-    details=None,
-    confirm=False,
-    confirmation_id=None,
-):
-    """Build a preview snapshot; the server owns the persistent gate.
+def error_details(exc, *, submitted=False):
+    """Classify an error by real SDK types and preserve sanitized EWS causes."""
+    from exchangelib.errors import EWSError, InvalidEnumValue, InvalidTypeError, NaiveDateTimeNotAllowed, ResponseMessageError, TransportError, UnauthorizedError
+    from requests.exceptions import RequestException
 
-    This is deliberately a pass-through now: the durable two-phase confirmation
-    (operation_id / confirm_token / idempotency_key) is enforced in the MCP layer
-    via the persistent OperationStore, not here. When ``confirm`` is False the
-    caller receives the read-only preview; when True the handler proceeds to
-    execute (the server has already validated the token and identical params).
-    The digest is only a preview-change hint, not an authentication token.
-    """
-    snapshot = {
-        "mailbox": mailbox.lower(),
-        "action": action,
-        "items": items,
-        "details": details,
-    }
-    encoded = json.dumps(
-        snapshot, sort_keys=True, ensure_ascii=False, separators=(",", ":")
-    ).encode("utf-8")
-    digest = hashlib.sha256(encoded).hexdigest()
-    if not confirm:
-        return {
-            "confirmation_required": True,
-            "confirmation_id": digest,
-            "action": action,
-            "preview": snapshot,
-        }
-    return None
+    chain = []
+    cause = exc
+    while cause is not None and id(cause) not in {id(item) for item in chain}:
+        chain.append(cause)
+        cause = cause.__cause__
+    exchange = next((e for e in chain if isinstance(e, EWSError)), None)
+    status = "unknown" if submitted and not is_definite_rejection(exc) else "failed"
+    if isinstance(exc, ToolOperationError):
+        status = exc.status if exc.status != "failed" else status
+        if exc.code in UNKNOWN_OUTCOME_CODES:
+            status = "unknown"
+        code, message = exc.code, exc.public_message
+    elif isinstance(exc, (InvalidEnumValue, InvalidTypeError, NaiveDateTimeNotAllowed)):
+        code, message = "INVALID_PARAMS", "参数不符合 Exchange 字段类型或取值要求。"
+    elif isinstance(exc, UnauthorizedError):
+        code, message = "AUTHENTICATION_FAILED", "Exchange 认证失败，请检查所选凭据。"
+    elif isinstance(exc, ResponseMessageError):
+        name = type(exc).__name__
+        code = {"ErrorAccessDenied": "EXCHANGE_ACCESS_DENIED", "ErrorSendAsDenied": "EXCHANGE_ACCESS_DENIED",
+                "ErrorImpersonateUserDenied": "EXCHANGE_ACCESS_DENIED", "ErrorItemNotFound": "ITEM_NOT_FOUND",
+                "ErrorInvalidChangeKey": "VERSION_CONFLICT", "ErrorIrresolvableConflict": "VERSION_CONFLICT"}.get(name, "EXCHANGE_ERROR")
+        message = "Exchange 拒绝或无法完成此操作。"
+    elif isinstance(exc, (TransportError, RequestException, TimeoutError, ConnectionError)):
+        code, message = "NETWORK_ERROR", "Exchange 网络请求失败。"
+    elif isinstance(exc, ValueError) and not submitted:
+        code, message = "INVALID_PARAMS", "参数或配置无效。"
+    elif isinstance(exc, EWSError):
+        code, message = "EXCHANGE_ERROR", "Exchange 请求或响应处理失败。"
+    else:
+        code, message = "INTERNAL_ERROR", "服务内部错误，请使用请求号查询服务日志。"
+    result = {"error_code": code, "message": sanitize(message), "status": status}
+    if status == "unknown":
+        result["message"] = (result["message"] or "操作失败") + " 操作结果未知，请先核对邮箱中的实际结果，勿重复提交。"
+    if exchange is not None:
+        result["exchange_code"] = type(exchange).__name__
+        result["exchange_message"] = sanitize(str(exchange))
+    if isinstance(exc, ToolOperationError) and exc.results is not None:
+        result["results"] = exc.results
+    return result

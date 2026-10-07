@@ -1,17 +1,6 @@
-"""The tool vocabulary, wrapped in one strict unified params contract.
-
-33 tools are defined; 28 are registered. Disabled tool definitions are retained
-but excluded from registration via ``DISABLED_TOOLS``.
-
-Mirrors the reference ``ews4s_oa_delegate`` registry: every tool exposes only a
-single ``arguments.params`` object; ``lanid`` / ``name`` are always required; IDs are
-mailbox-scoped; write tools route through the persistent two-phase confirmation
-(``operation_id`` + ``confirm_token`` + optional ``idempotency_key``).
-"""
-
-from __future__ import annotations
-
-# ---------------- field helpers ----------------
+"""已确认的 29 工具，顶层凭据参数与严格 JSON Schema。"""
+from copy import deepcopy
+from contact_fields import CONTACT_SCHEMA
 
 SIDE_READ = "read"
 SIDE_WRITE = "write"
@@ -41,7 +30,7 @@ _FOLDER_FIELDS = frozenset({"folder", "to_folder"})
 
 # Fine-grained error codes for public-schema validation failures. Only these
 # fields carry one; everything else - identity fields, unknown properties and
-# the preview/confirm/query oneOf combinations - stays INVALID_PARAMS, so a
+# unsupported properties - stay INVALID_PARAMS, so a
 # schema failure is never reported as an identity or a business rejection.
 _FIELD_ERROR_CODES = {}
 for _code, _names in (
@@ -64,29 +53,6 @@ _FOLDER_HINT = (
     "Use a well-known alias as returned by list_folders and accepted by this "
     "field's enum. Raw EWS folder IDs are rejected."
 )
-
-_READ_TOOLS = frozenset(
-    {
-        "list_folders",
-        "find_message",
-        "get_message",
-        "get_thread",
-        "get_attachment",
-        "prepare_attachment_download",
-        "get_mailbox_overview",
-        "list_events",
-        "get_event",
-        "list_tasks",
-        "find_people",
-        "get_contact",
-        "check_availability",
-        "get_oof_settings",
-        "waiting_on",
-        "get_server_status",
-        "list_flagged_messages",
-    }
-)
-
 
 def _s(name, type_, description, *, required=False, default=None, enum=None,
        items=None, minimum=None, maximum=None, min_length=None, max_length=None, min_items=None, max_items=None):
@@ -227,7 +193,7 @@ TOOLS: dict[str, list[dict]] = {
         _s("end", "string", "End; defaults to start+1h.", default=None),
         _s("location", "string", "Location.", default=None),
         _s("attendees", "array", "Attendee emails.", default=None, items="string", max_items=100),
-        _s("send_invitations", "boolean", "Email attendees (requires send switch + confirm).", default=False),
+        _s("send_invitations", "boolean", "Email attendees (requires send switch).", default=False),
     ],
     "update_event": [
         _s("event_id", "string", "Scoped event ID.", required=True),
@@ -236,7 +202,7 @@ TOOLS: dict[str, list[dict]] = {
         _s("start", "string", "New start.", default=None),
         _s("end", "string", "New end.", default=None),
         _s("location", "string", "New location; empty string clears.", default=None),
-        _s("notify_attendees", "boolean", "Notify attendees (requires send switch + confirm).", default=False),
+        _s("notify_attendees", "boolean", "Notify attendees (requires send switch).", default=False),
     ],
     "respond_to_event": [
         _s("event_id", "string", "Scoped event ID.", required=True),
@@ -247,164 +213,69 @@ TOOLS: dict[str, list[dict]] = {
         _s("event_id", "string", "Organizer-owned scoped event ID.", required=True),
         _s("message", "string", "Cancellation note; omitting it does not suppress meeting cancellation notices.", default=None),
     ],
-    # --- availability ---
-    "check_availability": [
-        _s("start", "string", "Window start.", required=True),
-        _s("end", "string", "Window end.", required=True),
-        _s("attendees", "array", "Attendee emails to check.", required=True, items="string", max_items=100),
-        _s("duration", "integer", "Suggested slot duration in minutes.", default=30, maximum=1440),
+    # --- contacts ---
+    "list_contact_folders": [],
+    "list_contacts": [
+        _s("folder_id", "string", "联系人文件夹 ID；省略为默认 Contacts。", min_length=1),
+        _s("limit", "integer", "分页大小。", default=50, minimum=1, maximum=100),
+        _s("offset", "integer", "分页偏移。", default=0, minimum=0),
     ],
-    # --- people / contacts ---
     "find_people": [
-        _s("query", "string", "Search text.", required=True),
-        _s("source", "string", "gal, contacts, or auto.", default="auto", enum=["auto", "gal", "contacts"]),
-        _s("limit", "integer", "Max per source.", default=20, maximum=100),
-        _s(
-            "directory_id",
-            "string",
-            "Administrator-configured team shared directory; optional and requires source=contacts, which must be passed explicitly. Searches only that directory. Omit for the employee's own Contacts folder.",
-            default=None,
-            min_length=1,
-        ),
+        _s("query", "string", "联系人/GAL 搜索文本。", required=True, min_length=1),
+        _s("source", "string", "省略文件夹时选择 auto/contacts/gal；指定文件夹只查询其中联系人。", default="auto", enum=["auto", "contacts", "gal"]),
+        _s("limit", "integer", "每来源最多结果。", default=20, minimum=1, maximum=100),
+        _s("folder_id", "string", "已有联系人文件夹 ID。", min_length=1),
     ],
     "get_contact": [
-        _s("contact_id", "string", "Scoped Contacts item ID, or exact GAL email.", required=True),
-        _s(
-            "directory_id",
-            "string",
-            "Administrator-configured team shared directory; optional. With it, contact_id is read as an item ID inside that directory only and an email address never resolves through GAL. Omit to read the employee's own Contacts.",
-            default=None,
-            min_length=1,
-        ),
+        _s("contact_id", "string", "联系人 ID；省略 folder_id 时也允许精确 GAL 邮箱地址。", required=True, min_length=1),
+        _s("folder_id", "string", "联系人所在文件夹 ID；省略使用默认 Contacts。", min_length=1),
     ],
     "create_contact": [
-        _s(
-            "display_name",
-            "string",
-            "Name saved on the contact itself; not the requester's name (that is the top-level name field) and it never selects a mailbox.",
-            required=True,
-            min_length=1,
-        ),
-        _s("email", "string", "Single contact email address; never selects the target mailbox.", required=True),
-        _s("phone", "string", "Business phone.", default=None),
-        _s("company_name", "string", "Company name.", default=None),
-        _s("job_title", "string", "Job title.", default=None),
-        _s(
-            "directory_id",
-            "string",
-            "Administrator-configured team shared directory to create in; optional. Only employees with create permission for that directory may use it, and the preview shows the resolved target. Omit to create in the employee's own Contacts.",
-            default=None,
-            min_length=1,
-        ),
+        _s("contact", "object", "联系人资料；新建 display_name 必填，未传的选填字段为空。", required=True),
+        _s("folder_id", "string", "创建目标已有联系人文件夹；省略使用默认 Contacts。", min_length=1),
     ],
-    # --- tasks ---
-    "list_tasks": [
-        _s("folder", "string", "Task folder alias.", default="tasks", enum=["tasks"]),
-        _s("incomplete_only", "boolean", "Only incomplete tasks.", default=True),
-        _s("limit", "integer", "Max results.", default=50, maximum=100),
+    "update_contact": [
+        _s("contact_id", "string", "要编辑的联系人 ID。", required=True, min_length=1),
+        _s("contact", "object", "仅修改传入字段，省略保留，明确空值清空；地址和标签递归合并。", required=True),
+        _s("folder_id", "string", "联系人所在文件夹；省略使用默认 Contacts。", min_length=1),
     ],
-    "create_task": [
-        _s("subject", "string", "Task subject.", required=True),
-        _s("body", "string", "Task body.", default=None, max_length=65536),
-        _s("start_date", "string", "Start date (ISO).", default=None),
-        _s("due_date", "string", "Due date (ISO).", default=None),
-    ],
-    "update_task": [
-        _s("task_id", "string", "Scoped task ID.", required=True),
-        _s("complete", "boolean", "Mark complete/incomplete.", default=None),
-        _s("due_date", "string", "New due date.", default=None),
-    ],
-    # --- mirror heuristic ---
-    "waiting_on": [
-        _s("id", "string", "Scoped message ID of the outgoing message.", required=True),
-        _s("days", "integer", "Mirror window in days (max 365).", default=30, maximum=365),
-    ],
-    # --- oof ---
-    "get_oof_settings": [],
-    "set_oof": [
-        _s("enabled", "boolean", "Enable/disable OOF.", required=True),
-        _s("internal_reply", "string", "Internal reply text.", default=None, max_length=65536),
-        _s("external_reply", "string", "External reply text; non-empty enables audience All.", default=None, max_length=65536),
-        _s("start", "string", "Scheduled start (optional).", default=None),
-        _s("end", "string", "Scheduled end (optional).", default=None),
-    ],
-    # --- status ---
     "get_server_status": [],
 }
 
-DESCRIPTIONS = {
-    "list_folders": "Report which folders this employee can access, with each one's item and unread counts; an inaccessible folder is reported in coverage, it does not block the others.",
-    "find_message": "Search one authorized employee mail folder: query matches subject text and supports structured filters; aqs is exclusive with nonempty query and structured filters. This does not search the service account mailbox; not finding a meeting notice in employee Sent does not establish delivery failure.",
-    "get_message": "Read one scoped message with paginated body and attachment inventory; clean_body defaults to false, so HTML is preserved unless explicitly cleaned; stale IDs require a new search.",
-    "get_thread": "Read a scoped conversation from employee Inbox and Sent; successful results include folder coverage and partial status. Each body is capped at 10000 characters; use get_message to read further. This does not search service-account Sent; missing meeting notices do not establish delivery failure.",
-    "get_attachment": "List attachment metadata or read supported text files; the 5 MiB input and 20000-character output limits apply to text reading, not metadata listing. Other file types return metadata only. To download an original file, use prepare_attachment_download and then HTTP GET its URL from the employee execution environment.",
-    "prepare_attachment_download": "Prepare an original file attachment for HTTP download after checking its message and mailbox scope. Returns download_url, filename, content_type, size, sha256 and expires_at; no file bytes or server paths. The URL is a temporary bearer credential: download into the task workspace, verify SHA-256, and do not publish it. Retry GET while valid; call this tool again after expiry. Requires server download configuration; item attachments are unsupported.",
-    "get_mailbox_overview": "Read Inbox total/unread counts and recent unread messages only.",
-    "create_draft": "Create a new draft or native EWS reply/reply_all/forward draft without sending; use an original message ID, not a consumed draft ID. A new draft takes real HTML with body_format=html; reply/forward bodies are always plain text and keep the quoted original's own formatting.",
-    "update_draft": "Update supplied draft fields and align the draft author with the OA employee when needed; empty values clear supported fields. body_action=replace (default) makes body the whole new body, including any quoted original. body_action=prepend adds body as one new piece of content at the start of the server-read existing body, keeping that body's tables, styles, quoted mail and inline images, so the original is never resubmitted; prepend takes plain text, or an HTML fragment with body_format=html when the draft is already HTML (fragment only, no html/head/body, and any cid: image it references must already exist on the draft). To change only recipients or subject, omit body (and do not pass body_format/body_action). The preview snapshots the draft version, confirm refuses a draft that was edited since preview, and the save itself uses EWS conflict detection.",
-    "delete_draft": "Move one draft to DeletedItems; requires DeletedItems access; never permanently deletes or falls back to hard delete.",
-    "send_draft": "Send one existing employee draft and save a copy in employee Sent; source draft ID is consumed, not a sent/received ID; no auto resend; idempotency_key persists across restarts.",
-    "update_messages": "Update read status/categories of ordinary mail only; meeting request/cancellation objects are rejected per item.",
-    "set_message_flag": "Set the Outlook follow-up flag (flagged/complete/clear) on one ordinary message; meeting request/cancellation objects are rejected.",
-    "list_flagged_messages": "List items with open or completed follow-up flags in one authorized mail folder, open flags by default; status=all includes both states and excludes unflagged items.",
-    "move_messages": "Move ordinary non-draft mail between this employee's Inbox and Sent only; use the returned NEW ID after moving; old ID is not rebound.",
-    "delete_messages": "Move ordinary mail to DeletedItems only; soft/permanent deletion is prohibited; batch outcomes identify failed/uncertain items; no auto retries.",
-    "list_events": "List calendar occurrences in a time window with pagination and instance expansion. has_more is a full-page hint; the next page may still be empty.",
-    "get_event": "Read one scoped calendar event with organizer, attendees, response and recurrence metadata.",
-    "create_event": "Create an event returning its real ID; invitations off by default; send_invitations=true emails attendees and requires the send switch.",
-    "update_event": "Update an organizer-owned single event or explicit occurrence; recurring masters rejected; notify_attendees=false is silent; empty location clears it.",
-    "respond_to_event": "Accept, decline or tentatively respond as an attendee, sending a response after confirmation and the send switch check; organizer-owned and recurring-master objects are rejected.",
-    "cancel_event": "Cancel an organizer-owned event: meetings send native EWS cancellation notices and require the send switch; only a non-meeting appointment with no attendees is moved to Deleted Items without a notice. Omitting message does not suppress cancellation notices; recurring masters rejected.",
-    "check_availability": "Query directory free/busy and suggest shared slots; any unavailable or NoData attendee prevents claiming a mutually free slot.",
-    "find_people": "Search the organization directory (GAL) and/or the OA mailbox Contacts folder independently; different sources with separate permissions and coverage. With directory_id, search only that administrator-configured team shared directory using source=contacts; gal/auto cannot be combined with it and are rejected.",
-    "get_contact": "Read a scoped Contacts item, or resolve an exact unique email in the organization directory; directory address cannot switch the target mailbox. With directory_id, read an item ID inside that team shared directory only: the employee's directory permission is checked first, the item's parent folder must be that directory, and an email address never falls through to GAL. The result names the directory it came from.",
-    "create_contact": "Create one contact in the OA employee's own Contacts folder, or in an administrator-configured team shared directory when directory_id is given; never touches the GAL and sends no mail. A shared-directory create requires create permission for that directory, and the preview and receipt both name the resolved target; the confirmed target is re-verified, so a re-pointed directory requires a fresh preview.",
-    "list_tasks": "Read scoped Exchange tasks live, incomplete by default; use returned IDs for update_task.",
-    "create_task": "Create one task in the OA employee's own Tasks folder; sends no mail and invites nobody.",
-    "update_task": "Update a scoped task completion/due date using a checked change key; no fields means no write.",
-    "waiting_on": "Opt-in local mirror follow-up heuristic, not proof of no reply; requires current online Inbox/Sent permissions and complete bounded mirror coverage.",
-    "get_oof_settings": "Read this OA mailbox out-of-office settings; folder delegation may not authorize this mailbox-level operation.",
-    "set_oof": "Set employee out-of-office settings; omitting external_reply disables external replies, supplying nonempty external_reply enables audience All (shown in preview); internal text is never copied outward by default.",
-    "get_server_status": "Return the current mailbox, whether this adapter has an account, send/cache flags, available mirror coverage and the data-directory basename; no credentials or other mailbox statistics.",
-}
+DESCRIPTIONS = {'list_folders': '列出目标邮箱邮件文件夹和数量；无法读取的文件夹单独返回覆盖错误。',
+ 'find_message': '搜索目标邮箱指定邮件文件夹，支持主题、时间、未读、附件或独立 AQS；返回分页及邮件 ID。',
+ 'get_message': '读取指定邮件详情及分页正文；默认保留 HTML，可选择纯文本。',
+ 'get_thread': '读取目标 Inbox 和 Sent 中的会话，返回覆盖情况与部分失败；每封正文最多一万字。',
+ 'get_attachment': '列出附件或读取受支持文本文件；不支持的类型只返回元数据。原文件使用 prepare_attachment_download。',
+ 'prepare_attachment_download': '生成原附件临时签名下载地址，返回文件名、类型、大小、SHA-256 和失效时间；需要启用下载配置。',
+ 'get_mailbox_overview': '读取目标收件箱总量、未读量和近期未读邮件。',
+ 'create_draft': '直接保存新邮件或原生回复/全部回复/转发草稿。新邮件可用 HTML；回复/转发输入仅为新增纯文本，Exchange 保留原文格式。',
+ 'update_draft': '直接修改指定草稿字段并保留未传字段和附件。正文 replace 替换整段，prepend 前置内容；HTML 前置必须是片段且原草稿为 HTML，cid 图片须已存在。真实 EWS '
+                 'ChangeKey 检查冲突。',
+ 'delete_draft': '将草稿移入 Deleted Items；不执行永久删除。',
+ 'send_draft': '直接发送目标草稿并保存到目标 Sent；From 为目标邮箱，允许公邮代理发送显示。发送须部署开关开启，结果未知时先核对实际邮箱，不自动重发。',
+ 'update_messages': '批量直接修改普通邮件已读状态和分类，返回逐项成功/失败/未知结果；拒绝会议通知对象。',
+ 'move_messages': '批量将普通非草稿邮件移到目标 Inbox 或 Sent，使用返回的新 ID。',
+ 'delete_messages': '批量将普通邮件移入 Deleted Items；不执行永久删除，返回逐项结果。',
+ 'set_message_flag': '直接修改普通邮件旗标和日期，拒绝会议通知对象。',
+ 'list_flagged_messages': '读取指定邮件文件夹中未完成/已完成的旗标邮件。',
+ 'list_events': '按时间窗口读取日历实例，分页；has_more 为满页提示。',
+ 'get_event': '读取日历详情、参与者、响应与重复信息。',
+ 'create_event': '直接创建日历条目；send_invitations 默认关闭，开启需发送开关。',
+ 'update_event': '直接编辑组织者拥有的单次日程或明确实例，拒绝重复主项；可静默或通知参与者。',
+ 'respond_to_event': '以参与者身份直接接受/暂定/拒绝邀请并发送响应，需发送开关；拒绝组织者和重复主项。',
+ 'cancel_event': '组织者直接取消日程；会议发送原生取消通知，需发送开关；无参与者普通预约移至已删除。',
+ 'list_contact_folders': '发现目标邮箱所有已有普通联系人文件夹，返回 ID、父 ID、名称和路径；不创建文件夹。',
+ 'list_contacts': '读取指定联系人文件夹，省略为默认 Contacts；不递归扫描子文件夹。',
+ 'find_people': '独立查询联系人/GAL；提供 folder_id 时只查其中联系人，GAL 只读；保留逐来源错误。',
+ 'get_contact': '读取指定文件夹的完整联系人资料；默认文件夹时也支持精确 GAL 邮箱查询。',
+ 'create_contact': '直接在指定已有文件夹创建联系人，支持完整标准字段、多个邮箱/电话/地址、备注和照片；未传选填值为空，不发送邮件。',
+ 'update_contact': '直接编辑指定文件夹联系人：未传保留、显式空清空、地址和标签递归合并。备注对应正文；照片独立附件步骤可能部分成功。',
+ 'get_server_status': '返回当前目标邮箱、连接状态和发送开关，不包含凭据。'}
 
-# Notification-copy placement is deployment-dependent; employee Sent is not a
-# delivery receipt. Keep the existing EWS send/save behavior unchanged.
-for _name in ("create_event", "update_event", "cancel_event"):
-    DESCRIPTIONS[_name] += (
-        " Meeting notification copies are not guaranteed to appear in employee Sent; "
-        "a missing copy alone does not establish sending failure or justify resending."
-    )
-
-# ---------------- deliberately unregistered tools ----------------
-# These definitions are retained but are NOT registered, so no external caller
-# can see or invoke them. Re-exposure also requires the corresponding business
-# module and deployment permissions. Three distinct reasons live here:
-#   * delete_draft / delete_messages -- deletion-class policy: withheld by
-#     decision, not a defect.
-#   * get_oof_settings / set_oof -- OOF is a mailbox-level Exchange right this
-#     delegated service account does not hold on the current deployment; even a
-#     correct request is refused with ErrorAccessDenied, so the tool could only
-#     ever fail. Re-expose only if the right is actually granted.
-#   * waiting_on -- requires the local mirror (EWS_MCP_CACHE_ENABLED=true),
-#     which is off; without it the tool can only ever refuse.
-DISABLED_TOOLS = frozenset(
-    {
-        "delete_draft",
-        "delete_messages",
-        "get_oof_settings",
-        "set_oof",
-        "waiting_on",
-    }
-)
-
-TOOL_NAMES = [name for name in TOOLS if name not in DISABLED_TOOLS]
-assert len(TOOL_NAMES) == 28, f"expected 28 registered tools, got {len(TOOL_NAMES)}"
-
-# Registered read tools: kept in step with TOOL_NAMES so this constant never
-# advertises a tool the dispatcher cannot route.
-READ_TOOLS = frozenset(_READ_TOOLS) & frozenset(TOOL_NAMES)
-
+TOOL_NAMES = list(TOOLS)
+assert len(TOOL_NAMES) == 29
+READ_TOOLS = frozenset(['list_folders', 'find_message', 'get_message', 'get_thread', 'get_attachment', 'prepare_attachment_download', 'get_mailbox_overview', 'list_events', 'get_event', 'find_people', 'get_contact', 'list_contact_folders', 'list_contacts', 'get_server_status', 'list_flagged_messages'])
 
 def _business_schema(fields):
     properties = {}
@@ -438,6 +309,9 @@ def _business_schema(fields):
             for key in ("minimum", "maximum"):
                 if key in field:
                     schema[key] = field[key]
+        # 原生 CharField 限长，在建立连接前拒绝，避免 save 本地清理误报提交未知。
+        if name == "subject":
+            schema["maxLength"] = 255
         if name in _FIELD_ERROR_CODES:
             # public-schema failures on this field report this code instead of
             # the blanket INVALID_PARAMS (see mcp_server._validate_arguments).
@@ -460,129 +334,39 @@ def _business_schema(fields):
 
 
 def public_tools():
-    """Build registration specs from the current enabled tool set."""
     result = []
     for name in TOOL_NAMES:
-        fields = TOOLS[name]
-        business_schema, business_required = _business_schema(fields)
-
-        params = dict(business_schema)
-        params["properties"]["lanid"] = {
-            "type": "string", "minLength": 1, "maxLength": 128,
-            "description": "Requester LANID; verified against OA on every call.",
-        }
-        params["properties"]["name"] = {
-            "type": "string", "minLength": 1, "maxLength": 128,
-            "description": "Requester Chinese name; must match the OA ChinNm.",
-        }
-        params["required"] = ["lanid", "name"] + [
-            f for f in business_required if f not in ("lanid", "name")
-        ]
-
-        description = (
-            DESCRIPTIONS[name]
-            + " OA verification is required on every call; the target mailbox comes only from OA."
-        )
-
-        if name not in _READ_TOOLS:
-            params["required"] = ["lanid", "name"]
-            params["properties"].update(
-                {
-                    "confirm_token": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 2048,
-                        "description": "Return the preview token unchanged to execute the identical operation.",
-                    },
-                    "operation_id": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 128,
-                        "description": "With identity only: query a receipt without repeating any write.",
-                    },
-                    "idempotency_key": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 128,
-                        "description": "Optional caller-chosen key; a completed key returns its receipt and never re-executes.",
-                    },
-                }
-            )
-            params["oneOf"] = [
-                {"required": business_required,
-                 "not": {"anyOf": [{"required": ["operation_id"]}, {"required": ["confirm_token"]}]}},
-                {"required": business_required + ["operation_id", "confirm_token"]},
-                {"required": ["operation_id"],
-                 "not": {"anyOf": [{"required": [key]} for key in
-                         [f["name"] for f in fields] + ["confirm_token", "idempotency_key"]]}},
-            ]
-            description += (
-                " All writes require a preview, then identical params plus operation_id and "
-                "confirm_token. Query operation_id after an uncertain response; never blindly retry."
-            )
-
+        schema, required = _business_schema(TOOLS[name])
+        schema["properties"].update({
+            "mailbox": {"type": "string", "minLength": 3, "maxLength": 320, "pattern": r"^[^\s@]+@[^\s@]+$", "description": "目标用户邮箱。"},
+            "username": {"type": ["string", "null"], "maxLength": 256, "description": "个人登录名，省略默认邮箱；公邮模式忽略。"},
+            "password": {"type": ["string", "null"], "maxLength": 4096, "description": "个人密码；未传/null/空字符串使用公邮代理；仅本次内存使用。"},
+        })
+        schema["required"] = ["mailbox", *required]
+        if name in ("create_contact", "update_contact"):
+            schema["properties"]["contact"] = deepcopy(CONTACT_SCHEMA)
+            if name == "create_contact":
+                schema["properties"]["contact"]["required"] = ["display_name"]
         if name == "create_draft":
-            # Applies to preview/confirm only; identity + operation_id stays valid.
-            params["allOf"] = [{
-                "if": {"anyOf": [{"not": {"required": ["operation_id"]}},
-                                  {"required": ["confirm_token"]}]},
-                "then": {
-                    "if": {"required": ["mode"], "properties": {"mode": {"enum": ["reply", "reply_all", "forward"]}}},
-                    "then": {"required": ["reply_to"]},
-                    "else": {"not": {"required": ["reply_to"]}},
-                },
-            }, {
-                # An HTML body only makes sense for a brand-new message: a reply's
-                # body is "your new text" and the quoted original supplies the
-                # formatting. Omitting mode defaults to new, so only an explicit
-                # reply mode conflicts.
-                "not": {
-                    "required": ["body_format", "mode"],
-                    "properties": {
-                        "body_format": {"const": "html"},
-                        "mode": {"enum": ["reply", "reply_all", "forward"]},
-                    },
-                },
-            }]
+            schema["allOf"] = [
+                {"if": {"required": ["mode"], "properties": {"mode": {"enum": ["reply", "reply_all", "forward"]}}},
+                 "then": {"required": ["reply_to"]}, "else": {"not": {"required": ["reply_to"]}}},
+                {"not": {"required": ["body_format", "mode"], "properties": {
+                    "body_format": {"const": "html"}, "mode": {"enum": ["reply", "reply_all", "forward"]}}}},
+            ]
         elif name == "update_draft":
-            params["allOf"] = [{
-                # Both only mean something alongside body; silently ignoring them
-                # would read as a successful edit that never happened.
-                "dependentRequired": {
-                    "body_format": ["body"],
-                    "body_action": ["body"],
-                },
-            }]
-        elif name == "find_people":
-            # A team shared directory is a third, explicit source: it is never
-            # folded into auto and never combined with gal, so the source must be
-            # stated rather than inherited from the default.
-            params["allOf"] = [{
-                "if": {"required": ["directory_id"]},
-                "then": {
-                    "required": ["source"],
-                    "properties": {"source": {"const": "contacts"}},
-                },
-            }]
+            schema["dependentRequired"] = {"body_format": ["body"], "body_action": ["body"]}
         elif name == "find_message":
-            params["allOf"] = [{
-                "if": {"required": ["aqs"]},
-                "then": {
-                    "properties": {"query": {"const": ""}},
-                    "not": {"anyOf": [{"required": [key]} for key in
-                                      ("since", "until", "is_unread", "has_attachments")]},
-                },
-            }]
-
-        result.append(
-            {
-                "name": name,
-                "description": description,
-                "inputSchema": params,
-            }
-        )
+            schema["allOf"] = [{"if": {"required": ["aqs"]}, "then": {
+                "properties": {"query": {"const": ""}},
+                "not": {"anyOf": [{"required": [key]} for key in ("since", "until", "is_unread", "has_attachments")]},
+            }}]
+        description = DESCRIPTIONS[name] + " 每次传 mailbox；可选 username/password。"
+        if name not in READ_TOOLS:
+            description += " 直接执行，无二次确认；结果未知时先核对实际邮箱。"
+        result.append({"name": name, "description": description, "inputSchema": schema})
     return result
 
 
 SPECS = {tool["name"]: tool for tool in public_tools()}
-assert len(SPECS) == 28
+assert len(SPECS) == 29

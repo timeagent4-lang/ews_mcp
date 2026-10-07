@@ -1,4 +1,4 @@
-"""Outlook follow-up flags on ordinary mail for the OA-resolved employee.
+"""当前目标邮箱普通邮件的 Outlook 后续处理旗标。
 
 Flag state is Outlook's own follow-up model: a ``0x1090`` FlagStatus plus the
 PSETID_Task properties. exchangelib 5.6 ships only ``0x1090``, and it rejects
@@ -12,15 +12,17 @@ through ``save(update_fields=[...])``.
 from datetime import datetime
 
 from exchangelib import EWSDateTime, ExtendedProperty, Message
+from exchangelib.items.base import NEVER_OVERWRITE
 from exchangelib.restriction import Q
 
 from mail_operations import SIMPLE_FIELDS
 from tool_support import (
     LOCAL_TIMEZONE,
     ToolOperationError,
+    error_details,
     iso_datetime,
     parse_datetime,
-    require_confirmation,
+    validate_item_fields,
 )
 
 FLAG_NONE = 0
@@ -177,7 +179,7 @@ def _list_row(item, time_field):
 
 class FlagOperations:
     def set_message_flag(
-        self, message_id, flag, due_date=None, confirm=False, confirmation_id=None
+        self, message_id, flag, due_date=None
     ):
         if flag not in FLAG_CHOICES:
             raise ToolOperationError(
@@ -186,24 +188,18 @@ class FlagOperations:
         item = self._tool_item(message_id)
         if type(item) is not Message:
             raise ToolOperationError("NOT_MAIL_MESSAGE", "此操作仅支持普通邮件。")
-        changes = _flag_changes(flag, due_date)  # validates due_date before preview
-        preview = require_confirmation(
-            mailbox=self.config.email,
-            action="set_message_flag",
-            items=[_flag_state(item)],
-            details={"flag": flag, "due_date": iso_datetime(due_date)},
-            confirm=confirm,
-            confirmation_id=confirmation_id,
-        )
-        if preview is not None:
-            return preview
+        if not item.id or not item.changekey:
+            raise ToolOperationError("INVALID_ITEM_ID", "邮件响应缺少 ID 或 ChangeKey，本次未提交写入。")
+        changes = _flag_changes(flag, due_date)
         for field, value in changes.items():
             setattr(item, field, value)
+        validate_item_fields(item, fields=list(changes))
         try:
-            item.save(update_fields=list(changes))
+            item.save(update_fields=list(changes), conflict_resolution=NEVER_OVERWRITE)
         except Exception as exc:
             raise ToolOperationError(
-                "FLAG_UPDATE_FAILED", "更新邮件旗标失败，请检查邮箱权限。"
+                "FLAG_UPDATE_FAILED", "更新邮件旗标失败。",
+                status=error_details(exc, submitted=True)["status"],
             ) from exc
         return {
             "id": item.id,
@@ -243,6 +239,9 @@ class FlagOperations:
             .only(*LIST_FIELDS)
             .order_by("-" + time_field)[:limit]
         )
+        for row in rows:
+            if isinstance(row, Exception):
+                raise row
         return {
             "items": [_list_row(row, time_field) for row in rows],
             "folder": folder,

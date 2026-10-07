@@ -1,6 +1,5 @@
-"""Scoped draft and ordinary mail mutations for the OA-resolved employee."""
+"""当前目标邮箱的草稿与普通邮件写入操作。"""
 
-import hashlib
 import re
 from html import escape as _html_escape
 
@@ -10,19 +9,11 @@ from exchangelib.items.base import MOVE_TO_DELETED_ITEMS, NEVER_OVERWRITE
 from tool_support import (
     ToolOperationError,
     classify_submission_failure,
-    require_confirmation,
+    error_details,
+    move_to_deleted_items,
     require_send,
-    sanitize,
+    validate_item_fields,
 )
-
-
-def _mailbox_state(value):
-    if value is None:
-        return None
-    return {
-        key: getattr(value, key, None)
-        for key in ("email_address", "name", "routing_type", "mailbox_type")
-    }
 
 
 def _address(value):
@@ -75,28 +66,8 @@ def _batch_ids(ids):
     return list(ids)
 
 
-def _failure(item_id, exc):
-    result = {
-        "id": item_id,
-        "success": False,
-        "error_code": (
-            exc.code if isinstance(exc, ToolOperationError) else "MAIL_OPERATION_FAILED"
-        ),
-        "message": (
-            exc.public_message
-            if isinstance(exc, ToolOperationError)
-            else "邮件操作失败，请检查权限或稍后重试。"
-        ),
-    }
-    if not isinstance(exc, ToolOperationError):
-        # A raw Exchange error must keep its ResponseCode per item instead of
-        # collapsing into the generic tool code above - the batch summary stays at
-        # the top level, the root cause stays with the row it belongs to.
-        result["exchange_code"] = exc.__class__.__name__
-        exchange_message = sanitize(str(exc))
-        if exchange_message:
-            result["exchange_message"] = exchange_message
-    return result
+def _failure(item_id, exc, *, submitted=False):
+    return {"id": item_id, "success": False, **error_details(exc, submitted=submitted)}
 
 
 def _new_body(text, source_body):
@@ -123,10 +94,6 @@ def _new_body(text, source_body):
 # The opening <body ...> tag. Only used to find a splice anchor, never to pick
 # apart the markup: everything between anchors is copied through untouched.
 _BODY_OPEN_RE = re.compile(r"<body\b[^>]*>", re.IGNORECASE)
-
-
-def _body_sha256(value):
-    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
 
 
 def _prepend_html(existing, snippet):
@@ -247,45 +214,9 @@ def _ordinary_message(item):
     # Meeting requests/cancellations are separate SDK classes and have other side effects.
     if type(item) is not Message:
         raise ToolOperationError("NOT_MAIL_MESSAGE", "此操作仅支持普通邮件。")
+    if not item.id or not item.changekey:
+        raise ToolOperationError("INVALID_ITEM_ID", "邮件响应缺少 ID 或 ChangeKey，本次未提交写入。")
     return item
-
-
-def _item_state(item):
-    body = str(item.body or "")
-    attachments = []
-    for attachment in item.attachments or []:
-        metadata = {
-            key: getattr(attachment, key, None)
-            for key in (
-                "name",
-                "size",
-                "content_type",
-                "content_id",
-                "content_location",
-                "is_inline",
-            )
-        }
-        metadata["id"] = getattr(getattr(attachment, "attachment_id", None), "id", None)
-        metadata["type"] = type(attachment).__name__
-        modified = getattr(attachment, "last_modified_time", None)
-        metadata["last_modified_time"] = modified.isoformat() if modified else None
-        attachments.append(metadata)
-    return {
-        "id": item.id,
-        "changekey": item.changekey,
-        "parent_folder_id": getattr(item.parent_folder_id, "id", None),
-        "is_draft": item.is_draft,
-        "subject": item.subject,
-        "author": _mailbox_state(item.author),
-        "to_recipients": [_mailbox_state(x) for x in item.to_recipients or []],
-        "cc_recipients": [_mailbox_state(x) for x in item.cc_recipients or []],
-        "bcc_recipients": [_mailbox_state(x) for x in item.bcc_recipients or []],
-        "body_preview": body[:2000],
-        "body_length": len(body),
-        "body_type": type(item.body).__name__,
-        "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
-        "attachments": attachments,
-    }
 
 
 class WriteOperations:
@@ -293,7 +224,7 @@ class WriteOperations:
         draft = _ordinary_message(self._tool_item(draft_id, folder_names=("drafts",)))
         if not draft.is_draft or getattr(draft.parent_folder_id, "id", None) != self._tool_folder("drafts").id:
             raise ToolOperationError(
-                "NOT_A_DRAFT", "邮件必须位于当前员工草稿箱且处于草稿状态。"
+                "NOT_A_DRAFT", "邮件必须位于目标邮箱草稿箱且处于草稿状态。"
             )
         return draft
 
@@ -307,8 +238,6 @@ class WriteOperations:
         mode="new",
         body_format="text",
         reply_to=None,
-        confirm=False,
-        confirmation_id=None,
     ):
         if mode not in ("new", "reply", "reply_all", "forward"):
             raise ToolOperationError("INVALID_DRAFT_MODE", "不支持的草稿类型。")
@@ -406,28 +335,19 @@ class WriteOperations:
                     )
                     # create_reply defaults an empty To back to the author.
                     draft.to_recipients = to
-        preview = require_confirmation(
-            mailbox=self.config.email,
-            action="create_draft",
-            items=[{
-                "subject": subject or "",
-                "body_preview": str(body or "")[:500],
-                "to": to_emails,
-                "cc": cc_emails,
-                "bcc": bcc_emails,
-                "mode": mode,
-                "body_format": body_format,
-                "reply_to": reply_to,
-            }],
-            confirm=confirm,
-            confirmation_id=confirmation_id,
-        )
-        if preview is not None:
-            return preview
+        validate_item_fields(draft)
         try:
             saved = draft.save() if mode == "new" else draft.save(folder=folder)
         except Exception as exc:
-            raise ToolOperationError("DRAFT_CREATE_FAILED", "保存草稿失败，请检查邮箱权限。") from exc
+            raise ToolOperationError(
+                "DRAFT_CREATE_FAILED", "保存草稿失败。",
+                status=error_details(exc, submitted=True)["status"],
+            ) from exc
+        if not saved or not saved.id or not saved.changekey:
+            raise ToolOperationError(
+                "DRAFT_SAVE_RESULT_UNKNOWN", "保存响应缺少草稿 ID 或 ChangeKey，请先检查草稿箱。",
+                status="unknown",
+            )
         return {"id": saved.id, "changekey": saved.changekey, "mode": mode, "created": True, "folder": "drafts"}
 
     def update_draft(
@@ -440,9 +360,6 @@ class WriteOperations:
         bcc_emails=None,
         body_format=None,
         body_action=None,
-        confirm=False,
-        confirmation_id=None,
-        expected_version=None,
     ):
         if body_format is not None and body_format not in ("text", "html"):
             raise ToolOperationError("INVALID_BODY_FORMAT", "body_format 仅支持 text 或 html。")
@@ -461,16 +378,6 @@ class WriteOperations:
             _validate_html_fragment(body)
 
         draft = self._write_draft(draft_id)
-        if expected_version is not None:
-            # 预览时服务器快照了本草稿的 changekey 与正文哈希，确认时重新读取并对照，
-            # 若预览后被 Outlook 或其它操作改动过则拒绝，而不是照着新状态覆盖。
-            current = {"changekey": draft.changekey, "body_sha256": _body_sha256(draft.body)}
-            if current != expected_version:
-                raise ToolOperationError(
-                    "DRAFT_CHANGED",
-                    "草稿在预览后被其他操作修改，本次未执行；请重新预览后再确认。",
-                )
-
         updates = {}
         if subject is not None:
             updates["subject"] = subject
@@ -499,96 +406,56 @@ class WriteOperations:
                 updates[field] = _recipients(value)
         if _address(draft.author) != self.config.email.lower():
             updates["author"] = Mailbox(email_address=self.config.email)
-        preview = require_confirmation(
-            mailbox=self.config.email,
-            action="update_draft",
-            items=[{
-                "draft_id": draft_id,
-                "subject": draft.subject,
-                "author": _address(draft.author),
-                "body_action": action,
-                "body_format": body_format or "text",
-                "body_preview": str(body or "")[:500],
-            }],
-            details={
-                "subject": subject,
-                "body_length": (len(body) if body is not None else None),
-                "body_action": action,
-                "body_format": body_format,
-                "to": to_emails,
-                "cc": cc_emails,
-                "bcc": bcc_emails,
-                # 版本快照存在服务端；确认时由 mcp_server._run_write 取回并重新校验，
-                # 不依赖调用方回传的版本号。
-                "version": {"changekey": draft.changekey, "body_sha256": _body_sha256(draft.body)},
-            },
-            confirm=confirm,
-            confirmation_id=confirmation_id,
-        )
-        if preview is not None:
-            return preview
         for field, value in updates.items():
             setattr(draft, field, value)
         if updates:
+            validate_item_fields(draft, fields=list(updates))
             try:
                 # NeverOverwrite 是 EWS 侧的乐观并发：ChangeKey 已随 ItemId 发出，
                 # 若在本次读取之后、写入之前又被改动，Exchange 会拒绝而不是覆盖。
                 draft.save(update_fields=list(updates), conflict_resolution=NEVER_OVERWRITE)
             except Exception as exc:
                 raise ToolOperationError(
-                    "DRAFT_UPDATE_FAILED", "更新草稿失败，请检查草稿权限或重新读取草稿。"
+                    "DRAFT_UPDATE_FAILED", "更新草稿失败，请重新读取草稿。",
+                    status=error_details(exc, submitted=True)["status"],
                 ) from exc
         return {"id": draft.id, "changekey": draft.changekey, "updated": bool(updates), "folder": "drafts"}
 
-    def send_draft(self, draft_id, confirm=False, confirmation_id=None):
+    def send_draft(self, draft_id):
         draft = self._write_draft(draft_id)
         if _address(draft.author) != self.config.email.lower():
             raise ToolOperationError(
-                "DRAFT_AUTHOR_MISMATCH", "草稿发件人不是当前员工，请先更新草稿再重新预览。"
+                "DRAFT_AUTHOR_MISMATCH", "草稿发件人与目标邮箱不一致，请先更新草稿。"
             )
         if not any((draft.to_recipients, draft.cc_recipients, draft.bcc_recipients)):
             raise ToolOperationError("RECIPIENT_REQUIRED", "发送邮件前必须指定收件人。")
-        preview = require_confirmation(
-            mailbox=self.config.email,
-            action="send_draft",
-            items=[_item_state(draft)],
-            confirm=confirm,
-            confirmation_id=confirmation_id,
-        )
-        if preview:
-            return preview
         require_send("发送邮件")
+        sent_folder = self._tool_folder("sent")
+        validate_item_fields(draft, fields=())
         try:
-            draft.send(save_copy=True, copy_to_folder=self._tool_folder("sent"))
+            draft.send(save_copy=True, copy_to_folder=sent_folder)
         except Exception as exc:
             # A timeout can mean the send succeeded; a definite rejection did not.
-            code, message, _ = classify_submission_failure(
+            code, message, uncertain = classify_submission_failure(
                 exc,
                 action="发送邮件",
                 unknown_code="SEND_FAILED_OR_UNKNOWN",
                 rejected_code="SEND_REJECTED",
             )
-            raise ToolOperationError(code, message) from exc
-        return {"id": draft.id, "sent": True, "copy_folder": "sent"}
+            raise ToolOperationError(code, message, status="unknown" if uncertain else "failed") from exc
+        # SendItem clears the draft ID and does not return a Sent item ID.
+        return {"id": draft_id, "sent": True, "copy_folder": "sent"}
 
-    def delete_draft(self, draft_id, confirm=False, confirmation_id=None):
+    def delete_draft(self, draft_id):
         draft = self._write_draft(draft_id)
-        preview = require_confirmation(
-            mailbox=self.config.email,
-            action="delete_draft",
-            items=[_item_state(draft)],
-            confirm=confirm,
-            confirmation_id=confirmation_id,
-        )
-        if preview:
-            return preview
+        validate_item_fields(draft, fields=())
         try:
-            # move_to_trash() 内部为 MOVE_TO_DELETED_ITEMS（移至已删除文件夹）。
-            # 原生 Message.delete() 是 HARD_DELETE（永久删除），语义不符，弃用。
-            # 调用后对象 ID 会被清空，返回仍以调用方传入的 draft_id 为准。
-            draft.move_to_trash()
+            move_to_deleted_items(draft)
         except Exception as exc:
-            raise ToolOperationError("DRAFT_DELETE_FAILED", "普通删除草稿失败，请检查邮箱权限。") from exc
+            raise ToolOperationError(
+                "DRAFT_DELETE_FAILED", "移至已删除邮件失败。",
+                status=error_details(exc, submitted=True)["status"],
+            ) from exc
         return {"id": draft_id, "deleted": True, "delete_type": MOVE_TO_DELETED_ITEMS}
 
     def update_messages(
@@ -597,8 +464,6 @@ class WriteOperations:
         set_read=None,
         categories_add=None,
         categories_remove=None,
-        confirm=False,
-        confirmation_id=None,
     ):
         ids = _batch_ids(ids)
         if set_read is not None and type(set_read) is not bool:
@@ -609,31 +474,16 @@ class WriteOperations:
                 or any(not isinstance(value, str) or not value.strip() for value in categories)
             ):
                 raise ToolOperationError("INVALID_CATEGORIES", "分类必须为非空文字列表。")
-        items, failures, snapshot = [], {}, []
+        items, failures = [], {}
         for item_id in ids:
             try:
                 item = _ordinary_message(self._tool_item(item_id))
                 items.append((item_id, item))
-                snapshot.append({"id": item_id, **_item_state(item)})
             except Exception as exc:
                 failures[item_id] = _failure(item_id, exc)
-                snapshot.append(failures[item_id])
-        preview = require_confirmation(
-            mailbox=self.config.email,
-            action="update_messages",
-            items=snapshot,
-            details={
-                "set_read": set_read,
-                "categories_add": categories_add,
-                "categories_remove": categories_remove,
-            },
-            confirm=confirm,
-            confirmation_id=confirmation_id,
-        )
-        if preview is not None:
-            return preview
         results = dict(failures)
         for item_id, item in items:
+            submitted = False
             try:
                 fields = []
                 if set_read is not None:
@@ -650,90 +500,73 @@ class WriteOperations:
                     )
                     fields.append("categories")
                 if fields:
-                    item.save(update_fields=fields)
+                    validate_item_fields(item, fields=fields)
+                    submitted = True
+                    item.save(update_fields=fields, conflict_resolution=NEVER_OVERWRITE)
                 results[item_id] = {
-                    "id": item_id, "success": True, "changekey": item.changekey, "updated": bool(fields)
+                    "id": item_id, "success": True, "status": "success", "changekey": item.changekey, "updated": bool(fields)
                 }
             except Exception as exc:
-                results[item_id] = _failure(item_id, exc)
+                results[item_id] = _failure(item_id, exc, submitted=submitted)
         return {"results": [results[item_id] for item_id in ids]}
 
-    def move_messages(self, ids, to_folder, confirm=False, confirmation_id=None):
+    def move_messages(self, ids, to_folder):
         ids = _batch_ids(ids)
         if to_folder not in ("inbox", "sent"):
             raise ToolOperationError(
                 "INVALID_MOVE_FOLDER", "普通邮件仅可在收件箱与已发送邮件间移动。"
             )
         folder = self._tool_folder(to_folder)
-        items, failures, snapshot = [], {}, []
+        items, failures = [], {}
         for item_id in ids:
             try:
                 item = _ordinary_message(self._tool_item(item_id, folder_names=("inbox", "sent")))
                 if item.is_draft:
                     raise ToolOperationError("DRAFT_MOVE_NOT_ALLOWED", "不能通过移动更改草稿状态。")
                 items.append((item_id, item))
-                snapshot.append({"id": item_id, **_item_state(item)})
             except Exception as exc:
                 failures[item_id] = _failure(item_id, exc)
-                snapshot.append(failures[item_id])
-        preview = require_confirmation(
-            mailbox=self.config.email,
-            action="move_messages",
-            items=snapshot,
-            details={"to_folder": to_folder},
-            confirm=confirm,
-            confirmation_id=confirmation_id,
-        )
-        if preview is not None:
-            return preview
         results = dict(failures)
         for item_id, item in items:
+            submitted = False
             try:
+                validate_item_fields(item, fields=())
+                submitted = True
                 item.move(to_folder=folder)
                 if not item.id:
                     raise ToolOperationError(
-                        "MOVE_RESULT_UNKNOWN", "移动返回的新邮件 ID 不可用，请重新列出目标文件夹。"
+                        "MOVE_RESULT_UNKNOWN", "移动响应缺少新邮件 ID，请先列出目标文件夹。",
+                        status="unknown",
                     )
                 results[item_id] = {
                     "id": item_id,
                     "new_id": item.id,
                     "changekey": item.changekey,
                     "success": True,
+                    "status": "success",
                     "folder": to_folder,
                 }
             except Exception as exc:
-                results[item_id] = _failure(item_id, exc)
+                results[item_id] = _failure(item_id, exc, submitted=submitted)
         return {"results": [results[item_id] for item_id in ids]}
 
-    def delete_messages(self, ids, confirm=False, confirmation_id=None):
+    def delete_messages(self, ids):
         ids = _batch_ids(ids)
-        items, failures, snapshot = [], {}, []
+        items, failures = [], {}
         for item_id in ids:
             try:
                 item = _ordinary_message(self._tool_item(item_id))
                 items.append((item_id, item))
-                snapshot.append(_item_state(item))
             except Exception as exc:
                 failures[item_id] = _failure(item_id, exc)
-                snapshot.append(failures[item_id])
-        preview = require_confirmation(
-            mailbox=self.config.email,
-            action="delete_messages",
-            items=snapshot,
-            confirm=confirm,
-            confirmation_id=confirmation_id,
-        )
-        if preview:
-            return preview
         results = dict(failures)
         for item_id, item in items:
+            submitted = False
             try:
-
-                # move_to_trash() 内部为 MOVE_TO_DELETED_ITEMS（移至已删除文件夹）。
-                # 原生 Message.delete() 是 HARD_DELETE（永久删除），语义不符，弃用。
-                # 调用后对象 ID 会被清空；逐项结果以调用方输入 item_id 键控。
-                item.move_to_trash()
-                results[item_id] = {"id": item_id, "success": True, "deleted": True}
+                validate_item_fields(item, fields=())
+                submitted = True
+                move_to_deleted_items(item)
+                results[item_id] = {"id": item_id, "success": True, "status": "success", "deleted": True}
             except Exception as exc:
-                results[item_id] = _failure(item_id, exc)
+                results[item_id] = _failure(item_id, exc, submitted=submitted)
         return {"results": [results[item_id] for item_id in ids], "delete_type": MOVE_TO_DELETED_ITEMS}

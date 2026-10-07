@@ -27,7 +27,7 @@ RUN --mount=type=secret,id=pip_conf,target=/etc/pip.conf \
 COPY *.py ./
 COPY utils/ utils/
 
-RUN useradd -m appuser && mkdir -p /data/ews_mcp && chown -R appuser:appuser /data/ews_mcp
+RUN useradd -m appuser && mkdir -p /data/aias_mcp && chown -R appuser:appuser /data/aias_mcp
 USER appuser
 
 EXPOSE 7805

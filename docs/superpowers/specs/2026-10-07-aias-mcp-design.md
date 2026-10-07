@@ -33,6 +33,8 @@
 
 按 ID 定位使用直接 GetFolder；读取或编辑联系人时检查 Contact 类型及其父文件夹。默认只查询指定文件夹中的联系人，不隐式扫描其子文件夹。
 
+实施时核对官方 SOAP 后补充：原生 FolderId 自带邮箱上下文，新 Root 绑定只影响 SDK 对象，不能证明其属于传入 mailbox。自定义文件夹通过直接 GetFolder 的轻量父 ID 链，确认最终到达目标 MsgFolderRoot；不引入 OA 或调用者身份校验，不读取树缓存。
+
 联系人资料统一放在 `contact` 对象中，公共凭据与 `folder_id/contact_id` 仍为工具顶层参数。支持以下标准可编辑资料：
 
 | 类别 | 字段 |
@@ -96,3 +98,4 @@
 - [exchangelib 错误类型](https://github.com/ecederstrand/exchangelib/blob/v5.6.0/exchangelib/errors.py)
 - [FastMCP 2.14.7 ToolResult](https://github.com/jlowin/fastmcp/blob/v2.14.7/src/fastmcp/tools/tool.py)
 - [微软 Send As / Send on Behalf](https://learn.microsoft.com/en-us/exchange/recipients/mailbox-permissions)
+- [微软显式和隐式代理访问／原生 ID 的邮箱上下文](https://learn.microsoft.com/en-us/exchange/client-developer/exchange-web-services/delegate-access-and-ews-in-exchange)

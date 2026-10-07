@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, Mock
 
-from exchangelib.errors import ErrorAccessDenied
+from exchangelib.errors import ErrorAccessDenied, ErrorCorruptData
 
 from mail_operations import MailOperations
 from tool_support import ToolOperationError
@@ -97,14 +97,40 @@ class MailReadResultTests(unittest.TestCase):
                 self.assertEqual(result["next_offset"], next_offset)
                 self.assertFalse(result["partial"])
 
-    def test_query_failure_is_not_converted_to_an_empty_success(self):
+    def test_query_failure_is_partial_with_other_folder_results(self):
         folder = folder_with_rows([])
         failure = ErrorAccessDenied("query denied after folder resolution")
         folder.filter.side_effect = failure
         self.setup_thread(folder, folder_with_rows([]))
-        with self.assertRaises(ErrorAccessDenied) as caught:
-            self.mail.get_thread("source")
-        self.assertIs(caught.exception, failure)
+        result = self.mail.get_thread("source")
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["source_errors"]["inbox"]["exchange_code"], "ErrorAccessDenied")
+
+    def test_yielded_exchange_error_keeps_cause_and_other_source(self):
+        self.setup_thread(folder_with_rows([ErrorCorruptData("corrupt")]), folder_with_rows([row("b")]))
+        result = self.mail.get_thread("source")
+        self.assertEqual(result["items"], [{"id": "b"}])
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["source_errors"]["inbox"]["exchange_code"], "ErrorCorruptData")
+
+    def test_folder_coverage_excludes_tasks_and_keeps_exchange_errors(self):
+        seen = []
+        def resolve(name):
+            seen.append(name)
+            if name == "sent":
+                raise ErrorAccessDenied("denied")
+            return SimpleNamespace(id=name, name=name, total_count=0, unread_count=0)
+        self.mail._tool_folder = Mock(side_effect=resolve)
+        result = self.mail.list_folders()
+        self.assertNotIn("tasks", seen)
+        self.assertIn("deleteditems", seen)
+        denied = next(row for row in result["items"] if row["folder"] == "sent")
+        self.assertEqual(denied["exchange_code"], "ErrorAccessDenied")
+
+    def test_partial_thread_keeps_per_folder_error(self):
+        self.setup_thread(ErrorAccessDenied("denied"), folder_with_rows([]))
+        result = self.mail.get_thread("source")
+        self.assertEqual(result["source_errors"]["inbox"]["exchange_code"], "ErrorAccessDenied")
 
 
 if __name__ == "__main__":

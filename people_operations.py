@@ -1,425 +1,304 @@
-"""Contacts and organization-directory (GAL) lookups limited to the employee.
-
-GAL and the mailbox Contacts folder are separate data sources with separate
-permissions; each is reported independently and one being unavailable must not
-fail the other (``partial``, not whole-failure).
-
-GAL lookups go through the EWS ``ResolveNames`` operation scoped to
-ActiveDirectory. ``exchangelib.folders.GALContacts`` is deliberately not used:
-in exchangelib 5.6 it rejects the ``account`` kwarg and cannot be instantiated
-standalone, so it only ever masked the real (working) directory lookup.
-"""
-
-import re
-
-from exchangelib import Contact
-from exchangelib.errors import ErrorAccessDenied, ErrorFolderNotFound
-from exchangelib.folders import Folder
+"""目标邮箱中的普通联系人文件夹与 GAL 查询，直接执行资料修改。"""
+from exchangelib import Contact, FileAttachment
+from exchangelib.errors import ErrorNameResolutionNoResults
+from exchangelib.folders import Contacts, Folder, MsgFolderRoot, Root
 from exchangelib.folders.base import BaseFolder
-from exchangelib.indexed_properties import EmailAddress, PhoneNumber
+from exchangelib.folders.collections import FolderCollection
+from exchangelib.items import NEVER_OVERWRITE
 from exchangelib.properties import FieldPath
-from exchangelib.services import GetFolder
+from exchangelib.services import DeleteAttachment, GetFolder
 
-import team_directories
+from contact_fields import build_contact_values, contact_photo, serialize_contact, validate_contact
+from tool_support import ToolOperationError, error_details
 
-from tool_support import ToolOperationError, require_confirmation
 
 SEARCH_SCOPE_ACTIVE_DIRECTORY = "ActiveDirectory"
-
-# 只用于 GetFolder 直取目标目录的属性投影。
-_FOLDER_FIELDS = ("name", "folder_class", "parent_folder_id", "total_count")
-
-
-def _primary_email(contact):
-    """First non-empty address. ``email_addresses`` is a list of ``EmailAddress``
-    entries (label + email), ordered by label, so EmailAddress1 wins."""
-    for entry in getattr(contact, "email_addresses", None) or []:
-        value = str(getattr(entry, "email", "") or "").strip()
-        if value:
-            return value
-    return None
+_FOLDER_FIELDS = ("name", "folder_class", "parent_folder_id", "total_count", "child_folder_count")
+_SYSTEM_CONTACT_FOLDERS = {"PersonMetadata", "RecipientCache", "QuickContacts", "IMContactList", "OrganizationalContacts", "PeopleCentricConversationBuddies"}
+_MAX_FOLDER_ANCESTORS = 256
 
 
-def _primary_phone(contact):
-    """Business phone first, then any labelled number.
-
-    Contact phones are a labelled list (``contacts:PhoneNumber``), the same shape
-    ``create_contact`` writes, so what was written is what is read back.
-    """
-    entries = getattr(contact, "phone_numbers", None) or []
-    by_label = {}
-    for entry in entries:
-        value = str(getattr(entry, "phone_number", "") or "").strip()
-        if value:
-            by_label[str(getattr(entry, "label", "") or "")] = value
-    return by_label.get("BusinessPhone") or next(iter(by_label.values()), None)
+def _folder_fields():
+    return {FieldPath(field=BaseFolder.get_field_by_fieldname(name)) for name in _FOLDER_FIELDS}
 
 
-def _contact_row(contact, source):
-    return {
-        "email": _primary_email(contact),
-        "source": source,
-        "id": getattr(contact, "id", None),
-        "changekey": getattr(contact, "changekey", None),
-        "display_name": getattr(contact, "display_name", None),
-        "job_title": getattr(contact, "job_title", None),
-        "department": getattr(contact, "department", None),
-        "company_name": getattr(contact, "company_name", None),
-        "phone": _primary_phone(contact),
-    }
+def _parent_id(folder):
+    parent = getattr(folder, "parent_folder_id", None)
+    return getattr(parent, "id", None)
+
+
+def _regular_contacts(folder):
+    return getattr(folder, "folder_class", None) == "IPF.Contact" and type(folder).__name__ not in _SYSTEM_CONTACT_FOLDERS
+
+
+def _folder_row(folder):
+    return {"id": folder.id, "folder_id": folder.id, "name": folder.name,
+            "folder_class": folder.folder_class, "parent_id": _parent_id(folder),
+            "total_count": folder.total_count, "child_folder_count": folder.child_folder_count}
+
+
+def _pagination(offset, limit):
+    if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
+        raise ToolOperationError("INVALID_PAGINATION", "offset 必须非负，limit 必须为 1 到 100。")
 
 
 def _directory_row(mailbox, contact):
-    """One GAL entry from ResolveNames. Mailbox is always present; the full
-    contact entry carries the extras and may be absent."""
-    return {
-        "source": "gal",
-        "id": getattr(contact, "id", None),
-        "changekey": getattr(contact, "changekey", None),
-        "display_name": getattr(mailbox, "name", None)
-        or getattr(contact, "display_name", None),
-        "email": getattr(mailbox, "email_address", None),
-        "job_title": getattr(contact, "job_title", None),
-        "department": getattr(contact, "department", None),
-        "company_name": getattr(contact, "company_name", None),
-    }
-
-
-def _with_directory(row, spec):
-    """Tag a row with the team directory it came from, so a later read can be
-    traced back to the same logical directory."""
-    row["directory_id"] = spec.directory_id
-    row["directory"] = spec.display_name
-    row["target_mailbox"] = spec.mailbox
+    row = serialize_contact(contact) if contact is not None else {}
+    row.update({"source": "gal", "email": getattr(mailbox, "email_address", None),
+                "display_name": getattr(mailbox, "name", None) or getattr(contact, "display_name", None)})
     return row
 
 
-def _denied(exc):
-    name = exc.__class__.__name__
-    return name.startswith("Error") and ("Denied" in name or "Access" in name)
-
-
-def _get_folder_by_id(account, folder_id):
-    """GetFolder by ID.
-
-    Deliberately not ``folder.children`` / ``account.root.walk()``: on a delegated
-    mailbox exchangelib's folder-tree cache raises while building the root map
-    (``KeyError`` in ``roots.py``), and traversal would also depend on folders the
-    delegate may not be allowed to enumerate. Addressing the folder directly is
-    both exact and independent of the rest of the mailbox.
-    """
-    template = Folder(root=account.root, id=folder_id)
-    additional = {
-        FieldPath(field=BaseFolder.get_field_by_fieldname(name))
-        for name in _FOLDER_FIELDS
-    }
-    folders = list(
-        GetFolder(account=account).call(
-            folders=[template], additional_fields=additional, shape="IdOnly"
-        )
-    )
-    return folders[0] if folders else None
+def _contact_row(contact):
+    row = serialize_contact(contact)
+    row["email"] = next(iter(row["email_addresses"].values()), None)
+    phones = row["phone_numbers"]
+    row["phone"] = phones.get("BusinessPhone") or next(iter(phones.values()), None)
+    return row
 
 
 class PeopleOperations:
-    def _resolve_directory(self, query):
-        """Resolve a name or email against the GAL (ActiveDirectory scope).
-
-        A fresh per-call client has not negotiated an EWS version yet and
-        ResolveNames needs a version hint, so warm it up first. A no-result
-        lookup comes back as an ``ErrorNameResolutionNoResults`` object inside
-        the result list (exchangelib returns it rather than raising), so only
-        genuine ``(Mailbox, Contact)`` tuples are kept.
-        """
-        account = self.account
-        _ = account.version  # force EWS version negotiation for the hint
-        entries = account.protocol.resolve_names(
-            [query],
-            return_full_contact_data=True,
-            search_scope=SEARCH_SCOPE_ACTIVE_DIRECTORY,
-        )
-        return [entry for entry in entries if isinstance(entry, tuple)]
-
-    def _open_directory(self, directory_id, *, write):
-        """Resolve the logical id and authorize the CURRENT employee.
-
-        Authorization is an explicit administrator list, never inferred from the
-        service account's write rights. ``write=False`` is checked before any
-        read, ``write=True`` before any create.
-        """
-        spec = team_directories.get_directory(directory_id)
-        team_directories.authorize(
-            spec, getattr(self, "requester_lanid", None), write=write
-        )
-        return spec
-
-    def _bind_directory(self, spec):
-        """Dedicated Account + verified folder for the target mailbox.
-
-        The requester's identity is untouched: ``self.account`` and
-        ``self.config.email`` keep pointing at the OA-resolved employee.
-        """
-        account = self._create_account(spec.mailbox)
-        try:
-            folder = _get_folder_by_id(account, spec.folder_id)
-        except (ErrorFolderNotFound, ErrorAccessDenied) as exc:
-            raise ToolOperationError(
-                "DIRECTORY_UNAVAILABLE",
-                "团队共享目录当前不可访问（不存在或服务账号无权访问）。",
-            ) from exc
-        if folder is None:
-            raise ToolOperationError(
-                "DIRECTORY_UNAVAILABLE", "团队共享目录当前不可访问（不存在）。"
-            )
-        folder_class = str(getattr(folder, "folder_class", "") or "")
-        if folder_class != spec.folder_class or not folder_class.startswith(
-            team_directories.CONTACT_FOLDER_CLASS_PREFIX
+    def list_contact_folders(self):
+        """一次分页发现 IPM 子树元数据；不使用 walk/parent/absolute 缓存。"""
+        root = Root(account=self.account)
+        ipm = MsgFolderRoot.get_distinguished(root=root)
+        rows, folders = {}, []
+        for folder in FolderCollection(account=self.account, folders=[ipm]).find_folders(
+            depth="Deep", shape="IdOnly", additional_fields=_folder_fields(), page_size=100,
         ):
-            raise ToolOperationError(
-                "DIRECTORY_INVALID_TARGET",
-                "配置指向的目标不是预期的联系人目录，已拒绝访问。",
-            )
-        if spec.parent_folder_id and getattr(
-            getattr(folder, "parent_folder_id", None), "id", None
-        ) != spec.parent_folder_id:
-            raise ToolOperationError(
-                "DIRECTORY_INVALID_TARGET", "配置指向的目录层级已变化，已拒绝访问。"
-            )
-        return account, folder
+            if isinstance(folder, Exception):
+                raise folder
+            rows[folder.id] = _folder_row(folder)
+            if _regular_contacts(folder):
+                folders.append(folder)
+        items = []
+        for folder in folders:
+            row = dict(rows[folder.id])
+            names, visited = [], set()
+            current = folder.id
+            while current and current != ipm.id and current in rows and current not in visited:
+                visited.add(current)
+                names.append(rows[current]["name"] or "")
+                current = rows[current]["parent_id"]
+            row["path"] = "/" + "/".join(reversed(names))
+            row["path_complete"] = current == ipm.id
+            items.append(row)
+        return {"items": sorted(items, key=lambda row: (row["path"], row["id"]))}
 
-    def _prepare_directory(self, directory_id, *, write):
-        spec = self._open_directory(directory_id, write=write)
-        account, folder = self._bind_directory(spec)
-        return spec, account, folder
+    def _contact_folder(self, folder_id=None):
+        root = Root(account=self.account)
+        if folder_id is None:
+            folder = Contacts.get_distinguished(root=root)
+        else:
+            if not isinstance(folder_id, str) or not folder_id.strip():
+                raise ToolOperationError("INVALID_CONTACT_FOLDER", "请使用 list_contact_folders 返回的文件夹 ID。")
+            folder = self._folder_metadata(root, folder_id)
+            if folder is None:
+                raise ToolOperationError("CONTACT_FOLDER_NOT_FOUND", "未找到指定联系人文件夹。")
+        if not _regular_contacts(folder):
+            raise ToolOperationError("INVALID_CONTACT_FOLDER", "指定文件夹不是普通联系人文件夹。")
+        if folder_id is not None:
+            self._require_folder_scope(folder, root)
+        return folder
 
-    def find_people(self, query, source="auto", limit=20, directory_id=None):
-        query = (query or "").strip()
-        if not query:
+    def _folder_metadata(self, root, folder_id):
+        folder = next(iter(GetFolder(account=self.account).call(
+            folders=[Folder(root=root, id=folder_id)], additional_fields=_folder_fields(), shape="IdOnly",
+        )), None)
+        if isinstance(folder, Exception):
+            raise folder
+        return folder
+
+    def _require_folder_scope(self, folder, root):
+        # raw FolderId 的 SOAP 不带 Mailbox；本地 Root 绑定不能证明实际邮箱归属。
+        ipm = MsgFolderRoot.get_distinguished(root=root)
+        metadata, visited = {folder.id: folder}, {folder.id}
+        current = folder
+        for _ in range(_MAX_FOLDER_ANCESTORS):
+            parent_id = _parent_id(current)
+            if ipm.id and parent_id == ipm.id:
+                return
+            if not parent_id or parent_id in visited:
+                break
+            visited.add(parent_id)
+            parent = metadata.get(parent_id)
+            if parent is None:
+                # 保留真实 EWS 查询异常，不把权限拒绝解释为异箱或不存在。
+                parent = self._folder_metadata(root, parent_id)
+                if parent is None or parent.id != parent_id:
+                    break
+                metadata[parent_id] = parent
+            current = parent
+        raise ToolOperationError("ITEM_OUT_OF_SCOPE", "无法确认指定联系人文件夹属于目标邮箱，未继续读写。")
+
+    def _fetch_contact(self, contact_id, folder):
+        if not isinstance(contact_id, str) or not contact_id.strip():
+            raise ToolOperationError("INVALID_CONTACT_ID", "请提供联系人 ID。")
+        item = next(iter(self.account.fetch(ids=[(contact_id, None)], folder=folder)), None)
+        if isinstance(item, Exception):
+            raise item
+        if item is None:
+            raise ToolOperationError("CONTACT_NOT_FOUND", "未找到指定联系人。")
+        if type(item) is not Contact:
+            raise ToolOperationError("INVALID_CONTACT", "指定项目不是普通联系人。")
+        if _parent_id(item) != folder.id:
+            raise ToolOperationError("ITEM_OUT_OF_SCOPE", "项目不属于指定联系人文件夹。")
+        item.folder = folder
+        return item
+
+    def list_contacts(self, folder_id=None, limit=50, offset=0):
+        _pagination(offset, limit)
+        folder = self._contact_folder(folder_id)
+        rows = list(folder.all().order_by("display_name")[offset:offset + limit + 1])
+        if any(isinstance(item, Exception) for item in rows):
+            raise next(item for item in rows if isinstance(item, Exception))
+        window = rows[:limit]
+        items = [_contact_row(item) for item in window if type(item) is Contact]
+        has_more = len(rows) > limit
+        return {"items": items, "folder_id": folder.id, "offset": offset, "limit": limit,
+                "has_more": has_more, "next_offset": offset + len(window) if has_more else None}
+
+    def _resolve_directory(self, query):
+        # ResolveNames 需要已协商版本；正常无匹配会返回异常对象而不是抛出。
+        _ = self.account.version
+        results = []
+        for entry in self.account.protocol.resolve_names([query], return_full_contact_data=True, search_scope=SEARCH_SCOPE_ACTIVE_DIRECTORY):
+            if isinstance(entry, ErrorNameResolutionNoResults):
+                continue
+            if isinstance(entry, Exception):
+                raise entry
+            if isinstance(entry, tuple) and len(entry) == 2:
+                results.append(entry)
+        return results
+
+    def find_people(self, query, source="auto", limit=20, folder_id=None):
+        if not isinstance(query, str) or not query.strip():
             raise ToolOperationError("INVALID_QUERY", "联系人搜索关键词不能为空。")
         if source not in ("auto", "gal", "contacts"):
             raise ToolOperationError("INVALID_SOURCE", "来源必须是 auto、gal 或 contacts。")
-        if directory_id is not None:
-            # 共享目录是第三种明确来源，不与 GAL/个人 Contacts 混用；组合非法就拒绝，
-            # 不做“猜测意图”的降级。
-            if source != "contacts":
-                raise ToolOperationError(
-                    "INVALID_SOURCE",
-                    "团队共享目录仅支持 source=contacts；不接受与 gal/auto 的组合。",
-                )
-            return self._find_in_directory(query, limit, directory_id)
-        sources = ("gal", "contacts") if source == "auto" else (source,)
-        results = []
-        coverage = {}
+        _pagination(0, limit)
+        if folder_id is not None and source == "gal":
+            raise ToolOperationError("INVALID_SOURCE", "指定联系人文件夹时不能使用 GAL 来源。")
+        sources = ("contacts",) if folder_id is not None else (("gal", "contacts") if source == "auto" else (source,))
+        items, coverage, failures = [], {}, {}
         for name in sources:
             try:
-                if name == "contacts":
-                    rows = (
-                        self._tool_folder("contacts")
-                        .filter(display_name__icontains=query)
-                        .order_by("display_name")[:limit]
-                    )
-                    coverage[name] = "ok"
-                    results.extend(_contact_row(contact, name) for contact in rows)
+                if name == "gal":
+                    found = [_directory_row(mailbox, contact) for mailbox, contact in self._resolve_directory(query.strip())[:limit]]
                 else:
-                    entries = self._resolve_directory(query)
-                    coverage[name] = "ok"
-                    results.extend(
-                        _directory_row(mailbox, contact) for mailbox, contact in entries[:limit]
-                    )
-            except Exception as exc:  # noqa: BLE001 - report per-source coverage
-                coverage[name] = "denied" if _denied(exc) else "unreachable"
-        payload = {"items": results, "sources": coverage}
-        if any(status != "ok" for status in coverage.values()):
-            payload["partial"] = True
-        return payload
+                    folder = self._contact_folder(folder_id)
+                    found = []
+                    for item in folder.filter(display_name__icontains=query.strip()).order_by("display_name")[:limit]:
+                        if isinstance(item, Exception):
+                            raise item
+                        if type(item) is Contact:
+                            found.append(_contact_row(item))
+                items.extend(found)
+                coverage[name] = "success"
+            except Exception as exc:
+                details = error_details(exc)
+                coverage[name] = "failed"
+                failures[name] = details
+        status = "success" if not failures else ("failed" if len(failures) == len(sources) else "partial")
+        result = {"items": items, "sources": coverage, "source_errors": failures, "status": status, "ok": status == "success"}
+        if failures:
+            result["error_code"] = "PEOPLE_SEARCH_FAILED" if status == "failed" else "PEOPLE_SEARCH_PARTIAL"
+            result["message"] = "联系人搜索全部来源失败。" if status == "failed" else "部分联系人来源不可用，其余来源结果已返回。"
+        return result
 
-    def _find_in_directory(self, query, limit, directory_id):
-        """Search ONLY the selected directory: no recursion into sub-folders and
-        no sweeping other mailboxes."""
-        spec, account, folder = self._prepare_directory(directory_id, write=False)
+    def get_contact(self, contact_id, folder_id=None):
+        if not isinstance(contact_id, str) or not contact_id.strip():
+            raise ToolOperationError("INVALID_CONTACT_ID", "请提供联系人 ID 或准确的 GAL 邮箱。")
+        if folder_id is None and "@" in contact_id:
+            for mailbox, contact in self._resolve_directory(contact_id.strip()):
+                if str(getattr(mailbox, "email_address", "") or "").casefold() == contact_id.strip().casefold():
+                    return _directory_row(mailbox, contact)
+            raise ToolOperationError("CONTACT_NOT_FOUND", "未在 GAL 找到该邮箱。")
+        folder = self._contact_folder(folder_id)
+        return _contact_row(self._fetch_contact(contact_id, folder))
+
+    def _save_contact(self, item, values, *, creating):
+        if not creating and (not item.id or not item.changekey):
+            raise ToolOperationError("CONTACT_IDENTIFIER_INCOMPLETE", "读取结果缺少联系人 ID 或 ChangeKey，未提交修改。")
         try:
-            rows = folder.filter(display_name__icontains=query).order_by("display_name")[:limit]
-            items = [_with_directory(_contact_row(c, "contacts"), spec) for c in rows]
-        except Exception as exc:  # noqa: BLE001 - 目录读取失败如实上报，不伪装成空结果
-            raise ToolOperationError(
-                "DIRECTORY_UNAVAILABLE", "读取团队共享目录失败。"
-            ) from exc
-        return {
-            "items": items,
-            "sources": {"contacts": "ok"},
-            "directory": spec.descriptor(),
-        }
-
-    def get_contact(self, contact_id, directory_id=None):
-        if not contact_id or not str(contact_id).strip():
-            raise ToolOperationError("INVALID_CONTACT_ID", "请提供联系人 ID 或邮箱。")
-        value = str(contact_id).strip()
-        if directory_id is not None:
-            # 共享目录分支：先验证员工目录权限，再按目录内 ID 读取并核对归属。
-            # 这里绝不进入 GAL 分支 — 即使传的是邮箱地址，也只当目录内 ID 处理。
-            return self._get_from_directory(value, directory_id)
-        if "@" in value:
-            # Exact GAL directory address resolution. A directory address is a
-            # contact lookup, never a switch of the target mailbox. GAL is a
-            # separate source with its own permission; if unavailable this is a
-            # clean directory-limited error, not a crash.
-            try:
-                entries = self._resolve_directory(value)
-            except Exception as exc:  # noqa: BLE001 - GAL unreachable/denied is a clean limit
-                raise ToolOperationError(
-                    "GAL_UNAVAILABLE",
-                    "组织目录(GAL)不可用或受现场策略限制，无法在此解析目录地址。",
-                ) from exc
-            row = next(
-                (
-                    _directory_row(mailbox, contact)
-                    for mailbox, contact in entries
-                    if str(getattr(mailbox, "email_address", "") or "").lower()
-                    == value.lower()
-                ),
-                None,
-            )
-            if row is None:
-                raise ToolOperationError("CONTACT_NOT_FOUND", "未在组织目录中找到该邮箱。")
-            return row
-        contact = self._tool_item(value, folder_names=("contacts",))
-        if type(contact) is not Contact:
-            raise ToolOperationError("INVALID_CONTACT", "指定项目不是当前员工的联系人。")
-        return _contact_row(contact, "contacts")
-
-    def _get_from_directory(self, contact_id, directory_id):
-        spec, account, folder = self._prepare_directory(directory_id, write=False)
+            for name, value in values.items():
+                Contact.get_field_by_fieldname(name).clean(value, version=self.account.version)
+        except (TypeError, ValueError) as exc:
+            raise ToolOperationError("INVALID_CONTACT", "联系人资料不符合 Exchange 字段约束，未提交修改。") from exc
         try:
-            item = next(iter(account.fetch(ids=[(contact_id, None)], folder=folder)), None)
-        except Exception as exc:  # noqa: BLE001 - 越权/失效 ID 一律按“找不到”处理
-            raise ToolOperationError(
-                "CONTACT_NOT_FOUND", "未在该团队共享目录中找到指定联系人。"
-            ) from exc
-        if item is None or isinstance(item, Exception):
-            raise ToolOperationError(
-                "CONTACT_NOT_FOUND", "未在该团队共享目录中找到指定联系人。"
-            )
-        # EWS GetItem is not folder-scoped, so an ID from another folder can come
-        # back here. Both the item class and the parent folder are checked before
-        # any detail is returned; a mismatch reports no field at all.
-        if type(item) is not Contact:
-            raise ToolOperationError(
-                "INVALID_CONTACT", "指定项目不是该团队共享目录中的联系人。"
-            )
-        if getattr(getattr(item, "parent_folder_id", None), "id", None) != folder.id:
-            raise ToolOperationError(
-                "ITEM_OUT_OF_SCOPE", "指定项目不属于该团队共享目录。"
-            )
-        item.folder = folder
-        return _with_directory(_contact_row(item, "contacts"), spec)
-
-    def create_contact(
-        self,
-        display_name,
-        email,
-        phone=None,
-        company_name=None,
-        job_title=None,
-        confirm=False,
-        confirmation_id=None,
-        directory_id=None,
-        directory_target=None,
-    ):
-        """Create one contact in the employee's own Contacts folder, or in a
-        configured team shared directory when ``directory_id`` is given.
-
-        Writes only the mailbox Contacts item: it never touches the GAL and
-        sends no mail. The target mailbox still comes only from the OA-resolved
-        employee (or from the administrator-verified directory entry); the
-        contact's own address never selects a mailbox.
-
-        ``directory_target`` is internal: the dispatcher passes back the target it
-        re-verified against the preview, so execution uses exactly the checked
-        target rather than resolving a second time.
-        """
-        display_name = (display_name or "").strip()
-        if not display_name:
-            raise ToolOperationError("INVALID_CONTACT", "联系人姓名不能为空。")
-        email = (email or "").strip()
-        if not re.fullmatch(r"^[^\s@<>;,]+@[^\s@<>;,]+$", email):
-            raise ToolOperationError("INVALID_CONTACT_EMAIL", "联系人邮箱地址格式无效。")
-        details = {
-            "display_name": display_name,
-            "email": email,
-            "phone": phone,
-            "company_name": company_name,
-            "job_title": job_title,
-        }
-        spec = None
-        prepared = None
-        if directory_id is not None:
-            if directory_target is not None:
-                # Already authorized and compared against the persisted preview.
-                spec = directory_target
-                prepared = self._bind_directory(spec)
-            else:
-                # Preview: authorize the create BEFORE showing a preview, so a
-                # read-only employee is refused up front and nothing is written.
-                spec, _account, folder = self._prepare_directory(directory_id, write=True)
-                prepared = (_account, folder)
-            details["directory_id"] = spec.directory_id
-            details["target_mailbox"] = spec.mailbox
-            details["target_folder"] = spec.folder_id
-        target = spec.identity() if spec is not None else None
-        preview = require_confirmation(
-            mailbox=self.config.email,
-            action="create_contact",
-            items=[details],
-            details={"target": target} if target is not None else None,
-            confirm=confirm,
-            confirmation_id=confirmation_id,
-        )
-        if preview is not None:
-            return preview
-        if prepared is None:
-            account, folder = self.account, self._tool_folder("contacts")
-        else:
-            account, folder = prepared
-        item = Contact(
-            account=account,
-            folder=folder,
-            display_name=display_name,
-            email_addresses=[EmailAddress(label="EmailAddress1", email=email)],
-            phone_numbers=(
-                [PhoneNumber(label="BusinessPhone", phone_number=phone)]
-                if phone is not None
-                else []
-            ),
-            company_name=company_name,
-            job_title=job_title,
-        )
-        try:
-            item.save()
+            if creating:
+                item.save()
+            elif values:
+                item.save(update_fields=list(values), conflict_resolution=NEVER_OVERWRITE)
         except Exception as exc:
+            details = error_details(exc, submitted=True)
             raise ToolOperationError(
-                "CONTACT_CREATE_FAILED", "新建联系人失败，请检查 Contacts 创建权限。"
+                "CONTACT_CREATE_FAILED" if creating else "CONTACT_UPDATE_FAILED",
+                "联系人保存失败。", status=details["status"],
+                results={"id": item.id, "contact_id": item.id, "changekey": item.changekey, "folder_id": item.folder.id} if item.id else None,
             ) from exc
-        if not (isinstance(item.id, str) and item.id) or not (
-            isinstance(item.changekey, str) and item.changekey
-        ):
-            raise ToolOperationError(
-                "CONTACT_RECEIPT_INCOMPLETE",
-                "联系人可能已写入但回执不完整；请勿重发，仅查询原操作号。",
-            )
-        receipt = {
-            "id": item.id,
-            "contact_id": item.id,
-            "changekey": item.changekey,
-            "created": True,
-            "folder": "contacts",
-            "display_name": display_name,
-            "email": email,
-            "phone": _primary_phone(item) or phone,
-        }
-        if spec is not None:
-            # 回执明确记录实际目标目录，后续读取能带回同一目录标识。
-            receipt["directory_id"] = spec.directory_id
-            receipt["directory"] = spec.display_name
-            receipt["target_mailbox"] = spec.mailbox
-            receipt["target_folder"] = spec.folder_id
+        if not item.id or not item.changekey:
+            raise ToolOperationError("CONTACT_SAVE_RESULT_UNKNOWN", "联系人可能已保存，但服务端未返回完整的项目标识。", status="unknown",
+                                     results={"id": item.id, "contact_id": item.id, "changekey": item.changekey, "folder_id": item.folder.id} if item.id else None)
+
+    def _apply_photo(self, item, photo, receipt, *, has_written):
+        old_photos = [attachment for attachment in (item.attachments or []) if isinstance(attachment, FileAttachment) and attachment.is_contact_photo]
+        removed = 0
+        step = "remove"
+        try:
+            for attachment in old_photos:
+                # SDK Attachment.detach() 丢弃 RootItemId；直接保留服务端的新 ChangeKey。
+                result = DeleteAttachment(account=self.account).get(items=[attachment.attachment_id])
+                if result.id != item.id or not result.changekey:
+                    raise ToolOperationError("CONTACT_PHOTO_RESULT_UNKNOWN", "删除照片后未返回完整的联系人标识。", status="unknown")
+                item.changekey = result.changekey
+                item.attachments.remove(attachment)
+                attachment.parent_item = None
+                attachment.attachment_id = None
+                removed += 1
+                has_written = True
+            if photo is not None:
+                step = "add"
+                item.attach(photo)
+                if not photo.attachment_id or not item.changekey:
+                    raise ToolOperationError("CONTACT_PHOTO_RESULT_UNKNOWN", "添加照片后未返回完整的附件标识。", status="unknown")
+                has_written = True
+        except Exception as exc:
+            details = error_details(exc, submitted=True)
+            status = "unknown" if details["status"] == "unknown" else ("partial" if has_written else "failed")
+            photo_result = {"removed": removed, "added": None if status == "unknown" and step == "add" else False}
+            if status == "unknown":
+                photo_result["pending_step"] = step
+            known = {**receipt, "changekey": item.changekey, "photo_result": photo_result}
+            if "updated" in known:
+                known["updated"] = has_written
+            raise ToolOperationError("CONTACT_PHOTO_FAILED", "联系人照片处理失败，已确定成功的部分已返回。", status=status, results=known) from exc
+        receipt.update({"changekey": item.changekey, "photo_result": {"removed": removed, "added": photo is not None}})
+        if "updated" in receipt:
+            receipt["updated"] = has_written
+
+    def create_contact(self, contact, folder_id=None):
+        values = build_contact_values(contact)
+        photo = contact_photo(contact["photo"]) if "photo" in contact else None
+        folder = self._contact_folder(folder_id)
+        item = Contact(account=self.account, folder=folder, **values)
+        self._save_contact(item, values, creating=True)
+        receipt = {"id": item.id, "contact_id": item.id, "changekey": item.changekey, "folder_id": folder.id, "created": True}
+        if "photo" in contact:
+            self._apply_photo(item, photo, receipt, has_written=True)
+        return receipt
+
+    def update_contact(self, contact_id, contact, folder_id=None):
+        # 先验证独立结构与照片，读取当前值后才做递归补丁合并。
+        validate_contact(contact)
+        photo = contact_photo(contact["photo"]) if isinstance(contact, dict) and "photo" in contact else None
+        folder = self._contact_folder(folder_id)
+        item = self._fetch_contact(contact_id, folder)
+        values = build_contact_values(contact, existing=item)
+        for name, value in values.items():
+            setattr(item, name, value)
+        self._save_contact(item, values, creating=False)
+        receipt = {"id": item.id, "contact_id": item.id, "changekey": item.changekey, "folder_id": folder.id, "updated": bool(values)}
+        if "photo" in contact:
+            self._apply_photo(item, photo, receipt, has_written=bool(values))
         return receipt

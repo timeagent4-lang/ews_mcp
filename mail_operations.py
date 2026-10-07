@@ -12,22 +12,16 @@ from exchangelib.folders import (
     Inbox,
     Root,
     SentItems,
-    Tasks,
 )
 
 from config import DownloadSettings, downloads_enabled
 from attachment_downloads import AttachmentDownloadStore
-from tool_support import LOCAL_TIMEZONE, ToolOperationError, iso_datetime, parse_datetime
+from tool_support import LOCAL_TIMEZONE, ToolOperationError, error_details, iso_datetime, parse_datetime
 
 
 MAIL_FOLDERS = ("inbox", "drafts", "sent")
-# The folders whose reachability decides which tools are usable, probed by
-# list_folders. Deliberately a separate vocabulary from MAIL_FOLDERS: that one
-# doubles as the ID scope for _tool_item (mail items are only ever looked up in
-# inbox/drafts/sent), so widening it would widen the ID scope too. deleteditems
-# is absent on purpose -- no registered tool addresses it (deletions go through
-# move_to_trash), which never resolves that folder).
-TOOL_FOLDERS = ("inbox", "drafts", "sent", "calendar", "contacts", "tasks")
+# Probe live folder reachability; mail item scope remains inbox/drafts/sent.
+TOOL_FOLDERS = ("inbox", "drafts", "sent", "calendar", "contacts", "deleteditems")
 SIMPLE_FIELDS = (
     "parent_folder_id",
     "subject",
@@ -55,10 +49,7 @@ TEXT_EXTENSIONS = {".txt", ".csv", ".tsv", ".log", ".md", ".json", ".xml"}
 
 def _folder_coverage(exc) -> str:
     """Classify a folder access failure as denied vs unreachable."""
-    name = exc.__class__.__name__
-    if name.startswith("Error") and (
-        "Denied" in name or "NotFound" in name or "Access" in name
-    ):
+    if error_details(exc)["error_code"] in ("EXCHANGE_ACCESS_DENIED", "ITEM_NOT_FOUND"):
         return "denied"
     return "unreachable"
 
@@ -109,13 +100,12 @@ class MailOperations:
             "sent": SentItems,
             "calendar": Calendar,
             "contacts": Contacts,
-            "tasks": Tasks,
             "deleteditems": DeletedItems,
         }
         if name not in classes:
             raise ToolOperationError(
                 "INVALID_FOLDER",
-                "仅支持 inbox、drafts、sent、calendar、contacts、tasks、deleteditems 文件夹。",
+                "仅支持 inbox、drafts、sent、calendar、contacts、deleteditems 文件夹。",
             )
         cache = self.__dict__.setdefault("_tool_folders", {})
         if name not in cache:
@@ -205,7 +195,7 @@ class MailOperations:
                 status = _folder_coverage(exc)
                 coverage[name] = status
                 folders.append(
-                    {"name": name, "folder": name, "accessible": False, "error": status}
+                    {"name": name, "folder": name, "accessible": False, "error": status, **error_details(exc)}
                 )
                 continue
             coverage[name] = "ok"
@@ -220,6 +210,7 @@ class MailOperations:
                     # employee's own mailbox.
                     "folder": name,
                     "accessible": True,
+                    "status": "success",
                     "id": folder.id,
                     "display_name": folder.name,
                     "total_count": folder.total_count,
@@ -392,23 +383,32 @@ class MailOperations:
             )
         rows = []
         coverage = {}
+        source_errors = {}
+        first_error = None
         for name in ("inbox", "sent"):
             try:
                 target = self._tool_folder(name)
+                queryset = (
+                    target.filter(conversation_id=source.conversation_id)
+                    .only(*SIMPLE_FIELDS)
+                    .order_by("datetime_sent")
+                )
+                found = list(queryset[: offset + limit + 1])
+                for row in found:
+                    if isinstance(row, Exception):
+                        raise row
             except Exception as exc:  # noqa: BLE001 - per-folder coverage
                 coverage[name] = _folder_coverage(exc)
+                source_errors[name] = error_details(exc)
+                first_error = first_error or exc
                 continue
             coverage[name] = "ok"
-            queryset = (
-                target.filter(conversation_id=source.conversation_id)
-                .only(*SIMPLE_FIELDS)
-                .order_by("datetime_sent")
-            )
-            rows.extend((row, name) for row in queryset[: offset + limit + 1])
+            rows.extend((row, name) for row in found)
         if not any(status == "ok" for status in coverage.values()):
             raise ToolOperationError(
-                "THREAD_FOLDERS_UNAVAILABLE", "收件箱与已发送邮件均不可访问，无法读取会话。"
-            )
+                "THREAD_FOLDERS_UNAVAILABLE", "收件箱与已发送邮件均不可访问，无法读取会话。",
+                results={"coverage": coverage, "source_errors": source_errors},
+            ) from first_error
         rows.sort(
             key=lambda pair: (
                 iso_datetime(
@@ -433,6 +433,7 @@ class MailOperations:
             "items": items,
             "coverage": coverage,
             "partial": partial,
+            **({"source_errors": source_errors} if source_errors else {}),
             "next_offset": offset + limit if len(rows) > offset + limit else None,
         }
 

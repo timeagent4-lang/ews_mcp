@@ -1,14 +1,17 @@
 # 本地补全的部署参考配置；未与内网配置逐字核对。
 services:
-  ews-mcp:
+  aias-mcp:
     build:
       context: .
       dockerfile: Dockerfile
-      secrets:
-        - pip_conf
-    image: ews-mcp:dev
-    container_name: ews-mcp-dev
+    image: aias-mcp:dev
+    container_name: aias-mcp-dev
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "7712:7805"
     healthcheck:
@@ -26,22 +29,10 @@ services:
     environment:
       EWS_MCP_HOST: "0.0.0.0"
       EWS_MCP_PORT: "7805"
-      EWS_MCP_DATA_DIR: /data/ews_mcp
+      EWS_MCP_DATA_DIR: /data/aias_mcp
     volumes:
       - ./.env:/app/.env:ro
-      - ews_mcp_data:/data/ews_mcp
-    networks:
-      - genie
-
-networks:
-  genie:
-    external: true
-    name: joyagent-jdgenie_liamleo_genie-network
+      - aias_mcp_data:/data/aias_mcp
 
 volumes:
-  ews_mcp_data:
-
-# 部署机提供的 pip 配置，仅供构建时挂载。
-secrets:
-  pip_conf:
-    file: ./secrets/pip.conf
+  aias_mcp_data:
