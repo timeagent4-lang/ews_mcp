@@ -207,7 +207,7 @@ class FlagOperations:
             "flag": flag,
             "flag_status": changes["flag_status"],
             "task_complete": changes["task_complete"],
-            "task_due_date": iso_datetime(changes.get("task_due_date")),
+            "task_due_date": iso_datetime(item.task_due_date),
             "updated_fields": list(changes),
         }
 
