@@ -1,12 +1,15 @@
 """当前目标邮箱日历的查询和直接写入。"""
 
 from datetime import date, datetime, time, timedelta
+from itertools import islice
 
 from exchangelib import Attendee, CalendarItem, EWSDate, EWSDateTime, HTMLBody, Mailbox
 from exchangelib.errors import ErrorInvalidRecipients, ErrorMissingRecipients
 from exchangelib.items import SEND_TO_ALL_AND_SAVE_COPY, SEND_TO_NONE
 from exchangelib.items.calendar_item import EXCEPTION, OCCURRENCE, RECURRING_MASTER, SINGLE
+from exchangelib.items.calendar_item import CancelCalendarItem
 from exchangelib.items.base import NEVER_OVERWRITE
+from exchangelib.properties import ReferenceItemId
 
 from mail_operations import _page
 from tool_support import (
@@ -254,11 +257,14 @@ class CalendarOperations:
         _require_attendee(event, self.config.email)
         require_send("发送日程响应")
         validate_item_fields(event, fields=())
+        # SendAndSaveCopy 的默认 Sent 查询发生在提交前；显式解析以保留失败边界。
+        sent_folder = self._tool_folder("sent")
         # SDK 5.6.0 reply objects have no author/from field. The scoped employee
         # account and exact event reference determine the represented identity;
         # sender remains server-managed. Do not invent unsupported reply fields.
         try:
             getattr(event, methods[response])(
+                folder=sent_folder,
                 **({"body": message} if message is not None else {})
             )
         except Exception as exc:
@@ -293,10 +299,17 @@ class CalendarOperations:
             # send gate; deleting an own appointment notifies nobody.
             require_send("发送日程取消通知")
             validate_item_fields(event, fields=())
+            sent_folder = self._tool_folder("sent")
+            # CalendarItem.cancel 不接受 folder；使用相同的原生取消引用和显式副本目录。
+            reply = CancelCalendarItem(
+                account=event.account,
+                reference_item_id=ReferenceItemId(id=event.id, changekey=event.changekey),
+                **({"body": message} if message is not None else {}),
+            )
             # CancelCalendarItem explicitly excludes author in SDK 5.6.0. The
             # organizer check and scoped reference preserve the employee identity.
             try:
-                event.cancel(**({"body": message} if message is not None else {}))
+                reply.send(save_copy=True, copy_to_folder=sent_folder)
             except Exception as exc:
                 # The request already left the client, and EWS can apply the
                 # cancellation to the ITEM and then fail only on delivering the
@@ -345,15 +358,17 @@ class CalendarOperations:
             raise ToolOperationError("INVALID_TIME_RANGE", "日程时间窗开始必须早于结束。")
         calendar = self._tool_folder("calendar")
         query = calendar.view(start=start_dt, end=end_dt).order_by("start")
-        page = list(query[offset : offset + limit])
-        for event in page:
+        # CalendarView 不支持 Offset，且 SDK 在本地排序；不能提前截断服务端结果。
+        window = list(islice(query, offset, offset + limit + 1))
+        for event in window:
             if isinstance(event, Exception):
                 raise event
+        page = window[:limit]
         return {
             "items": [_event_detail(event) for event in page],
             "offset": offset,
             "limit": limit,
-            "has_more": len(page) == limit,
+            "has_more": len(window) > limit,
         }
 
     def create_event(

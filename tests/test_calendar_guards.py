@@ -6,6 +6,7 @@ from unittest.mock import Mock, PropertyMock, patch
 from exchangelib import Account, Attendee, CalendarItem, EWSDateTime, Folder, Mailbox
 from exchangelib.errors import ErrorAccessDenied, ErrorCorruptData, ErrorInvalidRecipients
 from exchangelib.services import DeleteItem
+from exchangelib.items.calendar_item import CancelCalendarItem
 from requests.exceptions import ReadTimeout
 from calendar_operations import CalendarOperations
 from tool_support import ToolOperationError
@@ -20,6 +21,8 @@ class CalendarGuardTests(unittest.TestCase):
                                  start=EWSDateTime(2026, 10, 8, 9), end=EWSDateTime(2026, 10, 8, 10),
                                  organizer=Mailbox(email_address=self.ops.config.email))
         self.ops._calendar_item = Mock(return_value=self.event)
+        self.sent = Folder(id="sent")
+        self.ops._tool_folder = Mock(return_value=self.sent)
 
     def invoke(self, tool):
         extra = {"subject": "new"} if tool == "update_event" else (
@@ -28,7 +31,7 @@ class CalendarGuardTests(unittest.TestCase):
 
     def test_recurring_masters_rejected_before_write(self):
         self.event.type = "RecurringMaster"
-        with patch.object(CalendarItem, "save") as save, patch.object(CalendarItem, "cancel") as cancel, \
+        with patch.object(CalendarItem, "save") as save, patch.object(CancelCalendarItem, "send") as cancel, \
                 patch.object(CalendarItem, "accept") as accept, patch.object(Account, "bulk_delete", return_value=[True]) as trash:
             for tool in ("update_event", "respond_to_event", "cancel_event"):
                 with self.subTest(tool=tool):
@@ -92,12 +95,12 @@ class CalendarGuardTests(unittest.TestCase):
                 with patch("calendar_operations.require_send") as gate, patch.object(CalendarItem, "accept") as accept:
                     self.assertTrue(self.invoke("respond_to_event")["responded"])
                     gate.assert_called_once()
-                    accept.assert_called_once_with()
+                    accept.assert_called_once_with(folder=self.sent)
             setattr(self.event, group, [])
 
     def test_personal_cancel_still_soft_deletes_without_send(self):
         with patch("calendar_operations.require_send") as gate, \
-                patch.object(Account, "bulk_delete", return_value=[True]) as trash, patch.object(CalendarItem, "cancel") as cancel:
+                patch.object(Account, "bulk_delete", return_value=[True]) as trash, patch.object(CancelCalendarItem, "send") as cancel:
             self.assertTrue(self.invoke("cancel_event")["deleted"])
             trash.assert_called_once_with(ids=[self.event], delete_type="MoveToDeletedItems", send_meeting_cancellations="SendToNone")
             cancel.assert_not_called()
@@ -112,16 +115,16 @@ class CalendarGuardTests(unittest.TestCase):
                 save.assert_called_once_with(update_fields=["subject"], conflict_resolution="NeverOverwrite", send_meeting_invitations=(
                     "SendToAllAndSaveCopy" if notify else "SendToNone"))
                 self.assertEqual(gate.call_count, int(notify))
-        with patch("calendar_operations.require_send") as gate, patch.object(CalendarItem, "cancel") as cancel, \
+        with patch("calendar_operations.require_send") as gate, patch.object(CancelCalendarItem, "send") as cancel, \
                 patch.object(Account, "bulk_delete", return_value=[True]) as trash:
             self.assertFalse(self.invoke("cancel_event")["deleted"])
-            cancel.assert_called_once_with()
+            cancel.assert_called_once_with(save_copy=True, copy_to_folder=self.sent)
             gate.assert_called_once()
             trash.assert_not_called()
 
     def test_cancel_response_delivery_failure_stays_unknown(self):
         self.event.is_meeting = True
-        with patch("calendar_operations.require_send"), patch.object(CalendarItem, "cancel", side_effect=ErrorInvalidRecipients("delivery")) as cancel, \
+        with patch("calendar_operations.require_send"), patch.object(CancelCalendarItem, "send", side_effect=ErrorInvalidRecipients("delivery")) as cancel, \
                 patch.object(Account, "bulk_delete", return_value=[True]) as trash:
             with self.assertRaises(ToolOperationError) as cm:
                 self.ops.cancel_event("e")
@@ -133,7 +136,7 @@ class CalendarGuardTests(unittest.TestCase):
 
     def test_cancel_permission_rejection_is_failed_without_retry(self):
         self.event.is_meeting = True
-        with patch("calendar_operations.require_send"), patch.object(CalendarItem, "cancel", side_effect=ErrorAccessDenied("denied")) as cancel:
+        with patch("calendar_operations.require_send"), patch.object(CancelCalendarItem, "send", side_effect=ErrorAccessDenied("denied")) as cancel:
             with self.assertRaises(ToolOperationError) as cm:
                 self.ops.cancel_event("e")
         self.assertEqual(cm.exception.status, "failed")

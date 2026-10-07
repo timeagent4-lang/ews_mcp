@@ -259,7 +259,7 @@ DESCRIPTIONS = {'list_folders': '列出目标邮箱邮件文件夹和数量；�
  'delete_messages': '批量将普通邮件移入 Deleted Items；不执行永久删除，返回逐项结果。',
  'set_message_flag': '直接修改普通邮件旗标和日期，拒绝会议通知对象。',
  'list_flagged_messages': '读取指定邮件文件夹中未完成/已完成的旗标邮件。',
- 'list_events': '按时间窗口读取日历实例，分页；has_more 为满页提示。',
+ 'list_events': '按时间窗口读取排序后的日历实例，分页；has_more 表示还有下一页。',
  'get_event': '读取日历详情、参与者、响应与重复信息。',
  'create_event': '直接创建日历条目；send_invitations 默认关闭，开启需发送开关。',
  'update_event': '直接编辑组织者拥有的单次日程或明确实例，拒绝重复主项；可静默或通知参与者。',
