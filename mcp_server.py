@@ -7,6 +7,7 @@ import traceback
 from pathlib import Path
 
 import mcp.types as mcp_types
+from mcp.shared import session as mcp_session
 from anyio import to_thread
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
@@ -26,6 +27,21 @@ from tool_support import ToolOperationError, error_details
 from utils.audit import ToolAuditMiddleware, current_request_id, install_tool_audit_fallback, request_scope
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+
+class MCPSessionLogFilter(logging.Filter):
+    """SDK 会话直接调用 root logger，且协议校验发生在请求脱敏上下文之前。"""
+
+    def filter(self, record):
+        if os.path.normcase(record.pathname) == os.path.normcase(mcp_session.__file__):
+            record.msg = json.dumps({"event_type": "mcp_session_diagnostic", "level": record.levelname,
+                                     "line": record.lineno, "function": record.funcName})
+            record.args = ()
+            record.exc_info = record.exc_text = record.stack_info = None
+        return True
+
+
+logging.getLogger().addFilter(MCPSessionLogFilter())
 # SDK 在异常分支可能打印认证信息及完整 XML。业务错误统一走安全适配，
 # 阻断其原始日志传播；服务日志保留我们的请求记录和安全栈位置。
 for sdk_logger_name in ("exchangelib", "mcp.server", "fastmcp.server", "fastmcp.tools"):
@@ -33,7 +49,8 @@ for sdk_logger_name in ("exchangelib", "mcp.server", "fastmcp.server", "fastmcp.
     sdk_logger.addHandler(logging.NullHandler())
     sdk_logger.propagate = False
 logger = logging.getLogger(__name__)
-mcp = FastMCP("AiasExchangeServer", lifespan=download_lifespan)
+# 本服务统一校验并返回安全错误；SDK 的原始校验错误会回显参数值。
+mcp = FastMCP("AiasExchangeServer", lifespan=download_lifespan, strict_input_validation=False)
 tool_audit = ToolAuditMiddleware()
 mcp.add_middleware(tool_audit)
 install_tool_audit_fallback(mcp, tool_audit)

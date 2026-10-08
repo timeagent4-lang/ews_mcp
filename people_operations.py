@@ -111,6 +111,8 @@ class PeopleOperations:
             folder = self._folder_metadata(root, folder_id)
             if folder is None:
                 raise ToolOperationError("CONTACT_FOLDER_NOT_FOUND", "未找到指定联系人文件夹。")
+            if folder.id != folder_id:
+                raise ToolOperationError("CONTACT_FOLDER_CLASSIFICATION_FAILED", "联系人文件夹查询缺少匹配的文件夹标识，未继续读写。")
         if not _regular_contacts(folder):
             raise ToolOperationError("INVALID_CONTACT_FOLDER", "指定文件夹不是普通联系人文件夹。")
         if folder_id is not None:
@@ -123,6 +125,12 @@ class PeopleOperations:
                 )
             if metadata_id and folder.id == metadata_id:
                 raise ToolOperationError("INVALID_CONTACT_FOLDER", "指定文件夹是系统联系人目录，不能作为普通联系人文件夹使用。")
+            # SDK 会按名称猜测 PersonMetadata 等类型；已验证的普通目录只使用联系人字段。
+            # 保留原 FolderId 与元数据，去掉 distinguished 绑定以免请求转向默认目录。
+            folder = Contacts(root=folder.root, **{
+                field.name: getattr(folder, field.name)
+                for field in Contacts.FIELDS if field.name != "_distinguished_id"
+            })
         return folder
 
     def _person_metadata_folder_id(self, root):
