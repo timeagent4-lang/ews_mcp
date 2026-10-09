@@ -10,8 +10,8 @@
 - 当前注册 28 个工具，保留既有禁用集合及会议通知副本行为。
 - 附件通过 `prepare_attachment_download` 生成内网 HTTP 签名链接，AI 执行器 GET 下载文件；字节不进入工具响应。
 - 配置统一使用 `lanid`／`OUTLOOK_ADMIN_LANID`。
-- 本地最新验证：69 项离线测试通过。测试替代了缺失的 OA、审计和 Exchange 连接依赖，不等同于生产联调。
-- 当前副本缺少 `utils/audit.py`、`utils/lanid_email.py`、`availability_operations.py`、`mirror.py`、`oof_operations.py`、`people_operations.py`、`task_operations.py`；这些模块须从完整项目保留或恢复，不得用测试桩补入生产。
+- 当前员工版以 2026-09-30 提交 `c4a2bd7` 为基线，已按用户提供的内网源码照片补齐 `availability_operations.py`、`mirror.py`、`oof_operations.py`、`task_operations.py`；OA、审计和联系人模块也已在仓库内。照片无法证明恢复内容与该提交逐字一致，来源边界见 [源码恢复记录](docs/source-restoration.md)。
+- 恢复后的真实 `mcp_server` 导入通过。新增 11 项离线检查中 9 项通过、2 项复现原版镜像缺陷；完整测试共 62 项，仍有恢复前既存的 16 个失败和 4 个错误，不能视为全部通过或生产联调完成。
 - 照片、凭据、运行数据库及导出附件不入库。
 
 验证命令（使用目标环境 Python）：
