@@ -76,7 +76,7 @@ _SCHEMA_ERROR_MESSAGES = {
     "INVALID_DATETIME": "时间格式无效，请使用 ISO 日期时间。",
     "INVALID_PAGINATION": "分页参数无效，请检查 offset／limit 的类型与范围。",
     "INVALID_FOLDER": "文件夹参数无效，请使用 list_folders 返回的别名。",
-    "INVALID_BODY_FORMAT": "正文格式无效：body_format 仅支持 text 或 html（create_draft 的 html 仅限 mode=new；update_draft 的 html 用于 replace 整体替换或 prepend 前置片段，但 prepend+html 要求目标草稿本身已是 HTML）。",
+    "INVALID_BODY_FORMAT": "正文格式无效：body_format 仅支持 text 或 html（create_draft 回复／转发的 html 正文仅接受新增片段；update_draft 的 html 用于 replace 整体替换或 prepend 前置片段，但 prepend+html 要求目标草稿本身已是 HTML）。",
     "INVALID_BODY_ACTION": "正文处理方式无效：body_action 仅支持 replace 或 prepend。",
     "BODY_PARAM_REQUIRES_BODY": "body_format/body_action 仅在提供 body 时生效；只改收件人或主题时请省略 body 及这两个参数。",
     "INVALID_PARAMS": "参数不符合公开 schema：请检查必填字段、类型、范围及预览／确认／仅回执查询的参数组合。",

@@ -162,8 +162,8 @@ TOOLS: dict[str, list[dict]] = {
     "create_draft": [
         _s("mode", "string", "Draft mode; reply/reply_all/forward require reply_to; new forbids reply_to.", default="new", enum=["new", "reply", "reply_all", "forward"]),
         _s("subject", "string", "Subject; omitted for reply/forward uses RE:/FW: prefix.", default=""),
-        _s("body", "string", "With mode=reply/reply_all/forward this is only your new text: Exchange appends the quoted original natively, so do not paste the original back and do not pass a cleaned plain-text copy of it; an HTML original keeps its formatting. With mode=new it is the complete body of the new message.", default="", max_length=65536),
-        _s("body_format", "string", "How to read body. text (default) submits it as plain text. html submits it verbatim as an HTML body so tables and inline style= attributes render - use inline CSS, not a <style> block. html is only accepted with mode=new: a reply/forward body is plain text, and the quoted original keeps its own formatting.", default="text", enum=["text", "html"]),
+        _s("body", "string", "With mode=reply/reply_all/forward this is only your new content: plain text by default, or an HTML fragment with body_format=html (no html/head/body/doctype). Empty content is allowed. Exchange appends the quoted original natively, so do not paste the original back and do not pass a cleaned plain-text copy of it. With mode=new it is the complete body of the new message.", default="", max_length=65536),
+        _s("body_format", "string", "How to read body. text (default) submits plain text and keeps the quoted original's body type. html submits body verbatim: mode=new accepts a complete HTML body or fragment; reply/reply_all/forward accept only the new HTML fragment through EWS NewBodyContent, and Exchange includes the quoted original in HTML. Inline CSS is recommended for email compatibility; final rendering depends on the email client. No image upload is provided and cid: references do not create attachments.", default="text", enum=["text", "html"]),
         _s("to_emails", "string", "To recipients, ; separated.", default=""),
         _s("cc_emails", "string", "Cc recipients, ; separated.", default=""),
         _s("bcc_emails", "string", "Bcc recipients, ; separated.", default=""),
@@ -250,8 +250,8 @@ TOOLS: dict[str, list[dict]] = {
     "check_availability": [
         _s("start", "string", "Window start.", required=True),
         _s("end", "string", "Window end.", required=True),
-        _s("attendees", "array", "Attendee emails to check.", required=True, items="string", max_items=100),
-        _s("duration", "integer", "Suggested slot duration in minutes.", default=30, maximum=1440),
+        _s("attendees", "array", "Attendee emails to check; trimmed, lowercased and deduplicated.", required=True, items="string", min_items=1, max_items=100),
+        _s("interval_minutes", "integer", "Free/busy sampling interval in minutes, not a requested meeting duration.", default=30, minimum=5, maximum=1440),
     ],
     # --- people / contacts ---
     "find_people": [
@@ -300,7 +300,8 @@ TOOLS: dict[str, list[dict]] = {
     "list_tasks": [
         _s("folder", "string", "Task folder alias.", default="tasks", enum=["tasks"]),
         _s("incomplete_only", "boolean", "Only incomplete tasks.", default=True),
-        _s("limit", "integer", "Max results.", default=50, maximum=100),
+        _s("limit", "integer", "Page size.", default=50, minimum=1, maximum=100),
+        _s("offset", "integer", "Offset in the filtered task list; use the returned next_offset.", default=0, minimum=0),
     ],
     "create_task": [
         _s("subject", "string", "Task subject.", required=True),
@@ -334,7 +335,7 @@ DESCRIPTIONS = {
     "get_attachment": "List attachment metadata or read supported text files; the 5 MiB input and 20000-character output limits apply to text reading, not metadata listing. Other file types return metadata only. To download an original file, use prepare_attachment_download and then HTTP GET its URL from the employee execution environment.",
     "prepare_attachment_download": "Prepare an original file attachment for HTTP download after checking its message and mailbox scope. Returns download_url, filename, content_type, size, sha256 and expires_at; no file bytes or server paths. The URL is a temporary bearer credential: download into the task workspace, verify SHA-256, and do not publish it. Retry GET while valid; call this tool again after expiry. Requires server download configuration; item attachments are unsupported.",
     "get_mailbox_overview": "Read Inbox total/unread counts and recent unread messages only.",
-    "create_draft": "Create a new draft or native EWS reply/reply_all/forward draft without sending; use an original message ID, not a consumed draft ID. A new draft takes real HTML with body_format=html; reply/forward bodies are always plain text and keep the quoted original's own formatting.",
+    "create_draft": "Create a new draft or native EWS reply/reply_all/forward draft without sending; use an original message ID, not a consumed draft ID. body_format=html accepts the full body for a new message, or only a new HTML fragment for reply/forward; Exchange supplies the quoted original. Plain text remains the default and preserves an HTML original's body type.",
     "update_draft": "Update supplied draft fields and align the draft author with the OA employee when needed; empty values clear supported fields. body_action=replace (default) makes body the whole new body, including any quoted original. body_action=prepend adds body as one new piece of content at the start of the server-read existing body, keeping that body's tables, styles, quoted mail and inline images, so the original is never resubmitted; prepend takes plain text, or an HTML fragment with body_format=html when the draft is already HTML (fragment only, no html/head/body, and any cid: image it references must already exist on the draft). To change only recipients or subject, omit body (and do not pass body_format/body_action). The preview snapshots the draft version, confirm refuses a draft that was edited since preview, and the save itself uses EWS conflict detection.",
     "delete_draft": "Move one draft to DeletedItems; requires DeletedItems access; never permanently deletes or falls back to hard delete.",
     "send_draft": "Send one existing employee draft and save a copy in employee Sent; source draft ID is consumed, not a sent/received ID; no auto resend; idempotency_key persists across restarts.",
@@ -349,11 +350,11 @@ DESCRIPTIONS = {
     "update_event": "Update an organizer-owned single event or explicit occurrence; recurring masters rejected; notify_attendees=false is silent; empty location clears it.",
     "respond_to_event": "Accept, decline or tentatively respond as an attendee, sending a response after confirmation and the send switch check; organizer-owned and recurring-master objects are rejected.",
     "cancel_event": "Cancel an organizer-owned event: meetings send native EWS cancellation notices and require the send switch; only a non-meeting appointment with no attendees is moved to Deleted Items without a notice. Omitting message does not suppress cancellation notices; recurring masters rejected.",
-    "check_availability": "Query directory free/busy and suggest shared slots; any unavailable or NoData attendee prevents claiming a mutually free slot.",
+    "check_availability": "Return per-attendee free/busy intervals, including tentative, OOF and unknown; missing or unusable data stays unknown. Callers choose shared times and schedule meetings separately.",
     "find_people": "Search the organization directory (GAL) and/or the OA mailbox Contacts folder independently; different sources with separate permissions and coverage. With directory_id, search only that administrator-configured team shared directory using source=contacts; gal/auto cannot be combined with it and are rejected.",
     "get_contact": "Read a scoped Contacts item, or resolve an exact unique email in the organization directory; directory address cannot switch the target mailbox. With directory_id, read an item ID inside that team shared directory only: the employee's directory permission is checked first, the item's parent folder must be that directory, and an email address never falls through to GAL. The result names the directory it came from.",
     "create_contact": "Create one contact in the OA employee's own Contacts folder, or in an administrator-configured team shared directory when directory_id is given; never touches the GAL and sends no mail. A shared-directory create requires create permission for that directory, and the preview and receipt both name the resolved target; the confirmed target is re-verified, so a re-pointed directory requires a fresh preview.",
-    "list_tasks": "Read scoped Exchange tasks live, incomplete by default; use returned IDs for update_task.",
+    "list_tasks": "Read scoped Exchange tasks live, incomplete by default; filter before pagination and follow next_offset until null. Returns has_more, offset and limit; use returned IDs for update_task.",
     "create_task": "Create one task in the OA employee's own Tasks folder; sends no mail and invites nobody.",
     "update_task": "Update a scoped task completion/due date using a checked change key; no fields means no write.",
     "get_oof_settings": "Read this OA mailbox out-of-office settings; folder delegation may not authorize this mailbox-level operation.",
@@ -520,18 +521,6 @@ def public_tools():
                     "if": {"required": ["mode"], "properties": {"mode": {"enum": ["reply", "reply_all", "forward"]}}},
                     "then": {"required": ["reply_to"]},
                     "else": {"not": {"required": ["reply_to"]}},
-                },
-            }, {
-                # An HTML body only makes sense for a brand-new message: a reply's
-                # body is "your new text" and the quoted original supplies the
-                # formatting. Omitting mode defaults to new, so only an explicit
-                # reply mode conflicts.
-                "not": {
-                    "required": ["body_format", "mode"],
-                    "properties": {
-                        "body_format": {"const": "html"},
-                        "mode": {"enum": ["reply", "reply_all", "forward"]},
-                    },
                 },
             }]
         elif name == "update_draft":

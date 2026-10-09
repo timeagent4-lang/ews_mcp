@@ -175,7 +175,7 @@ def _prepend_body(source_body, text):
 # Anything that marks a whole document rather than a fragment. A full document
 # is refused instead of having its <body> extracted: the <head> can carry the
 # styles, and silently dropping it would change how the content renders.
-_DOCUMENT_MARKER_RE = re.compile(r"<\s*(!doctype|html|head|body)\b", re.IGNORECASE)
+_DOCUMENT_MARKER_RE = re.compile(r"<\s*/?\s*(!doctype|html|head|body)\b", re.IGNORECASE)
 # cid: URL references to inline images, e.g. src="cid:logo@contoso".
 _CID_REF_RE = re.compile(r"""cid:\s*([^"'\s)>]+)""", re.IGNORECASE)
 
@@ -188,7 +188,7 @@ def _validate_html_fragment(fragment):
     if _DOCUMENT_MARKER_RE.search(text):
         raise ToolOperationError(
             "HTML_FRAGMENT_REQUIRED",
-            "前置内容只接受 HTML 片段（如 <p>、<table>、<div>），不支持含 html/head/body/doctype "
+            "新增内容只接受 HTML 片段（如 <p>、<table>、<div>），不支持含 html/head/body/doctype "
             "的完整文档；请只提交片段本身，本次不自动提取 body，以免 <head> 中的样式被静默丢弃。",
         )
     return text
@@ -314,13 +314,10 @@ class WriteOperations:
             raise ToolOperationError("INVALID_DRAFT_MODE", "不支持的草稿类型。")
         if body_format not in ("text", "html"):
             raise ToolOperationError("INVALID_BODY_FORMAT", "body_format 仅支持 text 或 html。")
-        if body_format == "html" and mode != "new":
-            # 回复/转发的新增文本始终按纯文本转义；引用原文自带格式。若把调用方
-            # 的字符串直接当 HTML，等于让调用方替换掉整封信的标记与引文。
-            raise ToolOperationError(
-                "INVALID_BODY_FORMAT",
-                "HTML 正文仅支持 mode=new；回复/转发请传纯文本，引用原文的格式由 Exchange 保留。",
-            )
+        html_reply = body_format == "html" and mode != "new"
+        if html_reply and str(body or "").strip():
+            # NewBodyContent prefixes the quote; nonempty HTML must be a fragment.
+            _validate_html_fragment(body)
         author = Mailbox(email_address=self.config.email)
         recipients = [_recipients(to_emails), _recipients(cc_emails), _recipients(bcc_emails)]
         folder = self._tool_folder("drafts")
@@ -346,6 +343,7 @@ class WriteOperations:
             if not reply_to:
                 raise ToolOperationError("ORIGINAL_REQUIRED", "回复或转发需要原邮件 ID。")
             original = _ordinary_message(self._tool_item(reply_to))
+            new_body = HTMLBody(body) if html_reply else _new_body(body, original.body)
             target_subject = subject or (
                 ("FW: " if mode == "forward" else "RE: ") + (original.subject or "")
             )
@@ -353,7 +351,7 @@ class WriteOperations:
                 to, cc, bcc = _deduplicate(recipients)
                 draft = original.create_forward(
                     subject=target_subject,
-                    body=_new_body(body, original.body),
+                    body=new_body,
                     to_recipients=to,
                     cc_recipients=cc,
                     bcc_recipients=bcc,
@@ -391,14 +389,14 @@ class WriteOperations:
                     )
                 if mode == "reply_all":
                     draft = original.create_reply_all(
-                        subject=target_subject, body=_new_body(body, original.body), author=author
+                        subject=target_subject, body=new_body, author=author
                     )
                     # SDK defaults copy Bcc and ignore Reply-To; replace all recipient fields.
                     draft.to_recipients, draft.cc_recipients, draft.bcc_recipients = to, cc, bcc
                 else:
                     draft = original.create_reply(
                         subject=target_subject,
-                        body=_new_body(body, original.body),
+                        body=new_body,
                         to_recipients=to,
                         cc_recipients=cc,
                         bcc_recipients=bcc,

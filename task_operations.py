@@ -120,24 +120,39 @@ class TaskOperations:
             "due_date": _task_date(item.due_date),
         }
 
-    def list_tasks(self, folder="tasks", incomplete_only=True, limit=50):
-        # Re-check here, like every other folder-taking tool: the schema enum is
-        # client-side only, and the argument must drive the lookup instead of
-        # being silently replaced by a literal.
+    def list_tasks(self, folder="tasks", incomplete_only=True, limit=50, offset=0):
+        # Revalidate folder for direct callers that bypass the MCP schema.
         if folder not in ("tasks",):
             raise ToolOperationError("INVALID_FOLDER", "任务文件夹仅支持 tasks。 ")
+        if (
+            type(limit) is not int
+            or not 1 <= limit <= 100
+            or type(offset) is not int
+            or offset < 0
+        ):
+            raise ToolOperationError(
+                "INVALID_PAGINATION", "offset 必须非负且 limit 必须为 1 到 100。"
+            )
+        if type(incomplete_only) is not bool:
+            raise ToolOperationError("INVALID_PARAMS", "incomplete_only 必须为布尔值。")
         tasks_folder = self._tool_folder(folder)
-        # `complete` is a server-marking *method*, not a filterable field, so filter
-        # in Python on the status field.
-        rows = list(tasks_folder.all().order_by("-due_date")[:limit])
+        query = tasks_folder.all()
         if incomplete_only:
-            rows = [
-                task for task in rows
-                if getattr(task, "status", None) != Task.COMPLETED
-            ]
+            # Status is not searchable in exchangelib; IsComplete is filterable.
+            query = query.filter(is_complete=False)
+        rows = list(query.order_by("-due_date")[offset : offset + limit + 1])
+        # Include the lookahead in error checks so a failed read cannot look final.
+        for row in rows:
+            if isinstance(row, Exception):
+                raise row
+        has_more = len(rows) > limit
         return {
-            "items": [_task_row(task) for task in rows],
-            "incomplete_only": bool(incomplete_only),
+            "items": [_task_row(task) for task in rows[:limit]],
+            "incomplete_only": incomplete_only,
+            "offset": offset,
+            "limit": limit,
+            "has_more": has_more,
+            "next_offset": offset + limit if has_more else None,
         }
 
     def update_task(

@@ -1,17 +1,15 @@
-"""Free/busy availability for the employee's directory contacts.
+"""Return employee-directory free/busy facts; callers choose meeting times."""
 
-Unknown or NoData attendees must never be reported as free (their status is
-treated as busy/unknown so no slot is wrongly claimed as mutually free).
-"""
-
-from datetime import datetime, timedelta
+from datetime import time, timedelta
 
 from exchangelib import EWSDateTime
 from exchangelib.ewsdatetime import EWSTimeZone
 from exchangelib.properties import (
+    DaylightTime,
     Email,
     FreeBusyViewOptions,
     MailboxData,
+    StandardTime,
     TimeWindow,
     TimeZone,
 )
@@ -20,78 +18,104 @@ from exchangelib.services import GetUserAvailability
 from tool_support import LOCAL_TIMEZONE, ToolOperationError, parse_local_datetime
 
 
-def _suggested(start_dt, end_dt, duration):
-    """Build a bounded suggested slot dict from the window/interval."""
-    slot_end = min(start_dt + timedelta(minutes=duration), end_dt)
-    return {
-        "start": start_dt.astimezone(LOCAL_TIMEZONE).isoformat(),
-        "end": slot_end.astimezone(LOCAL_TIMEZONE).isoformat(),
-        "duration_minutes": int((slot_end - start_dt).total_seconds() // 60),
+_MERGED_STATUSES = {
+    "0": "free",
+    "1": "tentative",
+    "2": "busy",
+    "3": "oof",
+    "4": "unknown",
+}
+
+
+def _interval(start_dt, end_dt, status):
+    return {"start": start_dt.isoformat(), "end": end_dt.isoformat(), "status": status}
+
+
+def _busy_intervals(merged, start_dt, end_dt, step):
+    """Validate coverage before interpreting the stream; coalesce equal statuses."""
+    full_slots, remainder = divmod(end_dt - start_dt, step)
+    expected_slots = full_slots + bool(remainder)
+    if (
+        not isinstance(merged, str)
+        or len(merged) != expected_slots
+        or any(digit not in _MERGED_STATUSES for digit in merged)
+    ):
+        return [_interval(start_dt, end_dt, "unknown")]
+
+    intervals = []
+    for index, digit in enumerate(merged):
+        slot_start = start_dt + index * step
+        slot_end = min(slot_start + step, end_dt)
+        status = _MERGED_STATUSES[digit]
+        if intervals and intervals[-1]["status"] == status:
+            intervals[-1]["end"] = slot_end.isoformat()
+        else:
+            intervals.append(_interval(slot_start, slot_end, status))
+    return intervals
+
+
+def _window_status(intervals):
+    statuses = {interval["status"] for interval in intervals}
+    if "unknown" in statuses:
+        return "unknown"
+    return "free" if statuses == {"free"} else "busy"
+
+
+def _requester_timezone(start_dt):
+    # EWS Bias is added to local time to obtain UTC. Shanghai has no current DST;
+    # both transition elements are still required, with Month=0 for no transition.
+    transition = {
+        "bias": 0,
+        "time": time(0, 0),
+        "occurrence": 0,
+        "iso_month": 0,
+        "weekday": "Sunday",
     }
-
-
-# MergedFreeBusy digits index exchangelib's FREE_BUSY_CHOICES:
-# 0 Free, 1 Tentative, 2 Busy, 3 OOF, 4 NoData, 5 WorkingElsewhere.
-_BUSY_DIGITS = frozenset("1235")
-_NODATA_DIGIT = "4"
-
-
-def _classify_busy(merged, events):
-    """Map a MergedFreeBusy string to free/busy/unknown.
-
-    Anything that carries no information (empty merged data, NoData slots,
-    unrecognised digits) is ``unknown`` — never ``free``.
-    """
-    if events:
-        return "busy"
-    if not merged:
-        return "unknown"
-    if any(ch in _BUSY_DIGITS for ch in merged):
-        return "busy"
-    if any(ch == _NODATA_DIGIT for ch in merged):
-        return "unknown"
-    if all(ch == "0" for ch in merged):
-        return "free"
-    return "unknown"
+    offset_minutes = int(start_dt.utcoffset().total_seconds() // 60)
+    return TimeZone(
+        bias=-offset_minutes,
+        standard_time=StandardTime(**transition),
+        daylight_time=DaylightTime(**transition),
+    )
 
 
 class AvailabilityOperations:
-    def check_availability(self, start, end, attendees, duration=30):
+    def check_availability(self, start, end, attendees, interval_minutes=30):
         start_dt = parse_local_datetime(start)
         end_dt = parse_local_datetime(end)
         if start_dt >= end_dt:
             raise ToolOperationError("INVALID_TIME_RANGE", "忙闲时间窗口开始必须早于结束。")
+        if (
+            isinstance(interval_minutes, bool)
+            or not isinstance(interval_minutes, int)
+            or not 5 <= interval_minutes <= 1440
+        ):
+            raise ToolOperationError("INVALID_PARAMS", "忙闲采样间隔必须为 5–1440 分钟的整数。")
+        if not isinstance(attendees, (list, tuple)) or not 1 <= len(attendees) <= 100:
+            raise ToolOperationError("INVALID_ATTENDEE", "请提供 1–100 个参会人邮箱。")
         mailbox_data = []
-        for value in attendees or []:
-            email = str(value).strip().lower()
+        seen = set()
+        for value in attendees:
+            email = value.strip().lower() if isinstance(value, str) else ""
             if not email or "@" not in email:
                 raise ToolOperationError("INVALID_ATTENDEE", "参会人邮箱格式无效。")
+            if email in seen:
+                continue
+            seen.add(email)
             mailbox_data.append(MailboxData(email=Email(email_address=email)))
-        if not mailbox_data:
-            raise ToolOperationError("INVALID_ATTENDEE", "请至少提供一个参会人。")
         time_window = TimeWindow(
             start=EWSDateTime.from_datetime(start_dt),
             end=EWSDateTime.from_datetime(end_dt),
         )
         view_options = FreeBusyViewOptions(
             time_window=time_window,
-            merged_free_busy_interval=duration,
+            merged_free_busy_interval=interval_minutes,
             requested_view="MergedOnly",
         )
-        # Minimal requester TimeZone (UTC offset bias). LOCAL_TIMEZONE is not DST,
-        # so a bias-only element is sufficient; from_server_timezone needs pytz
-        # which is not installed here.
-        offset_minutes = int(
-            datetime.now(LOCAL_TIMEZONE).utcoffset().total_seconds() // 60
-        )
-        requester_tz = TimeZone(bias=offset_minutes)
+        requester_tz = _requester_timezone(start_dt)
         tzinfo_arg = EWSTimeZone.from_zoneinfo(LOCAL_TIMEZONE)
         try:
-            # ``call()`` returns a lazy generator (_chunked_get_elements); the HTTP
-            # request fires while it is iterated, NOT when it is created. Consume it
-            # inside the wrapper so a transport/EWS failure cannot escape as a raw,
-            # unclassified exception. The wrapper chains the original error, so the
-            # envelope still surfaces its desensitized exchange_code/exchange_message.
+            # Consume the lazy response here so transport/EWS failures are wrapped.
             views = list(
                 GetUserAvailability(protocol=self.account.protocol).call(
                     tzinfo=tzinfo_arg,
@@ -106,64 +130,29 @@ class AvailabilityOperations:
                 "AVAILABILITY_UNAVAILABLE",
                 "忙闲查询失败或受现场策略限制，结果未知。",
             ) from exc
-        # GetUserAvailability returns ONE element per MailboxData entry, in the
-        # same order: either a FreeBusyView or the EWS exception for that
-        # mailbox. There is no outer {mailbox, error, free_busy_view} wrapper.
-        # If the counts disagree the positional mapping is broken, and nothing
-        # may be reported as free.
-        statuses = {}
-        merged_by = {}
-        if len(views) != len(mailbox_data):
-            for data in mailbox_data:
-                email = data.email.email_address.lower()
-                statuses[email] = "unknown"
-                merged_by[email] = None
-        else:
-            for data, response in zip(mailbox_data, views):
-                email = data.email.email_address.lower()
-                if isinstance(response, Exception) or response is None:
-                    statuses[email] = "unknown"
-                    merged_by[email] = None
-                    continue
-                merged = str(getattr(response, "merged", "") or "")
-                events = getattr(response, "calendar_events", None) or []
-                statuses[email] = _classify_busy(merged, events)
-                merged_by[email] = merged
-        all_free = all(status == "free" for status in statuses.values())
-
-        # Suggested slot: if everyone is free, suggest the window head;
-        # otherwise, if all attendees have merged data with no unknowns, suggest
-        # the first interval where everyone is free ('0').
-        suggested = None
-        if all_free:
-            suggested = _suggested(start_dt, end_dt, duration)
-        elif (
-            all(status != "unknown" for status in statuses.values())
-            and merged_by
-            and all(value is not None for value in merged_by.values())
-        ):
-            slot_count = min(len(value) for value in merged_by.values())
-            for index in range(slot_count):
-                if all(value[index] == "0" for value in merged_by.values()):
-                    suggested = _suggested(
-                        start_dt + timedelta(minutes=index * duration),
-                        end_dt,
-                        duration,
-                    )
-                    break
+        # Responses match MailboxData order, including per-mailbox exceptions.
+        # A count mismatch invalidates the mapping; all statuses stay unknown.
+        aligned = len(views) == len(mailbox_data)
+        step = timedelta(minutes=interval_minutes)
+        results = []
+        for index, data in enumerate(mailbox_data):
+            response = views[index] if aligned else None
+            merged = (
+                getattr(response, "merged", None)
+                if response is not None and not isinstance(response, Exception)
+                else None
+            )
+            intervals = _busy_intervals(merged, start_dt, end_dt, step)
+            results.append({
+                "email": data.email.email_address,
+                "status": _window_status(intervals),
+                "intervals": intervals,
+            })
 
         return {
             "window_start": start_dt.astimezone(LOCAL_TIMEZONE).isoformat(),
             "window_end": end_dt.astimezone(LOCAL_TIMEZONE).isoformat(),
-            "attendees": [
-                {"email": email, "status": status}
-                for email, status in statuses.items()
-            ],
-            "mutually_free_slot_possible": bool(all_free),
-            "suggested_slot": suggested,
-            "note": (
-                "Unknown/NoData attendees are never reported as free."
-                if not all_free
-                else None
-            ),
+            "timezone": LOCAL_TIMEZONE.key,
+            "interval_minutes": interval_minutes,
+            "attendees": results,
         }

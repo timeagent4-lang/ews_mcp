@@ -9,6 +9,8 @@
 
 - 当前注册 28 个工具；删除未注册的本地镜像跟进工具后，保留其他禁用工具及会议通知副本行为。
 - 附件通过 `prepare_attachment_download` 生成内网 HTTP 签名链接，AI 执行器 GET 下载文件；字节不进入工具响应。
+- `check_availability` 返回各邮箱的忙闲区间，由调用方 Agent 选择公共时段；`interval_minutes` 为采样间隔（默认 30，范围 5–1440），不是会议时长。参数与迁移说明见 [忙闲查询](docs/availability.md)。
+- `list_tasks` 默认先筛选未完成任务，再按到期日降序分页；用返回的 `next_offset` 取后续页。参数、空结果和分页边界见 [任务列表](docs/task-listing.md)。
 - 配置统一使用 `lanid`／`OUTLOOK_ADMIN_LANID`。
 - 当前员工版以 2026-09-30 提交 `c4a2bd7` 为基线，已按用户提供的内网源码照片恢复忙闲、自动回复、任务等模块；OA、审计和联系人模块也已在仓库内。照片无法证明恢复内容与该提交逐字一致，来源边界及当时验证结果见 [源码恢复记录](docs/source-restoration.md)。
 - 本地邮件镜像与 `waiting_on` 已删除，不再使用 `EWS_MCP_CACHE_ENABLED`，服务状态也不再返回镜像覆盖或该开关。确认回执库、附件下载索引及附件缓存保留，`EWS_MCP_DATA_DIR` 仍需配置。

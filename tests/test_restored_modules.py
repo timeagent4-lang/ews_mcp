@@ -38,24 +38,32 @@ class AvailabilityTests(unittest.TestCase):
                 ["a@example.com", "b@example.com"],
             )
 
-    def test_missing_nodata_and_misaligned_responses_never_claim_free(self):
-        for responses in (
-            [], [FreeBusyView(merged="00")],
-            [FreeBusyView(merged="00"), FreeBusyView(merged="44")],
-            [FreeBusyView(merged="00"), None],
+    def test_missing_nodata_and_misaligned_responses_preserve_unknown_facts(self):
+        for responses, expected in (
+            ([], ["unknown", "unknown"]),
+            ([FreeBusyView(merged="00")], ["unknown", "unknown"]),
+            ([FreeBusyView(merged="00"), FreeBusyView(merged="44")], ["free", "unknown"]),
+            ([FreeBusyView(merged="00"), None], ["free", "unknown"]),
         ):
             with self.subTest(responses=responses):
                 result = self.query(responses)
-                self.assertFalse(result["mutually_free_slot_possible"])
-                self.assertIsNone(result["suggested_slot"])
+                self.assertEqual([item["status"] for item in result["attendees"]], expected)
+                for item, status in zip(result["attendees"], expected):
+                    self.assertEqual(item["intervals"], [{
+                        "start": "2026-10-09T09:00:00+08:00",
+                        "end": "2026-10-09T10:00:00+08:00", "status": status,
+                    }])
 
-    def test_free_window_suggests_first_bounded_slot(self):
+    def test_free_window_reports_each_attendee_full_interval(self):
         result = self.query([FreeBusyView(merged="00"), FreeBusyView(merged="00")])
-        self.assertTrue(result["mutually_free_slot_possible"])
-        self.assertEqual(result["suggested_slot"], {
-            "start": "2026-10-09T09:00:00+08:00",
-            "end": "2026-10-09T09:30:00+08:00", "duration_minutes": 30,
-        })
+        self.assertNotIn("suggested_slot", result)
+        self.assertNotIn("mutually_free_slot_possible", result)
+        self.assertEqual(result["attendees"], [{
+            "email": email, "status": "free", "intervals": [{
+                "start": "2026-10-09T09:00:00+08:00",
+                "end": "2026-10-09T10:00:00+08:00", "status": "free",
+            }],
+        } for email in ("a@example.com", "b@example.com")])
 
     def test_lazy_exchange_failure_gets_public_error_and_keeps_cause(self):
         original = ConnectionError("offline")
