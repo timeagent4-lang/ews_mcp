@@ -183,6 +183,10 @@ class FlagOperations:
             raise ToolOperationError(
                 "INVALID_FLAG", "旗标状态必须是 flagged, complete 或 clear。"
             )
+        if flag == "clear" and due_date is not None:
+            raise ToolOperationError(
+                "INVALID_PARAMS", "flag=clear 时不能提供 due_date；清除旗标会删除所有日期。"
+            )
         item = self._tool_item(message_id)
         if type(item) is not Message:
             raise ToolOperationError("NOT_MAIL_MESSAGE", "此操作仅支持普通邮件。")
@@ -211,7 +215,7 @@ class FlagOperations:
             "flag": flag,
             "flag_status": changes["flag_status"],
             "task_complete": changes["task_complete"],
-            "task_due_date": iso_datetime(changes.get("task_due_date")),
+            "task_due_date": iso_datetime(getattr(item, "task_due_date", None)),
             "updated_fields": list(changes),
         }
 

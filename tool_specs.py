@@ -189,7 +189,7 @@ TOOLS: dict[str, list[dict]] = {
     "set_message_flag": [
         _s("message_id", "string", "Scoped message ID to flag.", required=True),
         _s("flag", "string", "Follow-up state to apply.", required=True, enum=["flagged", "complete", "clear"]),
-        _s("due_date", "string", "ISO due date: flagged sets it (omission clears it); complete updates it when supplied (omission preserves it). For clear, omit this field; all flag dates are removed.", default=None),
+        _s("due_date", "string", "ISO due date: flagged sets it (omission clears it); complete updates it when supplied (omission preserves it). Not allowed with clear; all flag dates are removed.", default=None),
     ],
     "list_flagged_messages": [
         _s("folder", "string", "Mail folder to list.", default="inbox", enum=["inbox", "drafts", "sent"]),
@@ -531,6 +531,11 @@ def public_tools():
                     "body_format": ["body"],
                     "body_action": ["body"],
                 },
+            }]
+        elif name == "set_message_flag":
+            params["allOf"] = [{
+                "if": {"required": ["flag"], "properties": {"flag": {"const": "clear"}}},
+                "then": {"not": {"required": ["due_date"]}},
             }]
         elif name == "find_people":
             # A team shared directory is a third, explicit source: it is never
