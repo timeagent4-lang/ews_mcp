@@ -1,25 +1,13 @@
-"""The tool vocabulary, exposed through a strict flat arguments contract.
-
-32 tools are defined; 28 are registered. Disabled tool definitions are retained
-but excluded from registration via ``DISABLED_TOOLS``.
-
-Based on the reference ``ews4s_oa_delegate`` registry: business fields live directly
-in ``arguments``; ``lanid`` / ``name`` are always required; IDs are
-mailbox-scoped; write tools route through the persistent two-phase confirmation
-(``operation_id`` + ``confirm_token`` + optional ``idempotency_key``).
-"""
+"""Flat tool schemas with OA-scoped identities and persistent write confirmation."""
 
 from __future__ import annotations
 
-# ---------------- field helpers ----------------
 
 SIDE_READ = "read"
 SIDE_WRITE = "write"
 
-# string fields that may carry long free text (larger maxLength).
 _BIG_TEXT = frozenset({"body", "message", "internal_reply", "external_reply", "query"})
 
-# fields describing an item reference; get a mailbox-scoped hint.
 _ID_FIELDS = frozenset(
     {
         "id",
@@ -34,15 +22,10 @@ _ID_FIELDS = frozenset(
     }
 )
 
-# Folder references are a separate vocabulary: only the well-known aliases that
-# list_folders reports are accepted, so a caller cannot construct an arbitrary
-# FolderId and reach outside this employee's own mailbox.
+# Accept folder aliases only; raw FolderIds could escape the mailbox scope.
 _FOLDER_FIELDS = frozenset({"folder", "to_folder"})
 
-# Fine-grained error codes for public-schema validation failures. Only these
-# fields carry one; everything else - identity fields, unknown properties and
-# the preview/confirm/query oneOf combinations - stays INVALID_PARAMS, so a
-# schema failure is never reported as an identity or a business rejection.
+# Only these schema fields receive specific codes; others stay INVALID_PARAMS.
 _FIELD_ERROR_CODES = {}
 for _code, _names in (
     ("INVALID_DATETIME", ("start", "end", "start_date", "due_date", "since", "until")),
@@ -116,9 +99,6 @@ def _s(name, type_, description, *, required=False, default=None, enum=None,
     return field
 
 
-# ---------------- tool vocabulary ----------------
-
-# keyed by tool name; value is a list of business parameter specs.
 TOOLS: dict[str, list[dict]] = {
     # --- mail read ---
     "list_folders": [],
@@ -257,7 +237,7 @@ TOOLS: dict[str, list[dict]] = {
     "find_people": [
         _s("query", "string", "Search text.", required=True),
         _s("source", "string", "gal, contacts, or auto.", default="auto", enum=["auto", "gal", "contacts"]),
-        _s("limit", "integer", "Max per source.", default=20, maximum=100),
+        _s("limit", "integer", "Max per source.", default=20, minimum=1, maximum=100),
         _s(
             "directory_id",
             "string",
@@ -362,24 +342,13 @@ DESCRIPTIONS = {
     "get_server_status": "Return the current mailbox, whether this adapter has an account, the send switch and the data-directory basename; no credentials or other mailbox statistics.",
 }
 
-# Notification-copy placement is deployment-dependent; employee Sent is not a
-# delivery receipt. Keep the existing EWS send/save behavior unchanged.
 for _name in ("create_event", "update_event", "cancel_event"):
     DESCRIPTIONS[_name] += (
         " Meeting notification copies are not guaranteed to appear in employee Sent; "
         "a missing copy alone does not establish sending failure or justify resending."
     )
 
-# ---------------- deliberately unregistered tools ----------------
-# These definitions are retained but are NOT registered, so no external caller
-# can see or invoke them. Re-exposure also requires the corresponding business
-# module and deployment permissions. Two distinct reasons live here:
-#   * delete_draft / delete_messages -- deletion-class policy: withheld by
-#     decision, not a defect.
-#   * get_oof_settings / set_oof -- OOF is a mailbox-level Exchange right this
-#     delegated service account does not hold on the current deployment; even a
-#     correct request is refused with ErrorAccessDenied, so the tool could only
-#     ever fail. Re-expose only if the right is actually granted.
+# Deletion is disabled by policy; the service lacks mailbox-level OOF permission.
 DISABLED_TOOLS = frozenset(
     {
         "delete_draft",
@@ -392,8 +361,6 @@ DISABLED_TOOLS = frozenset(
 TOOL_NAMES = [name for name in TOOLS if name not in DISABLED_TOOLS]
 assert len(TOOL_NAMES) == 28, f"expected 28 registered tools, got {len(TOOL_NAMES)}"
 
-# Registered read tools: kept in step with TOOL_NAMES so this constant never
-# advertises a tool the dispatcher cannot route.
 READ_TOOLS = frozenset(_READ_TOOLS) & frozenset(TOOL_NAMES)
 
 
@@ -430,8 +397,6 @@ def _business_schema(fields):
                 if key in field:
                     schema[key] = field[key]
         if name in _FIELD_ERROR_CODES:
-            # public-schema failures on this field report this code instead of
-            # the blanket INVALID_PARAMS (see mcp_server._validate_arguments).
             schema["x-error-code"] = _FIELD_ERROR_CODES[name]
         desc = field["description"]
         if name in _ID_FIELDS:
@@ -451,7 +416,6 @@ def _business_schema(fields):
 
 
 def public_tools():
-    """Build registration specs from the current enabled tool set."""
     result = []
     for name in TOOL_NAMES:
         fields = TOOLS[name]
@@ -525,8 +489,6 @@ def public_tools():
             }]
         elif name == "update_draft":
             params["allOf"] = [{
-                # Both only mean something alongside body; silently ignoring them
-                # would read as a successful edit that never happened.
                 "dependentRequired": {
                     "body_format": ["body"],
                     "body_action": ["body"],
@@ -538,9 +500,7 @@ def public_tools():
                 "then": {"not": {"required": ["due_date"]}},
             }]
         elif name == "find_people":
-            # A team shared directory is a third, explicit source: it is never
-            # folded into auto and never combined with gal, so the source must be
-            # stated rather than inherited from the default.
+            # Shared directories require explicit contacts source; auto/GAL cannot include them.
             params["allOf"] = [{
                 "if": {"required": ["directory_id"]},
                 "then": {

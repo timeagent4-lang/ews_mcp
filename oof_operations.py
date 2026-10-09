@@ -1,8 +1,6 @@
-"""Mailbox-level Out-of-Office settings for the OA-resolved employee.
+"""OOF settings for the OA-resolved employee.
 
-OOF is a mailbox-level setting; folder delegation may not authorize it. If the
-fixed service account lacks the needed Exchange right this is reported as
-site-policy-limited rather than bypassed (no impersonation, OA kept).
+Folder delegation may not grant OOF rights; report policy limits without bypassing them.
 """
 
 from exchangelib.services import GetUserOofSettings, SetUserOofSettings
@@ -57,9 +55,7 @@ class OofOperations:
         internal = str(internal_reply or "").strip()
         external = str(external_reply or "").strip()
         state = OofSettings.ENABLED if enabled else OofSettings.DISABLED
-        # External replies are only enabled when an explicit external body is
-        # supplied; internal text is never copied outward by default. When
-        # disabled, audience is None so the placeholder is never delivered.
+        # External delivery requires explicit external text; otherwise audience is None.
         external_audience = "All" if (enabled and external) else None
         kwargs = {"state": state, "external_audience": external_audience}
         if enabled:

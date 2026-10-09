@@ -21,12 +21,8 @@ from tool_support import LOCAL_TIMEZONE, ToolOperationError, iso_datetime, parse
 
 
 MAIL_FOLDERS = ("inbox", "drafts", "sent")
-# The folders whose reachability decides which tools are usable, probed by
-# list_folders. Deliberately a separate vocabulary from MAIL_FOLDERS: that one
-# doubles as the ID scope for _tool_item (mail items are only ever looked up in
-# inbox/drafts/sent), so widening it would widen the ID scope too. deleteditems
-# is absent on purpose -- no registered tool addresses it (deletions go through
-# move_to_trash), which never resolves that folder).
+# Keep availability probes separate from MAIL_FOLDERS, which also limits mail ID access.
+# deleteditems is unused by registered tools; move_to_trash does not resolve it.
 TOOL_FOLDERS = ("inbox", "drafts", "sent", "calendar", "contacts", "tasks")
 SIMPLE_FIELDS = (
     "parent_folder_id",
@@ -54,7 +50,6 @@ TEXT_EXTENSIONS = {".txt", ".csv", ".tsv", ".log", ".md", ".json", ".xml"}
 
 
 def _folder_coverage(exc) -> str:
-    """Classify a folder access failure as denied vs unreachable."""
     name = exc.__class__.__name__
     if name.startswith("Error") and (
         "Denied" in name or "NotFound" in name or "Access" in name
@@ -126,19 +121,18 @@ class MailOperations:
     def _tool_item(self, item_id, folder_names=MAIL_FOLDERS, only_fields=None):
         if not isinstance(item_id, str) or not item_id.strip() or not folder_names:
             raise ToolOperationError("INVALID_ITEM_ID", "请提供有效的项目 ID。")
-        # 逐个解析允许文件夹。无关文件夹（优先 DELEGATE 权限的 drafts/sent）不可达时
-        # 逐个跳过，“不得”因它们整体提前失败——目标项目真正归属的文件夹才决定能否读取。
-        folders = {}          # 可解析的允许文件夹: name -> Folder
-        unresolved = {}       # 不可解析的文件夹: name -> 异常（无可达文件夹时用于如实上报）
+        # DELEGATE 下跳过无关的不可达文件夹；读取范围仍由目标父文件夹决定。
+        folders = {}
+        unresolved = {}
         for name in folder_names:
             try:
                 folders[name] = self._tool_folder(name)
             except Exception as exc:  # noqa: BLE001 - 需区分“无关文件夹不可达”与“全部不可达”
                 unresolved[name] = exc
         if not folders:
-            # 没有任何允许文件夹可用，抛出一个上游异常，而不是伪装成“无权限/空结果/成功”
+            # 全部不可达时保留上游错误，不能当作空结果。
             raise next(iter(unresolved.values()))
-        # 用第一个可解析文件夹做元数据探测（GetItem 按 Id，跨文件夹取 parent_folder_id 以判定归属）。
+        # GetItem 可按 ID 跨文件夹读取；先校验归属，再取正文。
         first = next(iter(folders.values()))
         metadata = self._fetch_one(item_id, first, ["parent_folder_id"])
         parent_id = metadata.parent_folder_id.id if metadata.parent_folder_id else None
@@ -151,7 +145,6 @@ class MailOperations:
             None,
         )
         if folder is None:
-            # 目标项父文件夹不在“可访问且允许”范围（含：位于不可达允许文件夹，或越界） -> 拒绝，不取正文。
             raise ToolOperationError(
                 "ITEM_OUT_OF_SCOPE", "项目不属于当前员工允许访问的文件夹。"
             )
@@ -191,11 +184,7 @@ class MailOperations:
         return item
 
     def list_folders(self):
-        """Probe reach to every folder that gates tool availability.
-
-        Each TOOL_FOLDERS entry is resolved through a real EWS request, so the
-        result is a permission signal, not a static list. A denied/unreachable
-        folder is reported explicitly instead of failing the whole call."""
+        """Probe actual folder access and report failures per folder."""
         folders = []
         coverage = {}
         for name in TOOL_FOLDERS:
@@ -212,12 +201,7 @@ class MailOperations:
             folders.append(
                 {
                     "name": name,
-                    # The alias this service uses for the folder. Only the mail
-                    # subset of TOOL_FOLDERS is accepted as a `folder` argument by
-                    # the mail tools; each such field carries its own enum. `id`
-                    # below is diagnostic only: raw EWS folder ids are rejected,
-                    # so no caller can point a tool at a folder outside this
-                    # employee's own mailbox.
+                    # Tools accept registered aliases; raw EWS folder IDs are diagnostic only.
                     "folder": name,
                     "accessible": True,
                     "id": folder.id,
@@ -348,7 +332,6 @@ class MailOperations:
             .order_by("-" + time_field)[offset : offset + limit + 1]
         )
         # EWS may yield exceptions as rows, including the pagination lookahead.
-        # Preserve the upstream error instead of claiming a successful page.
         for row in rows:
             if isinstance(row, Exception):
                 raise row
@@ -437,7 +420,6 @@ class MailOperations:
         }
 
     def _save_export(self, attachment, *, store=None):
-        """Stream a bounded attachment into the existing mailbox export directory."""
         if not isinstance(attachment, FileAttachment):
             raise ToolOperationError(
                 "ATTACHMENT_NOT_SUPPORTED", "仅支持保存文件类附件。"

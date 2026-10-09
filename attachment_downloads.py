@@ -1,8 +1,7 @@
-"""Bounded mailbox exports and short-lived bearer download links.
+"""Bounded exports and signed links to immutable cached files.
 
-Only the authenticated mail tool may create exports. HTTP clients get access
-to one immutable cached file via its signed URL; no Exchange credentials or
-server paths are accepted from them. The service account must own the data dir.
+Only authenticated tools create exports; the service account owns the data dir.
+HTTP callers cannot supply Exchange credentials or server paths.
 """
 
 import asyncio
@@ -31,7 +30,7 @@ WRITE_LEASE_SECONDS = 3600
 
 
 class DownloadAccessLogFilter(logging.Filter):
-    """Keep normal uvicorn fields while masking all download query parameters."""
+    """Mask download query parameters in access logs."""
     def filter(self, record):
         def redact(value):
             if isinstance(value, str) and "/downloads/" in unquote(value):
@@ -59,8 +58,7 @@ def _safe_storage_errors(fn):
             return fn(*args, **kwargs)
         except (OSError, sqlite3.Error) as exc:
             logger.error("attachment_storage_failed error_type=%s", type(exc).__name__)
-            # The existing MCP envelope traverses __cause__ and includes raw
-            # Exchange messages; do not chain local exceptions containing paths.
+            # The MCP envelope exposes causes; suppress local paths in chained errors.
             raise ToolOperationError("EXPORT_DIR_UNAVAILABLE", "附件导出存储不可用，请联系管理员。") from None
     return wrapped
 
@@ -109,7 +107,7 @@ class AttachmentDownloadStore:
 
     def _path(self, relative_path):
         path = self.exports / relative_path
-        # Check the actual path, including mailbox directory symlinks/junctions.
+        # Reject paths escaping through symlinks or junctions.
         if path.is_symlink() or not path.resolve().is_relative_to(self.exports):
             raise OSError("invalid export path")
         return path
@@ -121,7 +119,7 @@ class AttachmentDownloadStore:
 
     @_safe_storage_errors
     def save(self, mailbox, name, content_type, open_stream, reported_size=None):
-        """Reserve quota atomically, stream at most max_bytes+1, then publish."""
+        """Atomically reserve quota and publish a bounded stream."""
         mailbox = (mailbox or "").lower()
         if not re.fullmatch(r"[^/\\:\x00-\x20]+@[^/\\:\x00-\x20]+", mailbox) or len(mailbox) > 254:
             raise ToolOperationError("INVALID_MAILBOX", "无效的附件导出邮箱。")
@@ -130,7 +128,7 @@ class AttachmentDownloadStore:
             raise ToolOperationError("ATTACHMENT_TOO_LARGE", f"附件超过 {limit} 字节下载上限。")
         self.cleanup()
         identifier = uuid.uuid4().hex
-        # Original filename is metadata; only a generated identifier names the disk file.
+        # Only generated identifiers name disk files.
         relative_path = f"{mailbox}/{identifier}.bin"
         path = self._path(relative_path)
         part = self._path(relative_path + ".part")
@@ -175,8 +173,7 @@ class AttachmentDownloadStore:
                     "content_type": _mime(content_type), "saved_path": str(path),
                     "size": size, "sha256": digest.hexdigest()}
         except BaseException:
-            # Keep the reserved record if cleanup fails, so it remains accounted
-            # for and a later scheduled sweep can remove it.
+            # Failed cleanup retains the quota reservation for a later sweep.
             removed = True
             for target in (part, path):
                 try:
@@ -236,7 +233,7 @@ class AttachmentDownloadStore:
             raise DownloadError("DOWNLOAD_UNAVAILABLE", 410) from exc
 
     def cleanup(self):
-        """Only prune indexed, expired exports; leave legacy files alone."""
+        """Prune indexed, expired exports; leave legacy files alone."""
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             rows = db.execute("SELECT download_id,relative_path FROM attachment_downloads WHERE retained_until<=?", (time.time(),)).fetchall()
@@ -258,7 +255,7 @@ def _chunks(stream):
 
 
 def download_tool_result(result):
-    """Expose the metadata to clients that only forward MCP TextContent."""
+    """Include metadata for clients forwarding only MCP TextContent."""
     from fastmcp.tools.tool import ToolResult
     payload = {"results": result}
     return ToolResult(content=json.dumps(payload, ensure_ascii=False), structured_content=payload)
@@ -321,7 +318,7 @@ def register_download_route(mcp):
 
 @asynccontextmanager
 async def download_lifespan(mcp):
-    """Run cleanup even when nobody requests another export."""
+    """Sweep expired exports without waiting for new requests."""
     task = None
     configured_root = os.getenv("EWS_MCP_DATA_DIR", "").strip()
     has_cache = bool(configured_root) and (Path(configured_root) / "attachment_downloads.db").exists()

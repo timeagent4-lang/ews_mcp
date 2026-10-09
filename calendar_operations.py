@@ -211,8 +211,7 @@ class CalendarOperations:
                 "changekey": event.changekey,
                 "updated_fields": [],
             }
-        # notify_attendees only controls notification, never the confirmation
-        # gate: the preview must be read-only on BOTH paths.
+        # Confirmation is required even when attendees are not notified.
         preview = require_confirmation(
             mailbox=self.config.email,
             action="update_event",
@@ -275,9 +274,8 @@ class CalendarOperations:
         if preview is not None:
             return preview
         require_send("发送日程响应")
-        # SDK 5.6.0 reply objects have no author/from field. The scoped employee
-        # account and exact event reference determine the represented identity;
-        # sender remains server-managed. Do not invent unsupported reply fields.
+        # SDK reply objects lack author/from; the scoped event determines identity.
+        # Exchange manages sender.
         getattr(event, methods[response])(
             **({"body": message} if message is not None else {})
         )
@@ -287,13 +285,8 @@ class CalendarOperations:
         event = self._calendar_item(event_id)
         _require_single_or_occurrence(event)
         _require_organizer(event, self.config.email)
-        # Two different business actions hide behind this one tool name. A meeting
-        # has people to notify, so cancelling sends cancellation notices. A
-        # personal appointment has nobody to notify, so EWS rejects the notice for
-        # lack of recipients - such an item must simply be deleted. Decide from the
-        # event's own attendee set BEFORE acting; never from an
-        # ErrorInvalidRecipients caught after the fact, which would blind-delete
-        # any genuine meeting whose notice the server happened to reject.
+        # Decide from attendee data before submission: delete appointments, notify meetings.
+        # A rejected meeting notice must never trigger deletion.
         attendee_count = sum(
             len(group or ())
             for group in (
@@ -318,20 +311,13 @@ class CalendarOperations:
         if preview is not None:
             return preview
         if is_meeting:
-            # Only a real notice leaves the mailbox, so only this branch needs the
-            # send gate; deleting an own appointment notifies nobody.
             require_send("发送日程取消通知")
-            # CancelCalendarItem explicitly excludes author in SDK 5.6.0. The
-            # organizer check and scoped reference preserve the employee identity.
+            # CancelCalendarItem excludes author; organizer and scope checks preserve identity.
             try:
                 event.cancel(**({"body": message} if message is not None else {}))
             except Exception as exc:
-                # The request already left the client, and EWS can apply the
-                # cancellation to the ITEM and then fail only on delivering the
-                # notice. So an ErrorInvalidRecipients here does not prove nothing
-                # changed - observed in practice. Report it as an uncertain
-                # outcome (never a retryable failure) so the original confirmation
-                # cannot run a second time.
+                # EWS may cancel the item before notice delivery fails, even for
+                # ErrorInvalidRecipients. Mark uncertain to prevent duplicate execution.
                 raise ToolOperationError(
                     "CANCEL_OUTCOME_UNKNOWN",
                     "取消请求已发出但结果不确定：EWS 可能已取消该日程，仅在通知环节失败。"
@@ -342,9 +328,7 @@ class CalendarOperations:
                 "cancelled": True,
                 "deleted": False,
             }
-        # Personal appointment: soft-delete to 已删除邮件, matching delete_messages.
-        # move_to_trash() 是 MOVE_TO_DELETED_ITEMS（可恢复）；Item.delete() 是
-        # HARD_DELETE（永久删除），语义不符，弃用。
+        # move_to_trash 可恢复；Item.delete 默认永久删除。
         event.move_to_trash(send_meeting_cancellations=SEND_TO_NONE)
         return {
             "id": event.id,
@@ -353,12 +337,8 @@ class CalendarOperations:
         }
 
     def list_events(self, start, end, offset=0, limit=20):
-        # Validate pagination against the tool schema BEFORE touching the query,
-        # so a bad limit/offset is a parameter error rather than a query crash.
         _page(offset, limit)
-        # Normalise an aware window to the service timezone before it reaches
-        # exchangelib; a fixed-offset tzinfo (e.g. "+08:00") cannot be mapped to
-        # an IANA name and the call dies as a programmer error.
+        # exchangelib requires an IANA timezone, not a fixed offset such as +08:00.
         start_dt = parse_local_datetime(start)
         end_dt = parse_local_datetime(end)
         if start_dt >= end_dt:

@@ -1,8 +1,4 @@
-"""OA/ESB 按 lanid 查询用户信息（含 email）。
-
-供 MCP 服务（mcp_server.py）调用，只读。
-入口：email_by_lanid(lanid) -> str | None
-"""
+"""按 LANID 只读查询 OA/ESB 联系人与邮箱。"""
 
 import json
 import logging
@@ -21,11 +17,11 @@ logger = logging.getLogger(__name__)
 OA_URL = os.getenv("OA_BASE_URL", "http://<REDACTED>").rstrip("/")
 OA_PATH = os.getenv("OA_PATH", "/aias")
 SVC_CD = os.getenv("SVC_CD", "50230002")
-SVC_SCN = os.getenv("SVC_SCN", "01")              # 场景代码
-CNSMR_SYS_ID = os.getenv("CNSMR_SYS_ID", "602400")  # 消费方系统编号
-TLR_NO = os.getenv("TLR_NO", "1ch04654600")       # 柜员号
+SVC_SCN = os.getenv("SVC_SCN", "01")
+CNSMR_SYS_ID = os.getenv("CNSMR_SYS_ID", "602400")
+TLR_NO = os.getenv("TLR_NO", "1ch04654600")
 
-# OA ESB 请求的 HTTP 请求头（ESB 要求把 Svc 相关字段放 Header；如需鉴权头在此补充）
+# ESB 要求 Svc 等业务字段同时放在 HTTP Header。
 HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json",
@@ -74,7 +70,7 @@ def build_request_body(lanid: str) -> Dict[str, Any]:
 
 
 def query_lanid(lanid: str, timeout: int = 15) -> List[Dict[str, Any]]:
-    """按 lanid 查 OA，返回联系人列表（原始 ESB 字段）。请求失败抛 requests 异常。"""
+    """返回 OA 联系人的原始 ESB 字段。"""
     body = build_request_body(lanid)
     resp = requests.post(
         OA_URL + OA_PATH,
@@ -88,7 +84,6 @@ def query_lanid(lanid: str, timeout: int = 15) -> List[Dict[str, Any]]:
 
 
 def _normalize_email(value) -> Optional[str]:
-    """校验并规范化邮箱，合法返回小写邮箱，否则返回 None。"""
     if not isinstance(value, str):
         return None
     email = value.strip().lower()
@@ -99,13 +94,10 @@ def _normalize_email(value) -> Optional[str]:
     local, domain = email.split("@")
     if not local or not domain:
         return None
-    # 不含空白或控制字符
     if any(ord(ch) < 33 or ch.isspace() for ch in email):
         return None
-    # local 不以 . 开头/结尾，不含连续两点
     if local.startswith(".") or local.endswith(".") or ".." in local:
         return None
-    # domain 标签校验：非空，不以 - 开头/结尾，仅允许字母、数字、减号
     for label in domain.split("."):
         if not label or label.startswith("-") or label.endswith("-"):
             return None
@@ -130,7 +122,6 @@ def email_by_lanid(lanid: str, timeout: int = 15) -> Optional[str]:
 
 
 def strip_lanid_prefix(raw: str) -> str:
-    """去域前缀，如 'BEACN\\1ch04655044' -> '1ch04655044'。"""
     raw = (raw or "").strip()
     if "\\" in raw:
         raw = raw.rsplit("\\", 1)[-1]

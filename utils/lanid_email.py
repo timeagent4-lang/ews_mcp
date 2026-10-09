@@ -27,7 +27,7 @@ LOCAL_TIMEZONE = ZoneInfo(os.getenv("MAIL_LOCAL_TIMEZONE", "Asia/Shanghai"))
 
 
 def _format_local_datetime(value) -> Optional[str]:
-    """把 aware/naive datetime 或 ISO 字符串格式化为本地时区，失败返回 None。"""
+    """按本地时区格式化时间；无时区值视为本地时间，无效值返回 None。"""
     if value is None:
         return None
     dt = value
@@ -44,7 +44,7 @@ def _format_local_datetime(value) -> Optional[str]:
 
 
 def _bounded_llm_input(rows, limit: int = 60000) -> str:
-    """把待分析的行拼成一段文本并限制总长度，避免 LLM 输入超限。"""
+    """限制 LLM 输入总长度。"""
     if isinstance(rows, str):
         lines = [rows]
     else:
@@ -76,7 +76,7 @@ class OAServiceError(RuntimeError):
 
 
 def normalize_lanid(value: str) -> str:
-    """兼容纯 LANID 和 DOMAIN\\LANID，OA 请求只发送 LANID。"""
+    """OA 请求仅发送去域前缀后的 LANID。"""
 
     normalized = str(value or "").strip()
     if "\\" in normalized:
@@ -157,7 +157,7 @@ def _build_request_body(lanid: str, settings: Dict[str, Any]) -> dict:
 
 
 def _normalize_email(value: object) -> str:
-    """只接受 OA 返回的单个、格式明确的邮箱字符串。"""
+    """只接受 OA 返回的单个合法邮箱。"""
 
     if not isinstance(value, str):
         raise IdentityResolutionError("LANID 未对应有效邮箱")
@@ -226,7 +226,7 @@ def resolve_identity_by_lanid(
     lanid: str,
     expected_name: str,
 ) -> ResolvedIdentity:
-    """仅按 LANID 查询 OA，并校验唯一联系人的姓名和邮箱。"""
+    """按 LANID 查唯一联系人，并校验姓名与邮箱。"""
 
     normalized_lanid = normalize_lanid(lanid)
     normalized_expected_name = _normalize_expected_name(expected_name)
@@ -252,6 +252,8 @@ def resolve_identity_by_lanid(
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise OAServiceError("OA 联系人响应不是有效 JSON") from exc
 
+    if not isinstance(response_json, dict):
+        raise OAServiceError("OA 联系人响应必须是 JSON 对象")
     body = response_json.get("Body", {})
     contacts = body.get("CtcInfArry", []) if isinstance(body, dict) else []
     if not isinstance(contacts, list) or len(contacts) != 1:

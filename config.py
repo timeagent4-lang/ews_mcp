@@ -69,7 +69,7 @@ def operations_db_path() -> str:
 
 
 def http_timeout() -> int:
-    """EWS HTTP 请求超时（秒），默认 300（对齐参考项目）。"""
+    """EWS HTTP 请求超时（秒）。"""
     try:
         return int(os.getenv("EWS_MCP_HTTP_TIMEOUT", "300"))
     except (TypeError, ValueError):
@@ -77,7 +77,7 @@ def http_timeout() -> int:
 
 
 def preview_ttl_seconds() -> int:
-    """未执行预览的有效期（秒），默认 1800。<=0 表示预览不过期。"""
+    """未执行预览的有效期（秒）；<=0 表示不过期。"""
     try:
         return int(os.getenv("EWS_MCP_PREVIEW_TTL_SECONDS", "1800"))
     except (TypeError, ValueError):

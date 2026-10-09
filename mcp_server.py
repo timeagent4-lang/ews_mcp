@@ -1,10 +1,4 @@
-"""EWS MCP: OA+DELEGATE mail server; tool_specs defines the enabled tool set.
-
-Every tool exposes flat ``arguments`` (lanid/name required). Read tools
-dispatch directly; every write tool routes through the persistent two-phase
-confirmation (operation_id / confirm_token / idempotency_key). Uncertain
-outcomes are never auto-retried; callers query by the original operation_id.
-"""
+"""OA+DELEGATE server with persistent write confirmation and receipt replay."""
 
 import atexit
 import logging
@@ -14,6 +8,7 @@ import secrets
 from datetime import datetime, timezone
 
 import mcp.types as mcp_types
+from anyio import to_thread
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 from fastmcp.server.middleware import Middleware
@@ -84,14 +79,7 @@ _SCHEMA_ERROR_MESSAGES = {
 
 
 def _schema_error_code(schema, error):
-    """Map a JSON-schema violation to a public error code.
-
-    Only fields annotated with ``x-error-code`` in the tool spec keep a
-    fine-grained code. Identity fields, unknown properties and the
-    preview/confirm/query ``oneOf`` combinations fall through to
-    INVALID_PARAMS, so a schema failure is never reported as an identity or a
-    business rejection.
-    """
+    """Use field x-error-code annotations; other schema failures stay INVALID_PARAMS."""
     node = schema
     for part in error.absolute_path:
         properties = node.get("properties") if isinstance(node, dict) else None
@@ -127,20 +115,13 @@ class ToolInputValidationMiddleware(Middleware):
 # Audit wraps validation so rejected calls also reach its result handling.
 mcp.add_middleware(ToolInputValidationMiddleware())
 
-# Confirmation-flow receipts that are NOT failures (a preview awaiting confirm,
-# or an operation still in flight).
 _NON_FAILURE_STATUSES = frozenset(("pending", "confirmed", "executing"))
 
 
 def install_failure_envelope(fastmcp) -> None:
-    """Make genuine business failures come back as ``isError=true`` while
-    keeping the structured payload.
+    """Set isError on business failures without dropping structuredContent.
 
-    fastmcp's ``ToolResult`` path always yields ``isError=false``, and its only
-    ``isError=true`` path (raising) drops ``structuredContent``. The low-level
-    server passes a returned ``CallToolResult`` through verbatim, so we
-    post-process the result here - the same wrapper point the audit fallback
-    already uses.
+    FastMCP's raise path drops structuredContent, so wrap the low-level result.
     """
     low_level_server = fastmcp._mcp_server
     marker = "_mail_mcp_failure_envelope_installed"
@@ -186,8 +167,7 @@ def _resolve_mailbox(params: dict, ctx: Context | None) -> str:
     except IdentityResolutionError:
         _set_identity_assurance(ctx, "oa_lookup_failed")
         raise
-    # Match OutlookConfig.from_service_env before any receipt lookup or write:
-    # SQLite idempotency scopes compare mailbox strings exactly.
+    # Match OutlookConfig normalization: SQLite idempotency scopes use exact strings.
     email = identity.email
     mailbox = email.strip().lower() if isinstance(email, str) else ""
     if not mailbox or "@" not in mailbox:
@@ -197,11 +177,9 @@ def _resolve_mailbox(params: dict, ctx: Context | None) -> str:
 
 
 def requester_lanid(params: dict) -> str:
-    """The OA-verified employee LANID, used only to match directory allow-lists.
+    """Authorize directories with the OA employee LANID, not config.lanid's service identity.
 
-    ``config.lanid`` is the fixed service account, never an employee identity, so
-    it must not be used for authorization. An unusable value returns "" - the
-    shared directory then stays closed instead of guessing who is calling.
+    Invalid identities return an empty value so directory access stays closed.
     """
     try:
         return normalize_lanid(params.get("lanid"))
@@ -219,8 +197,7 @@ def initialize_outlook_client(params: dict, ctx: Context | None, *, mailbox=None
     return client
 
 
-# Errors that mean the server answered but the payload could not be parsed:
-# the outcome is unknown, never a definite rejection.
+# An unparseable response leaves the submission outcome unknown.
 _PARSE_ERROR_NAMES = frozenset(
     {
         "MalformedResponseError",
@@ -230,8 +207,7 @@ _PARSE_ERROR_NAMES = frozenset(
         "ErrorSchemaValidation",
     }
 )
-# Stable, category-level codes kept ALONGSIDE the raw Exchange code (never
-# instead of it).
+# Categories supplement the raw Exchange ResponseCode.
 _NORMALIZED_EXCHANGE_CODES = {
     "ErrorAccessDenied": "EXCHANGE_ACCESS_DENIED",
     "ErrorSendAsDenied": "EXCHANGE_ACCESS_DENIED",
@@ -261,13 +237,7 @@ def _log_tool_error(tool_name: str, exc: Exception, error_kind: str = None) -> N
 
 
 def _exchange_cause(exc: Exception):
-    """The raw Exchange error chained behind a tool-level wrapper, if any.
-
-    A submission failure surfaces as a stable tool code (``SEND_REJECTED``,
-    ``CANCEL_OUTCOME_UNKNOWN``) with the real error chained as ``__cause__``.
-    That raw error must stay legible rather than only living inside a prose
-    message.
-    """
+    """Find the raw Exchange cause behind a tool wrapper."""
     seen = set()
     cause = getattr(exc, "__cause__", None)
     while cause is not None and id(cause) not in seen:
@@ -285,12 +255,7 @@ def _normalized_code(error_code: str) -> str:
 
 
 def _classify_exception(exc: Exception):
-    """Map an exception to ``(error_code, error_kind, message)``.
-
-    For Exchange errors ``error_code`` is the RAW exchangelib class name (the
-    real ResponseCode), verbatim - the categorised form goes in a separate
-    field. Program errors are separated out instead of becoming UPSTREAM_ERROR.
-    """
+    """Return (code, kind, message), retaining raw Exchange ResponseCodes."""
     name = exc.__class__.__name__
     if isinstance(exc, IdentityNameMismatchError):
         return "IDENTITY_NAME_MISMATCH", "identity", sanitize(str(exc))
@@ -301,8 +266,7 @@ def _classify_exception(exc: Exception):
     if isinstance(exc, ToolOperationError):
         return exc.code, "tool", exc.public_message
     if isinstance(exc, _PROGRAM_ERROR_TYPES):
-        # Checked before the name pattern: AttributeError/IndexError also end in
-        # "Error" but are program bugs, not Exchange ResponseCodes.
+        # Check program errors first; their names can also end in Error.
         return "INTERNAL_ERROR", "program", None
     if name == "OAServiceError":
         return "OA_UNAVAILABLE", "upstream", sanitize(str(exc))
@@ -318,14 +282,12 @@ def _classify_exception(exc: Exception):
 
 
 def _failure_record(exc: Exception) -> dict:
-    """Compact, replayable root-cause record persisted with a failed operation."""
+    """Persist root-cause details for later receipt replay."""
     code, kind, message = _classify_exception(exc)
     record = {"error_code": code}
     if kind == "exchange":
         record["error_code_normalized"] = _normalized_code(code)
     else:
-        # A tool-level wrapper keeps the real ResponseCode in its cause. Persist
-        # it, so a later replay of this record cannot hide the actual error.
         cause = _exchange_cause(exc)
         if cause is not None:
             record["exchange_code"] = cause.__class__.__name__
@@ -366,8 +328,6 @@ def _tool_failure(
     if error_kind == "exchange" and error_code:
         payload["error_code_normalized"] = _normalized_code(error_code)
     elif exc is not None:
-        # A tool-level wrapper must not bury the raw ResponseCode it chained:
-        # expose it as its own field so the caller can still branch on it.
         cause = _exchange_cause(exc)
         if cause is not None:
             payload["exchange_code"] = cause.__class__.__name__
@@ -436,13 +396,7 @@ def _require_record_scope(tool_name, mailbox, record):
 
 
 def _require_directory_read(record, lanid) -> None:
-    """Re-check shared-directory read permission before a stored record is returned.
-
-    A record can outlive the authorization it was created under. Receipts,
-    completed replays and idempotency replays all read the directory context from
-    the record, so every one of them passes through here: once an employee is
-    removed from the allow-list, no replay can hand the shared data back.
-    """
+    """Recheck read permission on every replay; records can outlive authorization."""
     directory_id = ((record or {}).get("business_params") or {}).get("directory_id")
     if not directory_id:
         return
@@ -451,16 +405,9 @@ def _require_directory_read(record, lanid) -> None:
 
 
 def _verified_directory_target(record, params):
-    """Confirm-time re-check of a shared-directory write; returns the target to use.
+    """Require current create permission and the exact target resolved by the preview.
 
-    Takes the raw ``params`` (not ``_business(params)``), because the LANID that
-    the directory allow-list matches on is a control field.
-
-    Two things must still hold when the confirmation is presented: the employee
-    keeps create permission, and the configured target is byte-for-byte the one
-    the preview resolved. If an administrator has re-pointed the directory (or the
-    registration version changed), the old confirmation is refused rather than
-    writing into the new folder. ``None`` means "not a shared-directory write".
+    Use raw params because the employee LANID is a control field.
     """
     directory_id = params.get("directory_id")
     if not directory_id:
@@ -483,7 +430,7 @@ def _receipt(tool_name: str, record, *, mailbox, lanid=None, replay=False) -> To
     result = record["result"]
     if result is None and status not in (STATUS_COMPLETED, STATUS_PARTIAL):
         result = {"status": status}
-    ok = status in (STATUS_COMPLETED, STATUS_PARTIAL)
+    ok = status == STATUS_COMPLETED
     stored_failure = (
         result
         if isinstance(result, dict)
@@ -491,9 +438,7 @@ def _receipt(tool_name: str, record, *, mailbox, lanid=None, replay=False) -> To
         and status in (STATUS_FAILED, STATUS_UNKNOWN)
         else None
     )
-    # A batch write reports success per item, so its failure carries no top-level
-    # error_code and would otherwise fall through to OPERATION_UNKNOWN - naming a
-    # known outcome as unknown. Keep the item rows and name the batch outcome.
+    # Batch verdicts come from per-item results, not a top-level error_code.
     batch = (
         result
         if _is_batch_result(result)
@@ -510,7 +455,6 @@ def _receipt(tool_name: str, record, *, mailbox, lanid=None, replay=False) -> To
         "replayed": replay,
     }
     if stored_failure:
-        # Replays must keep the SAME root cause as the first failure.
         payload["error_code"] = stored_failure["error_code"]
         if stored_failure.get("error_code_normalized"):
             payload["error_code_normalized"] = stored_failure["error_code_normalized"]
@@ -557,11 +501,7 @@ def _query_receipt(tool_name: str, operation_id: str, mailbox: str, lanid=None) 
 
 
 def _preview_expired(record) -> bool:
-    """True when a still-unexecuted preview is past its TTL.
-
-    An unparseable timestamp counts as expired: we never hand back a token we
-    cannot prove is still fresh.
-    """
+    """Treat invalid timestamps as expired rather than issuing an unverifiable token."""
     ttl = preview_ttl_seconds()
     if ttl <= 0:
         return False
@@ -583,11 +523,7 @@ def _require_unexpired_preview(record):
 
 
 def _preview_replay(tool_name: str, record, *, mailbox, lanid=None) -> ToolResult:
-    """Replay a still-valid, unexecuted preview: same details, same token.
-
-    Nothing is written and the caller may confirm with this exact
-    operation_id / confirm_token pair.
-    """
+    """Reuse the valid preview's token without executing the write."""
     _require_record_scope(tool_name, mailbox, record)
     _require_directory_read(record, lanid)
     return ToolResult(
@@ -604,7 +540,6 @@ def _preview_replay(tool_name: str, record, *, mailbox, lanid=None) -> ToolResul
 
 
 def _is_batch_result(result) -> bool:
-    """True when a write reported per-item outcomes instead of one verdict."""
     return isinstance(result, dict) and isinstance(result.get("results"), list)
 
 
@@ -629,36 +564,22 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
     idem = params.get("idempotency_key")
     business = _business(params)
 
-    # (1) operation_id alone is a query; never executes.
     if operation_id and not confirm_token:
         return _query_receipt(tool_name, operation_id, mailbox, lanid=lanid)
 
-    # (2) idempotency replay: a known key returns its receipt and never
-    #     re-executes. Skipped when a confirm_token is present: that is an
-    #     explicit intent to execute THIS operation, and the key is already
-    #     bound to the preview record, so short-circuiting here would make the
-    #     documented "identical params + operation_id + confirm_token" confirm
-    #     silently return the pending preview instead of executing.
+    # Confirm tokens bypass idempotency replay so a pending preview can execute.
     if idem and not confirm_token:
         record = store.find_by_idempotency_key(idem, mailbox=mailbox)
         if record is not None:
             _require_record_scope(tool_name, mailbox, record)
             status = record["status"]
             if status != STATUS_PENDING:
-                # Terminal/in-flight for this key: replay the receipt and never
-                # reactivate it, whatever it was.
                 return _receipt(tool_name, record, mailbox=mailbox, lanid=lanid, replay=True)
             if not _preview_expired(record):
-                # Still-valid unexecuted preview: hand back its details and the
-                # same token so the caller can confirm it.
                 return _preview_replay(tool_name, record, mailbox=mailbox, lanid=lanid)
-            # Expired preview: fall through to build a fresh preview. The stale
-            # row is left untouched and the new one is a distinct operation, so
-            # nothing executing/unknown/completed is ever revived.
+            # Expired previews create a new operation below; never revive the old record.
 
     if confirm_token:
-        # A finished or already-claimed operation is never re-executed: the
-        # receipt is returned instead (guards retries and concurrent confirms).
         existing = store.get(operation_id)
         _require_record_scope(tool_name, mailbox, existing)
         if existing is not None and (
@@ -676,16 +597,11 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
         ):
             return _receipt(tool_name, existing, mailbox=mailbox, lanid=lanid, replay=True)
         if existing is not None and _is_batch_result(existing["result"]):
-            # A batch that already ran reported per-item outcomes. Re-claiming it
-            # would re-run the WHOLE batch - the "整批重试" we must never do. The
-            # per-item receipt tells the caller what to retry instead.
+            # Replaying an executed batch could duplicate successful items.
             return _receipt(tool_name, existing, mailbox=mailbox, lanid=lanid, replay=True)
         try:
             _require_unexpired_preview(existing)
-            # Re-check the shared-directory target and create permission BEFORE
-            # connecting or claiming: a stale confirmation must never write into
-            # a re-pointed folder, and the record stays pending so a re-preview is
-            # the only way forward.
+            # Verify target and rights before claiming; stale confirmations stay pending.
             verified_target = _verified_directory_target(existing, params)
             # Connect before claiming, so connection failure leaves pending.
             # Connection setup may cross the TTL; check again before execution.
@@ -702,18 +618,14 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
             execute = {**business, "confirm": True, "confirmation_id": confirm_token}
             recorded_version = (existing.get("details") or {}).get("version")
             if recorded_version is not None:
-                # The preview snapshotted the target's version; hand the server's
-                # own copy back so the handler can refuse a draft that was edited
-                # between preview and confirm. Callers never supply this value.
+                # Use the server snapshot to reject edits since preview.
                 execute["expected_version"] = recorded_version
             if verified_target is not None:
-                # Execute against the target that was just verified, not a second
-                # resolution that could disagree with it.
+                # Reuse the verified target to avoid a second, conflicting resolution.
                 execute["directory_target"] = verified_target
             result = getattr(client, tool_name)(**execute)
         except Exception as exc:
-            # Default is UNKNOWN: only a named, definite rejection proves nothing
-            # was written. Ambiguous outcomes are never auto-retried.
+            # Ambiguous writes stay UNKNOWN and are never automatically retried.
             ambiguous = not is_definite_rejection(exc)
             store.mark(
                 operation_id,
@@ -721,14 +633,13 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
                 result=_failure_record(exc),
             )
             return _tool_failure(tool_name, exc=exc, operation_id=operation_id)
-        # Bookkeeping and the receipt stay OUTSIDE that handler: the write has
-        # already happened, so no later failure here may rewrite its terminal
-        # status (that would invite a duplicate create).
+        # Keep post-write bookkeeping outside the submission exception handler:
+        # a later failure must not make the write retryable.
         status, final_result = _classify_write_result(result)
         store.mark(operation_id, status, result=final_result)
         return _receipt(tool_name, store.get(operation_id), mailbox=mailbox, lanid=lanid)
 
-    # (3) preview: run the handler read-only, persist a pending operation.
+    # Preview handlers are read-only; persist their result for confirmation.
     client = initialize_outlook_client(params, ctx, mailbox=mailbox)
     try:
         result = getattr(client, tool_name)(**business, confirm=False)
@@ -768,10 +679,10 @@ def _dispatch(tool_name: str, params: dict, ctx: Context) -> ToolResult:
         return _tool_failure(tool_name, exc=exc)
 
 
-# ---- register the current enabled tools with the unified schema ----
 def _make_handler(tool_name):
-    def handler(ctx: Context = None, **params) -> ToolResult:
-        return _dispatch(tool_name, params, ctx)
+    async def handler(ctx: Context = None, **params) -> ToolResult:
+        # Keep synchronous OA/Exchange work off the loop; finish writes after cancellation.
+        return await to_thread.run_sync(_dispatch, tool_name, params, ctx)
 
     handler.__name__ = f"tool_{tool_name}"
     return handler
@@ -805,12 +716,7 @@ async def healthz(request: Request):
 
 
 class MCPKeyAuthMiddleware:
-    """Gate every HTTP request to the MCP endpoint behind a shared key.
-
-    Deliberately scoped to ``/mcp`` only: ``/healthz`` (liveness probe) and the
-    signed ``/downloads/{identifier}`` routes stay open, so the container
-    healthcheck and attachment links keep working.
-    """
+    """Authenticate /mcp only; health checks and signed downloads stay accessible."""
 
     def __init__(self, app, api_key: str):
         self.app = app
@@ -833,10 +739,8 @@ class MCPKeyAuthMiddleware:
 
 
 def main():
-    # Persistent confirmation store lives under the data dir (required).
     store = configure_store(os.path.join(data_dir(), "operations.db"))
-    # Close the SQLite connection explicitly on shutdown so the WAL is
-    # checkpointed, rather than leaving it to process teardown.
+    # Close explicitly to checkpoint SQLite's WAL.
     atexit.register(store.close)
     host = os.getenv("EWS_MCP_HOST", "127.0.0.1")
     port = int(os.getenv("EWS_MCP_PORT", "7805"))

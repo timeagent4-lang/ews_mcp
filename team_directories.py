@@ -1,27 +1,7 @@
-"""管理员维护的团队共享联系人目录注册表。
+"""管理员核实的团队联系人目录注册表（EWS_MCP_TEAM_DIRECTORIES JSON）。
 
-``directory_id`` 是逻辑标识符，不是邮箱地址，也不是原始 FolderId；调用方只能引用
-注册表里预配置、已由管理员人工核实的条目，因此无法用它去访问任意邮箱或任意目录。
-注册表来自环境变量 ``EWS_MCP_TEAM_DIRECTORIES``（JSON）；未配置时共享目录能力整体
-关闭，个人 Contacts 行为不受影响。
-
-访问权限是**明确名单**，不从服务账号的 Editor 权限推导：服务账号能写，不等于每位
-员工都能读。未列入名单的员工一律拒绝。
-
-条目格式::
-
-    {
-      "team-customers": {
-        "display_name": "团队客户通讯录",
-        "mailbox": "lch04655043@hkbea.com",
-        "folder_id": "AAMk...",
-        "parent_folder_id": "AAMk...",
-        "folder_class": "IPF.Contact",
-        "members": ["lch04655043", "lch04604059"]
-      }
-    }
-
-``members`` 是唯一的授权名单：读与建共用同一份，列入白名单的员工读写权限一起给。
+调用方只能引用预配置的 directory_id，不能指定任意邮箱或 FolderId。
+读与建共用 members 明确名单；不从服务账号权限推导员工权限。
 """
 
 from __future__ import annotations
@@ -36,8 +16,7 @@ from tool_support import ToolOperationError
 
 ENV_VAR = "EWS_MCP_TEAM_DIRECTORIES"
 
-# 只有联系人类型的文件夹可以作为共享目录目标。Exchange 用 IPF.Contact 及其子类
-# （IPF.Contact.Custom、IPF.Contact.Customer 等）标记联系人文件夹。
+# IPF.Contact 及其子类均为联系人文件夹。
 CONTACT_FOLDER_CLASS_PREFIX = "IPF.Contact"
 
 
@@ -46,7 +25,6 @@ def _error(code: str, message: str) -> ToolOperationError:
 
 
 def _normalize_principal(value) -> str:
-    """把 LANID 归一到可比较的形式（去域前缀、去空白、小写）。"""
     if not isinstance(value, str):
         raise ValueError("principal must be a string")
     normalized = value.strip()
@@ -86,7 +64,7 @@ def _required_text(spec, field, directory_id):
 
 @dataclass(frozen=True)
 class TeamDirectory:
-    """一条已核实的团队目录配置；不含任何凭据。"""
+    """已核实的团队目录配置。"""
 
     directory_id: str
     display_name: str
@@ -98,11 +76,9 @@ class TeamDirectory:
     version: str
 
     def identity(self) -> dict:
-        """持久化/比较用的稳定快照：决定“写到哪儿”的全部字段。
+        """确认时比对目标快照，防止配置改指后旧确认写入新目录。
 
-        预览时把这份快照写进操作记录，确认时重新解析并逐字段比对；配置被改指到
-        另一个目录时两者不等，旧确认就不会写到新位置。display_name 只影响展示，
-        不进入快照。
+        仅展示用的 display_name 不进入快照。
         """
         return {
             "directory_id": self.directory_id,
@@ -113,7 +89,6 @@ class TeamDirectory:
         }
 
     def descriptor(self) -> dict:
-        """回执/预览里展示来源目录用的可读信息。"""
         return {
             "directory_id": self.directory_id,
             "display_name": self.display_name,
@@ -125,8 +100,6 @@ class TeamDirectory:
         return _normalize_principal(principal) in self.members
 
     def can_create(self, principal) -> bool:
-        # 读与建共用同一份名单。若日后要拆分角色，只需让这个方法改查另一份集合，
-        # authorize(write=...) 的调用点无需改动。
         return _normalize_principal(principal) in self.members
 
 
@@ -154,7 +127,7 @@ def _parse_entry(directory_id, spec) -> TeamDirectory:
     display_name = (spec.get("display_name") or "").strip() or directory_id
     members = _principal_set(spec.get("members"), "members", directory_id)
     if not members:
-        # 空名单不是“谁都能读”，而是配置未完成：拒绝启动该目录的访问。
+        # 空名单表示配置未完成，拒绝访问。
         raise _error(
             "DIRECTORY_CONFIG_INVALID",
             f"团队目录 {directory_id} 未配置任何获授权员工（members）。",
@@ -180,7 +153,7 @@ def _parse_entry(directory_id, spec) -> TeamDirectory:
 
 
 def _load() -> Dict[str, TeamDirectory]:
-    """解析环境变量。每次调用都重新读取，好让配置改动立即生效。"""
+    """每次调用重新读取配置，使权限与目标变更立即生效。"""
     raw = os.getenv(ENV_VAR, "").strip()
     if not raw:
         raise _error(
@@ -201,7 +174,7 @@ def _load() -> Dict[str, TeamDirectory]:
 
 
 def get_directory(directory_id) -> TeamDirectory:
-    """按逻辑标识取一条已核实配置；未知标识明确失败，不回退任何默认目录。"""
+    """未知标识不回退默认目录。"""
     identifier = (directory_id or "").strip() if isinstance(directory_id, str) else ""
     if not identifier:
         raise _error("INVALID_DIRECTORY", "directory_id 不能为空。")
@@ -216,7 +189,7 @@ def get_directory(directory_id) -> TeamDirectory:
 
 
 def authorize(spec: TeamDirectory, principal, *, write: bool) -> None:
-    """在返回任何数据或执行任何写入之前，核对当前员工是否获授权。"""
+    """在读写前核对当前员工的目录权限。"""
     try:
         allowed = spec.can_create(principal) if write else spec.can_read(principal)
     except ValueError as exc:

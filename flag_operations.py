@@ -1,12 +1,7 @@
-"""Outlook follow-up flags on ordinary mail for the OA-resolved employee.
+"""Outlook follow-up flags for ordinary employee mail.
 
-Flag state is Outlook's own follow-up model: a ``0x1090`` FlagStatus plus the
-PSETID_Task properties. exchangelib 5.6 ships only ``0x1090``, and it rejects
-``property_tag`` for the ``0x8000-0xFFFE`` range ("reserved for custom
-properties"), so the rest are declared in PSETID_Task dispid form and
-registered on ``Message`` at import. Only a plain ``Message`` accepts these
-fields (a ``MeetingCancellation`` raises AttributeError); writes must go
-through ``save(update_fields=[...])``.
+Use PSETID_Task dispids for custom properties; exchangelib rejects reserved tags.
+Register on Message and save only the changed fields.
 """
 
 from datetime import datetime
@@ -74,7 +69,6 @@ class TaskComplete(ExtendedProperty):
     property_type = "Boolean"
 
 
-#: attr name -> ExtendedProperty subclass; registered on Message at import.
 FLAG_FIELDS = (
     ("flag_status", FlagStatus),
     ("flag_complete_time", FlagCompleteTime),
@@ -87,18 +81,17 @@ FLAG_FIELDS = (
 
 
 def register_flag_fields():
-    """Register the follow-up flag model on ``Message`` (idempotent)."""
+    """Register Message flag fields once."""
     for name, cls in FLAG_FIELDS:
         try:
             Message.register(name, cls)
         except ValueError:
-            # Already registered by an earlier import; register() is not idempotent.
+            # Message.register raises for an already registered field.
             pass
 
 
 register_flag_fields()
 
-#: Fields projected when listing flagged mail; ``flag_status`` drives the filter.
 LIST_FIELDS = tuple(
     dict.fromkeys(
         (*SIMPLE_FIELDS, "sender", "flag_status", "task_due_date", "task_complete")
@@ -107,18 +100,16 @@ LIST_FIELDS = tuple(
 
 
 def _ews_datetime(value):
-    """SystemTime extended properties only accept EWSDateTime, not plain datetime."""
+    """SystemTime fields require EWSDateTime."""
     if value is None:
         return None
     return EWSDateTime.from_datetime(parse_datetime(value).astimezone(LOCAL_TIMEZONE))
 
 
 def _flag_changes(flag, due_date):
-    """The full field set for a requested flag state.
+    """Flagging resets completion; clearing resets all task fields.
 
-    ``flagged`` resets completion artifacts; ``complete`` stamps the completion
-    time but leaves start/due dates alone unless a due date is supplied;
-    ``clear`` empties every task field.
+    Completing preserves start/due dates unless due_date is supplied.
     """
     now = EWSDateTime.from_datetime(datetime.now(LOCAL_TIMEZONE))
     due = _ews_datetime(due_date)
@@ -190,7 +181,7 @@ class FlagOperations:
         item = self._tool_item(message_id)
         if type(item) is not Message:
             raise ToolOperationError("NOT_MAIL_MESSAGE", "此操作仅支持普通邮件。")
-        changes = _flag_changes(flag, due_date)  # validates due_date before preview
+        changes = _flag_changes(flag, due_date)  # Validate the date before preview
         preview = require_confirmation(
             mailbox=self.config.email,
             action="set_message_flag",

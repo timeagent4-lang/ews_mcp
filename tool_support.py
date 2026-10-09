@@ -1,4 +1,4 @@
-"""Small shared helpers for Exchange tool operations; no authentication state."""
+"""Shared Exchange tool helpers; no authentication state."""
 
 import hashlib
 import json
@@ -17,13 +17,7 @@ _WS_RE = re.compile(r"\s+")
 
 
 def sanitize(text, limit: int = 300):
-    """Redact PII/secrets before an upstream message leaves the server.
-
-    Not merely a truncation: e-mail addresses and long opaque tokens (ids,
-    changekeys, hashes) are masked first, whitespace is collapsed, then the
-    result is capped. Shared by the server envelope and by per-item batch
-    results, so both redact identically.
-    """
+    """Redact emails and opaque tokens before truncating caller-visible errors."""
     if not text:
         return None
     cleaned = _EMAIL_RE.sub("<email>", str(text))
@@ -35,7 +29,7 @@ def sanitize(text, limit: int = 300):
 
 
 class ToolOperationError(ValueError):
-    """An expected operation failure with a safe, caller-visible explanation."""
+    """Expected failure with a safe, caller-visible explanation."""
 
     def __init__(self, code: str, message: str):
         self.code = code
@@ -58,13 +52,7 @@ def parse_datetime(value):
 
 
 def parse_local_datetime(value):
-    """Parse a timestamp and normalise its tzinfo to the service timezone.
-
-    exchangelib can only map an IANA-named tzinfo to an EWS timezone; a
-    fixed-offset one (e.g. "+08:00") dies during EWS conversion. Re-pointing the
-    tzinfo keeps the same instant, and naive input is already localised by
-    ``parse_datetime``.
-    """
+    """Use the IANA timezone required by exchangelib, preserving the instant."""
     return parse_datetime(value).astimezone(LOCAL_TIMEZONE)
 
 
@@ -77,11 +65,7 @@ def iso_datetime(value):
 
 
 def require_send(action_desc: str) -> None:
-    """Block real sends/notifications/OOF unless EWS_MCP_SEND_ENABLED=true.
-
-    Previews remain allowed; only the confirmed execution is gated. This is the
-    default-off safety switch, not a global read-only toggle.
-    """
+    """Gate confirmed sends/notifications/OOF on EWS_MCP_SEND_ENABLED; allow previews."""
     from config import send_enabled
 
     if not send_enabled():
@@ -91,9 +75,7 @@ def require_send(action_desc: str) -> None:
         )
 
 
-# ToolOperationError codes whose outcome is genuinely uncertain (the request may
-# have reached the server). Anything else raised without a cause is our own
-# pre-submit validation, which proves nothing was submitted.
+# These errors may follow submission; other cause-free tool errors are pre-submit validation.
 UNKNOWN_OUTCOME_CODES = frozenset(
     {
         "SEND_FAILED_OR_UNKNOWN",
@@ -106,13 +88,9 @@ UNKNOWN_OUTCOME_CODES = frozenset(
     }
 )
 
-# ALLOWLIST, deliberately: an error may only be treated as "the server rejected
-# it, nothing was applied" when we can name it. Anything unrecognised —
-# including unknown EWS errors, disconnects and response-parse failures — must
-# stay UNKNOWN, because it may already have been applied.
+# Only known rejections prove nothing was applied; unknown errors remain uncertain.
 _DEFINITE_REJECTION_ERRORS = frozenset(
     {
-        # permission / addressing
         "ErrorAccessDenied",
         "ErrorSendAsDenied",
         "ErrorImpersonateUserDenied",
@@ -121,12 +99,10 @@ _DEFINITE_REJECTION_ERRORS = frozenset(
         "ErrorInvalidArgument",
         "ErrorInvalidValueForProperty",
         "ErrorMailRecipientNotFound",
-        # item / id
         "ErrorItemNotFound",
         "ErrorInvalidId",
         "ErrorInvalidIdEmpty",
         "ErrorInvalidIdMalformed",
-        # calendar response/cancel preconditions
         "ErrorCalendarIsNotOrganizer",
         "ErrorCalendarIsCancelledForAccept",
         "ErrorCalendarIsCancelledForDecline",
@@ -142,34 +118,24 @@ _DEFINITE_REJECTION_ERRORS = frozenset(
         "ErrorCalendarIsOrganizerForRemove",
         "ErrorNotOrganizer",
         "ErrorNotDelegate",
-        # OOF settings rejected outright
         "ErrorInvalidUserOofSettings",
     }
 )
 
 
 def is_definite_rejection(exc) -> bool:
-    """True only when we can PROVE the operation was not applied.
-
-    Unknown errors default to False (ambiguous) on purpose: re-executing an
-    ambiguous write can duplicate a send.
-    """
+    """Require definite non-application; retrying ambiguous writes can duplicate sends."""
     code = getattr(exc, "code", None)
     if code is not None and exc.__class__.__name__ == "ToolOperationError":
         if code in UNKNOWN_OUTCOME_CODES:
             return False
         cause = getattr(exc, "__cause__", None)
-        # No cause -> raised by our own pre-submit validation.
         return True if cause is None else is_definite_rejection(cause)
     return exc.__class__.__name__ in _DEFINITE_REJECTION_ERRORS
 
 
 def classify_submission_failure(exc, *, action, unknown_code, rejected_code):
-    """Tell "never submitted" apart from "submitted but outcome unknown".
-
-    Returns ``(error_code, public_message, uncertain)``. Default is uncertain:
-    only a named, definite rejection is treated as safely re-executable.
-    """
+    """Return (code, public_message, uncertain); only definite rejections permit retries."""
     if is_definite_rejection(exc):
         return (
             rejected_code,
@@ -192,14 +158,9 @@ def require_confirmation(
     confirm=False,
     confirmation_id=None,
 ):
-    """Build a preview snapshot; the server owns the persistent gate.
+    """Build a preview; the MCP layer's OperationStore validates confirmed execution.
 
-    This is deliberately a pass-through now: the durable two-phase confirmation
-    (operation_id / confirm_token / idempotency_key) is enforced in the MCP layer
-    via the persistent OperationStore, not here. When ``confirm`` is False the
-    caller receives the read-only preview; when True the handler proceeds to
-    execute (the server has already validated the token and identical params).
-    The digest is only a preview-change hint, not an authentication token.
+    The digest signals preview changes and is not an authentication token.
     """
     snapshot = {
         "mailbox": mailbox.lower(),

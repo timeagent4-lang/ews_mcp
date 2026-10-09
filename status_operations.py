@@ -1,7 +1,4 @@
-"""Adapter status: current mailbox counters and effective safety settings.
-
-Deliberately exposes no credentials or other-mailbox statistics.
-"""
+"""Current-mailbox counters and safety settings, without credentials."""
 
 import os
 

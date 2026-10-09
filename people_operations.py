@@ -1,13 +1,6 @@
-"""Contacts and organization-directory (GAL) lookups limited to the employee.
+"""Employee contacts and GAL lookups with independent per-source permissions.
 
-GAL and the mailbox Contacts folder are separate data sources with separate
-permissions; each is reported independently and one being unavailable must not
-fail the other (``partial``, not whole-failure).
-
-GAL lookups go through the EWS ``ResolveNames`` operation scoped to
-ActiveDirectory. ``exchangelib.folders.GALContacts`` is deliberately not used:
-in exchangelib 5.6 it rejects the ``account`` kwarg and cannot be instantiated
-standalone, so it only ever masked the real (working) directory lookup.
+Use ActiveDirectory ResolveNames; report unavailable sources as partial coverage.
 """
 
 import re
@@ -26,13 +19,11 @@ from tool_support import ToolOperationError, require_confirmation
 
 SEARCH_SCOPE_ACTIVE_DIRECTORY = "ActiveDirectory"
 
-# 只用于 GetFolder 直取目标目录的属性投影。
 _FOLDER_FIELDS = ("name", "folder_class", "parent_folder_id", "total_count")
 
 
 def _primary_email(contact):
-    """First non-empty address. ``email_addresses`` is a list of ``EmailAddress``
-    entries (label + email), ordered by label, so EmailAddress1 wins."""
+    """Use the first non-empty labelled address (EmailAddress1 first)."""
     for entry in getattr(contact, "email_addresses", None) or []:
         value = str(getattr(entry, "email", "") or "").strip()
         if value:
@@ -41,11 +32,6 @@ def _primary_email(contact):
 
 
 def _primary_phone(contact):
-    """Business phone first, then any labelled number.
-
-    Contact phones are a labelled list (``contacts:PhoneNumber``), the same shape
-    ``create_contact`` writes, so what was written is what is read back.
-    """
     entries = getattr(contact, "phone_numbers", None) or []
     by_label = {}
     for entry in entries:
@@ -70,8 +56,7 @@ def _contact_row(contact, source):
 
 
 def _directory_row(mailbox, contact):
-    """One GAL entry from ResolveNames. Mailbox is always present; the full
-    contact entry carries the extras and may be absent."""
+    """ResolveNames may omit Contact details; Mailbox is always present."""
     return {
         "source": "gal",
         "id": getattr(contact, "id", None),
@@ -86,8 +71,6 @@ def _directory_row(mailbox, contact):
 
 
 def _with_directory(row, spec):
-    """Tag a row with the team directory it came from, so a later read can be
-    traced back to the same logical directory."""
     row["directory_id"] = spec.directory_id
     row["directory"] = spec.display_name
     row["target_mailbox"] = spec.mailbox
@@ -100,14 +83,7 @@ def _denied(exc):
 
 
 def _get_folder_by_id(account, folder_id):
-    """GetFolder by ID.
-
-    Deliberately not ``folder.children`` / ``account.root.walk()``: on a delegated
-    mailbox exchangelib's folder-tree cache raises while building the root map
-    (``KeyError`` in ``roots.py``), and traversal would also depend on folders the
-    delegate may not be allowed to enumerate. Addressing the folder directly is
-    both exact and independent of the rest of the mailbox.
-    """
+    """Fetch by ID to avoid delegated folder-tree cache and enumeration permissions."""
     template = Folder(root=account.root, id=folder_id)
     additional = {
         FieldPath(field=BaseFolder.get_field_by_fieldname(name))
@@ -123,16 +99,9 @@ def _get_folder_by_id(account, folder_id):
 
 class PeopleOperations:
     def _resolve_directory(self, query):
-        """Resolve a name or email against the GAL (ActiveDirectory scope).
-
-        A fresh per-call client has not negotiated an EWS version yet and
-        ResolveNames needs a version hint, so warm it up first. A no-result
-        lookup comes back as an ``ErrorNameResolutionNoResults`` object inside
-        the result list (exchangelib returns it rather than raising), so only
-        genuine ``(Mailbox, Contact)`` tuples are kept.
-        """
+        """Resolve against ActiveDirectory; discard returned no-result exceptions."""
         account = self.account
-        _ = account.version  # force EWS version negotiation for the hint
+        _ = account.version  # ResolveNames needs a negotiated version
         entries = account.protocol.resolve_names(
             [query],
             return_full_contact_data=True,
@@ -141,12 +110,7 @@ class PeopleOperations:
         return [entry for entry in entries if isinstance(entry, tuple)]
 
     def _open_directory(self, directory_id, *, write):
-        """Resolve the logical id and authorize the CURRENT employee.
-
-        Authorization is an explicit administrator list, never inferred from the
-        service account's write rights. ``write=False`` is checked before any
-        read, ``write=True`` before any create.
-        """
+        """Authorize the employee from the administrator list before reads or creates."""
         spec = team_directories.get_directory(directory_id)
         team_directories.authorize(
             spec, getattr(self, "requester_lanid", None), write=write
@@ -154,11 +118,7 @@ class PeopleOperations:
         return spec
 
     def _bind_directory(self, spec):
-        """Dedicated Account + verified folder for the target mailbox.
-
-        The requester's identity is untouched: ``self.account`` and
-        ``self.config.email`` keep pointing at the OA-resolved employee.
-        """
+        """Bind the verified target without changing the requester's account or identity."""
         account = self._create_account(spec.mailbox)
         try:
             folder = _get_folder_by_id(account, spec.folder_id)
@@ -196,11 +156,12 @@ class PeopleOperations:
         query = (query or "").strip()
         if not query:
             raise ToolOperationError("INVALID_QUERY", "联系人搜索关键词不能为空。")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ToolOperationError("INVALID_PAGINATION", "limit 必须为 1 到 100。")
         if source not in ("auto", "gal", "contacts"):
             raise ToolOperationError("INVALID_SOURCE", "来源必须是 auto、gal 或 contacts。")
         if directory_id is not None:
-            # 共享目录是第三种明确来源，不与 GAL/个人 Contacts 混用；组合非法就拒绝，
-            # 不做“猜测意图”的降级。
+            # 共享目录仅接受明确的 contacts 来源。
             if source != "contacts":
                 raise ToolOperationError(
                     "INVALID_SOURCE",
@@ -234,8 +195,7 @@ class PeopleOperations:
         return payload
 
     def _find_in_directory(self, query, limit, directory_id):
-        """Search ONLY the selected directory: no recursion into sub-folders and
-        no sweeping other mailboxes."""
+        """Search the selected directory without traversing other folders."""
         spec, account, folder = self._prepare_directory(directory_id, write=False)
         try:
             rows = folder.filter(display_name__icontains=query).order_by("display_name")[:limit]
@@ -255,14 +215,10 @@ class PeopleOperations:
             raise ToolOperationError("INVALID_CONTACT_ID", "请提供联系人 ID 或邮箱。")
         value = str(contact_id).strip()
         if directory_id is not None:
-            # 共享目录分支：先验证员工目录权限，再按目录内 ID 读取并核对归属。
-            # 这里绝不进入 GAL 分支 — 即使传的是邮箱地址，也只当目录内 ID 处理。
+            # 目录内 ID 必须通过权限和归属检查，不转入 GAL 查询。
             return self._get_from_directory(value, directory_id)
         if "@" in value:
-            # Exact GAL directory address resolution. A directory address is a
-            # contact lookup, never a switch of the target mailbox. GAL is a
-            # separate source with its own permission; if unavailable this is a
-            # clean directory-limited error, not a crash.
+            # A GAL address selects a contact, never a target mailbox.
             try:
                 entries = self._resolve_directory(value)
             except Exception as exc:  # noqa: BLE001 - GAL unreachable/denied is a clean limit
@@ -299,9 +255,7 @@ class PeopleOperations:
             raise ToolOperationError(
                 "CONTACT_NOT_FOUND", "未在该团队共享目录中找到指定联系人。"
             )
-        # EWS GetItem is not folder-scoped, so an ID from another folder can come
-        # back here. Both the item class and the parent folder are checked before
-        # any detail is returned; a mismatch reports no field at all.
+        # GetItem is not folder-scoped; verify class and parent before returning details.
         if type(item) is not Contact:
             raise ToolOperationError(
                 "INVALID_CONTACT", "指定项目不是该团队共享目录中的联系人。"
@@ -325,17 +279,10 @@ class PeopleOperations:
         directory_id=None,
         directory_target=None,
     ):
-        """Create one contact in the employee's own Contacts folder, or in a
-        configured team shared directory when ``directory_id`` is given.
+        """Create in employee Contacts or an administrator-verified team directory.
 
-        Writes only the mailbox Contacts item: it never touches the GAL and
-        sends no mail. The target mailbox still comes only from the OA-resolved
-        employee (or from the administrator-verified directory entry); the
-        contact's own address never selects a mailbox.
-
-        ``directory_target`` is internal: the dispatcher passes back the target it
-        re-verified against the preview, so execution uses exactly the checked
-        target rather than resolving a second time.
+        Contact email never selects the mailbox. directory_target is the authorized
+        target checked against the persisted preview.
         """
         display_name = (display_name or "").strip()
         if not display_name:
@@ -354,12 +301,11 @@ class PeopleOperations:
         prepared = None
         if directory_id is not None:
             if directory_target is not None:
-                # Already authorized and compared against the persisted preview.
+                # Authorized and checked against the persisted preview.
                 spec = directory_target
                 prepared = self._bind_directory(spec)
             else:
-                # Preview: authorize the create BEFORE showing a preview, so a
-                # read-only employee is refused up front and nothing is written.
+                # Authorize writes before exposing the preview.
                 spec, _account, folder = self._prepare_directory(directory_id, write=True)
                 prepared = (_account, folder)
             details["directory_id"] = spec.directory_id
@@ -417,7 +363,6 @@ class PeopleOperations:
             "phone": _primary_phone(item) or phone,
         }
         if spec is not None:
-            # 回执明确记录实际目标目录，后续读取能带回同一目录标识。
             receipt["directory_id"] = spec.directory_id
             receipt["directory"] = spec.display_name
             receipt["target_mailbox"] = spec.mailbox

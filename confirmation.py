@@ -1,19 +1,8 @@
-"""Persistent two-phase write confirmation state machine.
+"""Persistent preview/confirm operations and idempotent receipts.
 
-Every mutating tool first produces a read-only "preview" and persists a pending
-operation record (`operation_id` + a random `confirm_token` bound to it).
-The caller then re-sends the *identical* business params plus `operation_id`
-and `confirm_token` to execute. Records live in a local SQLite db so receipts
-and idempotency survive restarts.
-
-Rules enforced here (mirrors the reference 28-tool adapter):
-- `operation_id` alone (no token) is a "query" and never executes anything.
-- `idempotency_key` is persisted across restarts; a completed key returns its
-  receipt instead of re-executing; an in-flight/unknown key is reported read-only.
-- Restart migrates any pending/confirmed/executing record to `unknown`.
-- Uncertainty (timeouts, non-atomic EWS ops such as OOF, concurrent Outlook
-  writers) is kept as `unknown` / `partial` and is never auto-retried.
-- No unlock/reconciliation is provided.
+Execution requires the preview token and identical business parameters.
+Operation ID alone is read-only. Restarts mark active operations unknown;
+uncertain outcomes are never retried automatically.
 """
 
 from __future__ import annotations
@@ -39,7 +28,7 @@ _UNCERTAIN_STATUSES = (STATUS_UNKNOWN, STATUS_PARTIAL)
 
 
 class ConfirmationError(ValueError):
-    """Expected confirmation-flow failure with a safe, caller-visible message."""
+    """Confirmation failure with a caller-safe message."""
 
     def __init__(self, code: str, message: str):
         self.code = code
@@ -48,7 +37,7 @@ class ConfirmationError(ValueError):
 
 
 class OperationStore:
-    """SQLite-backed store of confirmation operations (one DB per data dir)."""
+    """SQLite confirmation store; one database per data directory."""
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -164,18 +153,9 @@ class OperationStore:
         return self._row_to_dict(row) if row else None
 
     def find_by_idempotency_key(self, idempotency_key, mailbox=None) -> dict | None:
-        """Most recent operation bound to a key, scoped to `mailbox` when given.
+        """Return the latest row for a mailbox-scoped idempotency key.
 
-        A key names a business action *within one mailbox*: two mailboxes that
-        reuse a key are two different actions, so one must never be answered
-        with - or blocked by - the other. Callers must pass the mailbox; the
-        unscoped form exists only for whole-store inspection.
-
-        Latest-wins: when an expired preview is safely re-previewed it mints a
-        new row under the same key, and that fresh preview is the one that
-        governs. A terminal row is never superseded in practice, because the
-        idempotency path only mints a new row when the latest one is an expired
-        `pending` (i.e. nothing was ever executed under that key).
+        Only expired pending previews may be superseded; unscoped lookup is for inspection.
         """
         sql = (
             "SELECT * FROM operations WHERE idempotency_key = ? "
@@ -190,20 +170,10 @@ class OperationStore:
         return self._row_to_dict(row) if row else None
 
     def begin_confirm(self, operation_id, confirm_token, business_params) -> dict:
-        """Validate an execution attempt and atomically claim the run right.
+        """Atomically claim pending or pre-submit failed operations.
 
-        Only a fresh preview (`pending`) or a definite pre-submit failure
-        (`failed`) may be claimed. `executing` / `unknown` / `completed` /
-        `partial` records are never re-executed: the claim is a single
-        conditional UPDATE so concurrent confirms cannot both win.
-
-        The claim is additionally scoped to the whole `idempotency_key`: a key
-        names a *business action*, so if a sibling row under the same key is
-        already in-flight or finished, this row must not run either. Without
-        that, two live rows sharing a key (concurrent first preview, or
-        concurrent rebuild of an expired one) would each execute once. That
-        scope is the key *within one mailbox*: the same key used by two
-        mailboxes names two different actions and must not cross-block.
+        A conditional UPDATE allows one execution per operation and per idempotency
+        key within a mailbox. Executing, unknown, completed, and partial rows cannot rerun.
         """
         record = self.get(operation_id)
         if record is None:
@@ -261,12 +231,7 @@ class OperationStore:
         return record
 
     def _key_already_consumed(self, record) -> bool:
-        """True when a sibling row under the same idempotency key has left the
-        claimable set - the business action is already in flight or finished.
-
-        The claim UPDATE enforces this atomically; this only classifies the
-        refusal for the caller's message.
-        """
+        """Classify a refused claim; begin_confirm enforces mailbox/key exclusion atomically."""
         key = record.get("idempotency_key")
         if not key:
             return False
@@ -301,12 +266,11 @@ class OperationStore:
             self._conn.commit()
 
     def close(self) -> None:
-        """Release the SQLite connection explicitly (WAL files are checkpointed)."""
         with self._lock:
             self._conn.close()
 
     def migrate_active_to_unknown(self) -> int:
-        """Starce-terminated pending/confirmed/executing ops become unknown."""
+        """Mark active operations unknown after a restart."""
         with self._lock:
             cursor = self._conn.execute(
                 "UPDATE operations SET status=?, updated_at=? WHERE status IN (?,?,?)",
@@ -317,7 +281,7 @@ class OperationStore:
 
 
 def _normalize(value):
-    """Deterministic, order-insensitive normalization for snapshot comparison."""
+    """Normalize dictionary keys and sequences for snapshot comparison."""
     if isinstance(value, dict):
         return {str(k): _normalize(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -329,7 +293,6 @@ _store = None
 
 
 def configure_store(db_path):
-    """Install the process-wide operation store (one DB per data dir)."""
     global _store
     _store = OperationStore(db_path)
     return _store

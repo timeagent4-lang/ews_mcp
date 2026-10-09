@@ -1,53 +1,78 @@
-"""Offline contract tests. Missing deployment adapters are stubbed only at import.
-
-The real FastMCP registry, MCP Client transport, dispatcher and SQLite store run;
-OA, audit integration and Exchange connectivity are not integration-tested here.
-"""
+"""Offline contracts through real MCP transport, audit and SQLite receipts."""
 import importlib.util
 import inspect
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import sys
 import tempfile
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 
-import mcp.types as mcp_types
 from fastmcp import Client
-from fastmcp.server.middleware import Middleware
 from jsonschema import Draft202012Validator
 
 from calendar_operations import CalendarOperations
 from confirmation import OperationStore
 from flag_operations import FlagOperations
 from mail_operations import MailOperations
-from tool_specs import DISABLED_TOOLS, SPECS, TOOLS
+import outlook_client
+from tool_specs import DISABLED_TOOLS, READ_TOOLS, SPECS, TOOLS
 from tool_support import ToolOperationError
+import utils.audit as audit_adapter
+import utils.lanid_email as identity_adapter
 from write_operations import WriteOperations
 
 
 IDENTITY = {"lanid": "employee", "name": "员工"}
 MAILBOX = "employee@example.com"
+READ_ARGUMENTS = {
+    "list_folders": {},
+    "find_message": {"query": "report", "folder": "sent", "limit": 3},
+    "get_message": {"message_id": "message"},
+    "get_thread": {"message_id": "message"},
+    "get_attachment": {"message_id": "message"},
+    "prepare_attachment_download": {"message_id": "message", "attachment_id": "attachment"},
+    "get_mailbox_overview": {},
+    "list_events": {"start": "2026-10-09", "end": "2026-10-10"},
+    "get_event": {"event_id": "event"},
+    "check_availability": {
+        "start": "2026-10-09T09:00:00+08:00", "end": "2026-10-09T10:00:00+08:00",
+        "attendees": ["attendee@example.com"],
+    },
+    "find_people": {"query": "colleague"},
+    "get_contact": {"contact_id": "contact"},
+    "list_tasks": {},
+    "get_server_status": {},
+    "list_flagged_messages": {},
+}
+WRITE_ARGUMENTS = {
+    "create_draft": {"subject": "report", "body": "content"},
+    "update_draft": {"draft_id": "draft", "subject": "updated"},
+    "send_draft": {"draft_id": "draft"},
+    "set_message_flag": {"message_id": "message", "flag": "complete"},
+    "update_messages": {"ids": ["message"], "set_read": True},
+    "move_messages": {"ids": ["message"], "to_folder": "inbox"},
+    "create_event": {"subject": "meeting", "start": "2026-10-09T09:00:00+08:00"},
+    "update_event": {"event_id": "event", "subject": "updated"},
+    "respond_to_event": {"event_id": "event", "response": "accept"},
+    "cancel_event": {"event_id": "event"},
+    "create_contact": {"display_name": "contact", "email": "contact@example.com"},
+    "create_task": {"subject": "task"},
+    "update_task": {"task_id": "task", "complete": True},
+}
 
 
-def load_server(*, audit_middleware=Middleware, audit_fallback=None):
-    audit = ModuleType("utils.audit")
-    audit.AUDIT_IDENTITY_STATE_KEY = "identity"
-    audit.ToolAuditMiddleware = audit_middleware
-    audit.install_tool_audit_fallback = audit_fallback or (lambda *args: None)
-    identity = ModuleType("utils.lanid_email")
-    identity.IdentityResolutionError = type("IdentityResolutionError", (ValueError,), {})
-    identity.IdentityNameMismatchError = type("IdentityNameMismatchError", (ValueError,), {})
-    identity.resolve_identity_by_lanid = Mock(side_effect=AssertionError("OA must be mocked"))
-    outlook = ModuleType("outlook_client")
-    outlook.OutlookClient = Mock(side_effect=AssertionError("Exchange must be mocked"))
+def load_server(*, audit_logger=None):
     spec = importlib.util.spec_from_file_location(
         "contract_test_server", Path(__file__).resolve().parents[1] / "mcp_server.py")
     module = importlib.util.module_from_spec(spec)
-    with patch.dict(sys.modules, {"utils": ModuleType("utils"), "utils.audit": audit,
-                                "utils.lanid_email": identity, "outlook_client": outlook}):
+    with patch.object(identity_adapter, "resolve_identity_by_lanid",
+                      side_effect=AssertionError("OA must be mocked")), \
+            patch.object(outlook_client, "OutlookClient",
+                         side_effect=AssertionError("Exchange must be mocked")), \
+            patch.object(audit_adapter, "create_audit_logger", return_value=audit_logger or Mock()):
         spec.loader.exec_module(module)
     return module
 
@@ -55,7 +80,7 @@ def load_server(*, audit_middleware=Middleware, audit_fallback=None):
 class PublicSchemaTests(unittest.TestCase):
     def valid(self, tool, **params):
         return Draft202012Validator(SPECS[tool]["inputSchema"]).is_valid(
-            {"params": {**IDENTITY, **params}})
+            {**IDENTITY, **params})
 
     def test_new_parameters_match_signatures_and_defaults(self):
         for tool, owner, fields in (
@@ -65,7 +90,7 @@ class PublicSchemaTests(unittest.TestCase):
             ("respond_to_event", CalendarOperations, ("response",)),
         ):
             signature = inspect.signature(getattr(owner, tool))
-            props = SPECS[tool]["inputSchema"]["properties"]["params"]["properties"]
+            props = SPECS[tool]["inputSchema"]["properties"]
             for name in fields:
                 with self.subTest(tool=tool, field=name):
                     self.assertIn(name, props)
@@ -82,12 +107,8 @@ class PublicSchemaTests(unittest.TestCase):
         self.assertFalse(self.valid("list_flagged_messages", status="clear"))
 
     def test_known_business_schemas_only_expose_real_method_parameters(self):
-        owners = (MailOperations, WriteOperations, FlagOperations, CalendarOperations)
         for name, spec in SPECS.items():
-            owner = next((c for c in owners if hasattr(c, name)), None)
-            if owner is None:
-                continue  # Missing deployment modules cannot be verified offline.
-            signature = inspect.signature(getattr(owner, name)).parameters
+            signature = inspect.signature(getattr(outlook_client.OutlookClient, name)).parameters
             for field in TOOLS[name]:
                 with self.subTest(tool=name, field=field["name"]):
                     self.assertIn(field["name"], signature)
@@ -96,10 +117,15 @@ class PublicSchemaTests(unittest.TestCase):
             Draft202012Validator.check_schema(spec["inputSchema"])
 
     def test_write_branches_for_every_registered_write(self):
-        from tool_specs import READ_TOOLS
-        for tool in set(SPECS) - READ_TOOLS:
+        self.assertEqual(set(WRITE_ARGUMENTS), set(SPECS) - READ_TOOLS)
+        for tool, business in WRITE_ARGUMENTS.items():
             with self.subTest(tool=tool):
+                self.assertTrue(self.valid(tool, **business))
+                self.assertTrue(self.valid(tool, **business, idempotency_key="key"))
+                self.assertTrue(self.valid(tool, **business, operation_id="op", confirm_token="token"))
                 self.assertTrue(self.valid(tool, operation_id="op"))
+                self.assertFalse(self.valid(tool, **business, operation_id="op"))
+                self.assertFalse(self.valid(tool, **business, confirm_token="token"))
                 self.assertFalse(self.valid(tool, confirm_token="token"))
                 self.assertFalse(self.valid(tool, operation_id=""))
                 self.assertFalse(self.valid(tool, operation_id="op", idempotency_key="key"))
@@ -107,6 +133,23 @@ class PublicSchemaTests(unittest.TestCase):
         self.assertTrue(self.valid("send_draft", draft_id="draft", operation_id="op", confirm_token="token"))
         self.assertFalse(self.valid("send_draft", draft_id="draft", operation_id="op"))
         self.assertFalse(self.valid("send_draft", operation_id="op", confirm_token="token"))
+
+    def test_every_tool_requires_flat_identity_and_rejects_internal_arguments(self):
+        fixtures = {**READ_ARGUMENTS, **WRITE_ARGUMENTS}
+        self.assertEqual(set(fixtures), set(SPECS))
+        self.assertEqual(set(READ_ARGUMENTS), READ_TOOLS)
+        for tool, business in fixtures.items():
+            validator = Draft202012Validator(SPECS[tool]["inputSchema"])
+            valid = {**IDENTITY, **business}
+            with self.subTest(tool=tool):
+                self.assertTrue(validator.is_valid(valid))
+                self.assertFalse(validator.is_valid({"params": valid}))
+                for field in ("lanid", "name"):
+                    self.assertFalse(validator.is_valid({k: v for k, v in valid.items() if k != field}))
+                    for value in ("", None, 123, True):
+                        self.assertFalse(validator.is_valid({**valid, field: value}))
+                for hidden in ("params", "ctx", "_tool", "expected_version", "directory_target"):
+                    self.assertFalse(validator.is_valid({**valid, hidden: "injected"}))
 
     def test_draft_mode_and_aqs_conditional_contracts(self):
         for mode in ("reply", "reply_all", "forward"):
@@ -138,7 +181,7 @@ class PublicSchemaTests(unittest.TestCase):
             extras = {"to_folder": "inbox"} if tool == "move_messages" else {}
             for ids in ([], [""], ["a", "a"], ["a"] * 51):
                 self.assertFalse(self.valid(tool, ids=ids, **extras))
-        self.assertNotIn("save", SPECS["get_attachment"]["inputSchema"]["properties"]["params"]["properties"])
+        self.assertNotIn("save", SPECS["get_attachment"]["inputSchema"]["properties"])
         self.assertTrue(set(DISABLED_TOOLS).isdisjoint(SPECS))
 
 
@@ -190,7 +233,7 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(patcher.stop)
 
     async def call(self, client, tool="send_draft", **params):
-        return await client.call_tool(tool, {"params": {**IDENTITY, **params}}, raise_on_error=False)
+        return await client.call_tool(tool, {**IDENTITY, **params}, raise_on_error=False)
 
     def record(self, tool="send_draft", mailbox=MAILBOX, status="pending", key=None):
         row = self.store.create_preview(tool=tool, mailbox=mailbox, action=tool,
@@ -203,22 +246,148 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_actual_mcp_entry_rejects_invalid_types_and_hidden_arguments(self):
         async with Client(self.server.mcp) as client:
             listed = await client.list_tools()
-            self.assertEqual({t.name for t in listed}, set(SPECS))
+            self.assertEqual({t.name for t in listed}, set(READ_ARGUMENTS) | set(WRITE_ARGUMENTS))
             for t in listed:
                 self.assertEqual(t.inputSchema, SPECS[t.name]["inputSchema"])
-            for arguments in (
-                {"params": {**IDENTITY, "limit": 0}},
-                {"params": {**IDENTITY, "is_unread": "false"}},
-                {"params": {**IDENTITY, "is_unread": None}},
-                {"params": {**IDENTITY, "unknown": 1}},
-                {"params": IDENTITY, "_tool": "send_draft"},
-                {}, {"params": None},
+            self.assertEqual(len(listed), 28)
+            for arguments, code in (
+                ({**IDENTITY, "limit": 0}, "INVALID_PAGINATION"),
+                ({**IDENTITY, "is_unread": "false"}, "INVALID_PARAMS"),
+                ({**IDENTITY, "is_unread": None}, "INVALID_PARAMS"),
+                ({**IDENTITY, "unknown": 1}, "INVALID_PARAMS"),
+                ({**IDENTITY, "_tool": "send_draft"}, "INVALID_PARAMS"),
+                ({**IDENTITY, "ctx": {}}, "INVALID_PARAMS"),
+                ({**IDENTITY, "expected_version": {}}, "INVALID_PARAMS"),
+                ({**IDENTITY, "directory_target": {}}, "INVALID_PARAMS"),
+                ({"params": IDENTITY}, "INVALID_PARAMS"),
+                ({**IDENTITY, "params": {}}, "INVALID_PARAMS"),
+                ({}, "INVALID_PARAMS"),
+                ({"params": None}, "INVALID_PARAMS"),
             ):
                 result = await client.call_tool("find_message", arguments, raise_on_error=False)
                 self.assertTrue(result.is_error, arguments)
-                self.assertEqual(result.structured_content["error_code"], "INVALID_PARAMS")
+                self.assertEqual(result.structured_content["error_code"], code)
             self.server.resolve_identity_by_lanid.assert_not_called()
             self.business.find_message.assert_not_called()
+
+    async def test_all_registered_reads_keep_identity_out_of_business_arguments(self):
+        async with Client(self.server.mcp) as client:
+            for tool, business in READ_ARGUMENTS.items():
+                with self.subTest(tool=tool):
+                    method = Mock(return_value={"marker": tool})
+                    setattr(self.business, tool, method)
+                    self.server.tool_audit.logger.reset_mock()
+                    result = await self.call(client, tool, **business)
+                    self.assertFalse(result.is_error, result)
+                    self.assertEqual(result.structured_content["results"], {"marker": tool})
+                    method.assert_called_once_with(**business)
+                    self.assertEqual(self.business.requester_lanid, "employee")
+                    event = json.loads(self.server.tool_audit.logger.info.call_args.args[0])
+                    self.assertEqual(event["identity_assurance"], "oa_name_match")
+                    self.assertEqual(event["status"], "success")
+
+    async def test_all_registered_writes_preview_confirm_and_replay_once(self):
+        async with Client(self.server.mcp) as client:
+            for tool, business in WRITE_ARGUMENTS.items():
+                with self.subTest(tool=tool):
+                    method = Mock(side_effect=lambda _tool=tool, **kw: (
+                        {"applied": _tool} if kw.get("confirm")
+                        else {"preview": {"items": [{"tool": _tool}], "details": {}}}))
+                    setattr(self.business, tool, method)
+                    preview = (await self.call(client, tool, **business)).structured_content
+                    self.assertTrue(preview["confirmation_required"])
+                    operation_id, token = preview["operation_id"], preview["confirm_token"]
+                    stored = self.store.get(operation_id)
+                    self.assertEqual(stored["status"], "pending")
+                    self.assertEqual(stored["business_params"], business)
+                    self.assertEqual(stored["mailbox"], MAILBOX)
+                    method.assert_called_once_with(**business, confirm=False)
+                    for replayed in (False, True):
+                        result = await self.call(client, tool, **business,
+                                                 operation_id=operation_id, confirm_token=token)
+                        self.assertFalse(result.is_error, result)
+                        self.assertEqual(result.structured_content["status"], "completed")
+                        self.assertEqual(result.structured_content["results"], {"applied": tool})
+                        self.assertEqual(result.structured_content["replayed"], replayed)
+                    self.assertEqual(method.call_count, 2)
+                    method.assert_called_with(**business, confirm=True, confirmation_id=token)
+                    self.server.OutlookClient.reset_mock()
+                    receipt = await self.call(client, tool, operation_id=operation_id)
+                    self.assertEqual(receipt.structured_content["results"], {"applied": tool})
+                    self.server.OutlookClient.assert_not_called()
+
+    async def test_submission_failures_keep_classification_and_never_resubmit_on_query(self):
+        from exchangelib.errors import ErrorAccessDenied
+        cases = (
+            (ErrorAccessDenied("denied"), "ErrorAccessDenied", "exchange", "failed"),
+            (TimeoutError("timed out"), "UPSTREAM_TIMEOUT", "transport", "unknown"),
+            (TypeError("SECRET_PROGRAM_DETAIL"), "INTERNAL_ERROR", "program", "unknown"),
+        )
+        async with Client(self.server.mcp) as client:
+            for exc, code, kind, status in cases:
+                with self.subTest(error=code):
+                    self.business.send_draft.side_effect = lambda **kw: {
+                        "preview": {"items": [], "details": {}}}
+                    preview = (await self.call(client, draft_id="d")).structured_content
+                    self.business.send_draft.reset_mock()
+                    self.business.send_draft.side_effect = exc
+                    confirm = {"draft_id": "d", "operation_id": preview["operation_id"],
+                               "confirm_token": preview["confirm_token"]}
+                    result = await self.call(client, **confirm)
+                    self.assertTrue(result.is_error)
+                    self.assertEqual(result.structured_content["error_code"], code)
+                    self.assertEqual(result.structured_content["error_kind"], kind)
+                    self.assertNotIn("SECRET_PROGRAM_DETAIL", str(result))
+                    self.assertEqual(self.store.get(preview["operation_id"])["status"], status)
+                    replay_params = [{"operation_id": preview["operation_id"]}]
+                    if status == "unknown":
+                        replay_params.append(confirm)
+                    for params in replay_params:
+                        replay = await self.call(client, **params)
+                        self.assertTrue(replay.is_error)
+                        self.assertEqual(replay.structured_content["status"], status)
+                        self.assertEqual(replay.structured_content["error_code"], code)
+                        self.assertNotIn("SECRET_PROGRAM_DETAIL", str(replay))
+                        if kind == "exchange":
+                            self.assertEqual(replay.structured_content["error_code_normalized"],
+                                             "EXCHANGE_ACCESS_DENIED")
+                    self.business.send_draft.assert_called_once()
+
+    async def test_batch_verdicts_survive_receipt_query_and_confirmation_replay(self):
+        cases = (
+            ([{"success": True}, {"success": True}], "completed", None, 2, 0),
+            ([{"success": True}, {"success": False}], "partial", "BATCH_PARTIAL_FAILURE", 1, 1),
+            ([{"success": False}, {"success": False}], "failed", "BATCH_FAILED", 0, 2),
+        )
+        async with Client(self.server.mcp) as client:
+            for rows, status, code, successes, failures in cases:
+                with self.subTest(status=status):
+                    self.business.update_messages.side_effect = lambda **kw: {
+                        "preview": {"items": [], "details": {}}}
+                    business = {"ids": ["one", "two"], "set_read": True}
+                    preview = (await self.call(client, "update_messages", **business)).structured_content
+                    self.business.update_messages.reset_mock()
+                    self.business.update_messages.side_effect = None
+                    self.business.update_messages.return_value = {"results": rows}
+                    confirm = {**business, "operation_id": preview["operation_id"],
+                               "confirm_token": preview["confirm_token"]}
+                    for params in (confirm, {"operation_id": preview["operation_id"]}, confirm):
+                        self.server.tool_audit.logger.reset_mock()
+                        result = await self.call(client, "update_messages", **params)
+                        payload = result.structured_content
+                        self.assertEqual(result.is_error, failures != 0)
+                        self.assertEqual(payload["ok"], failures == 0)
+                        self.assertEqual(payload["status"], status)
+                        self.assertEqual(payload.get("error_code"), code)
+                        self.assertEqual(payload["results"], {"results": rows})
+                        if failures:
+                            self.assertEqual(payload["success_count"], successes)
+                            self.assertEqual(payload["failed_count"], failures)
+                        event = json.loads(self.server.tool_audit.logger.info.call_args.args[0])
+                        self.assertEqual(event["status"], "failure" if failures else "success")
+                        self.assertEqual(event["error_code"], code)
+                    self.assertEqual(self.store.get(preview["operation_id"])["status"], status)
+                    self.business.update_messages.assert_called_once()
 
     async def test_preview_query_confirm_replay_only_executes_once(self):
         async with Client(self.server.mcp) as client:
@@ -238,12 +407,36 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_oa_failure_blocks_receipt_query(self):
         row = self.record(status="completed")
-        self.server.resolve_identity_by_lanid.side_effect = self.server.IdentityResolutionError("OA unavailable")
+        with patch.object(self.store, "get", wraps=self.store.get) as lookup:
+            async with Client(self.server.mcp) as client:
+                for exc, code, assurance in (
+                    (self.server.IdentityResolutionError("OA unavailable"),
+                     "IDENTITY_LOOKUP_FAILED", "oa_lookup_failed"),
+                    (self.server.IdentityNameMismatchError("name mismatch"),
+                     "IDENTITY_NAME_MISMATCH", "oa_name_mismatch"),
+                ):
+                    with self.subTest(error=code):
+                        self.server.resolve_identity_by_lanid.side_effect = exc
+                        self.server.tool_audit.logger.reset_mock()
+                        result = await self.call(client, operation_id=row["operation_id"])
+                        self.assertTrue(result.is_error)
+                        self.assertEqual(result.structured_content["error_code"], code)
+                        self.assertEqual(result.structured_content["error_kind"], "identity")
+                        self.assertNotIn("SECRET", str(result))
+                        event = json.loads(self.server.tool_audit.logger.info.call_args.args[0])
+                        self.assertEqual(event["identity_assurance"], assurance)
+                        self.assertEqual(event["status"], "rejected")
+            lookup.assert_not_called()
+        self.server.OutlookClient.assert_not_called()
+
+    async def test_directory_actor_uses_normalized_employee_lanid(self):
+        self.business.get_server_status.return_value = {"ready": True}
         async with Client(self.server.mcp) as client:
-            result = await self.call(client, operation_id=row["operation_id"])
-        self.assertTrue(result.is_error)
-        self.assertEqual(result.structured_content["error_code"], "IDENTITY_LOOKUP_FAILED")
-        self.assertNotIn("SECRET", str(result))
+            result = await self.call(client, "get_server_status", lanid=" DOMAIN\\Employee ")
+        self.assertFalse(result.is_error)
+        self.assertEqual(result.structured_content["results"], {"ready": True})
+        self.assertEqual(self.business.requester_lanid, "Employee")
+        self.server.resolve_identity_by_lanid.assert_called_once_with(" DOMAIN\\Employee ", "员工")
 
     async def test_receipt_confirmation_and_terminal_replay_are_scoped(self):
         async with Client(self.server.mcp) as client:
@@ -448,48 +641,40 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
 
 class AuditEntryTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejected_raw_arguments_reach_audit_hooks_without_business_execution(self):
-        # Test spies replace only the absent audit adapter. The actual MCP
-        # transport, middleware chain, schema validator and envelope run.
-        events = []
-
-        class RecordingAudit(Middleware):
-            async def on_call_tool(self, context, call_next):
-                result = await call_next(context)
-                events.append(("middleware", result.structured_content["error_code"]))
-                return result
-
-        def install_fallback(server, audit):
-            handlers = server._mcp_server.request_handlers
-            original = handlers[mcp_types.CallToolRequest]
-
-            async def fallback(request):
-                result = await original(request)
-                events.append(("fallback", result.root.structuredContent["error_code"]))
-                return result
-
-            handlers[mcp_types.CallToolRequest] = fallback
-
-        server = load_server(audit_middleware=RecordingAudit, audit_fallback=install_fallback)
+        audit_logger = Mock()
+        server = load_server(audit_logger=audit_logger)
         cases = [
-            ("get_message", {"params": IDENTITY}, "INVALID_PARAMS"),
-            ("find_message", {"params": {**IDENTITY, "is_unread": "false"}}, "INVALID_PARAMS"),
-            ("find_message", {"params": IDENTITY, "_tool": "send_draft"}, "INVALID_PARAMS"),
+            ("get_message", IDENTITY, "INVALID_PARAMS"),
+            ("find_message", {**IDENTITY, "is_unread": "false"}, "INVALID_PARAMS"),
+            ("find_message", {**IDENTITY, "_tool": "send_draft"}, "INVALID_PARAMS"),
+            ("find_message", {**IDENTITY, "limit": 0}, "INVALID_PAGINATION"),
+            ("find_message", {"params": IDENTITY}, "INVALID_PARAMS"),
+            ("find_message", {**IDENTITY, "params": IDENTITY}, "INVALID_PARAMS"),
             ("find_message", {}, "INVALID_PARAMS"),
             ("find_message", {"params": None}, "INVALID_PARAMS"),
-            ("send_draft", {"params": {**IDENTITY, "confirm_token": "SECRET_TOKEN"}}, "INVALID_PARAMS"),
-            ("unregistered_tool", {"params": IDENTITY}, "UNKNOWN_TOOL"),
-            (next(iter(DISABLED_TOOLS)), {"params": IDENTITY}, "UNKNOWN_TOOL"),
+            ("send_draft", {**IDENTITY, "confirm_token": "SECRET_TOKEN"}, "INVALID_PARAMS"),
+            ("unregistered_tool", IDENTITY, "UNKNOWN_TOOL"),
+            *[(tool, IDENTITY, "UNKNOWN_TOOL") for tool in sorted(DISABLED_TOOLS)],
         ]
         with patch.dict(os.environ, {"EWS_MCP_DOWNLOAD_ENABLED": "false"}):
             async with Client(server.mcp) as client:
                 for tool, arguments, code in cases:
                     with self.subTest(tool=tool, arguments=arguments):
-                        events.clear()
+                        audit_logger.reset_mock()
                         result = await client.call_tool(tool, arguments, raise_on_error=False)
                         self.assertTrue(result.is_error)
                         self.assertEqual(result.structured_content["error_code"], code)
                         self.assertNotIn("SECRET_TOKEN", str(result))
-                        self.assertEqual(events, [("middleware", code), ("fallback", code)])
+                        audit_logger.info.assert_called_once()
+                        serialized = audit_logger.info.call_args.args[0]
+                        event = json.loads(serialized)
+                        self.assertEqual(event["tool"], tool)
+                        self.assertEqual(event["error_code"], code)
+                        self.assertEqual(event["status"], "failure")
+                        self.assertEqual(event["identity_assurance"], "not_verified")
+                        self.assertEqual(event["lanid"], arguments.get("lanid"))
+                        self.assertEqual(event["name"], arguments.get("name"))
+                        self.assertNotIn("SECRET_TOKEN", serialized)
         server.resolve_identity_by_lanid.assert_not_called()
         server.OutlookClient.assert_not_called()
 

@@ -14,7 +14,6 @@ from tool_support import (
 
 
 def _task_date(value):
-    """Task start/due dates are EWSDate(date) objects; format them safely."""
     if isinstance(value, datetime):
         return value.date().isoformat()
     if isinstance(value, date):
@@ -23,15 +22,14 @@ def _task_date(value):
 
 
 def _ews_date(value):
-    """Task start/due dates are date-valued EWSDate fields, not datetimes."""
+    """Task start/due fields hold dates, not datetimes."""
     if value is None:
         return None
     return EWSDate.from_date(parse_datetime(value).date())
 
 
 def _task_row(task):
-    # `Task.complete` is a *method* (marks complete on the server), not an
-    # attribute; derive the Boolean from the `status` field instead.
+    # Task.complete mutates the server; read completion from status.
     status = getattr(task, "status", None)
     percent = getattr(task, "percent_complete", None)
     if percent is not None:
@@ -61,15 +59,11 @@ class TaskOperations:
         confirm=False,
         confirmation_id=None,
     ):
-        """Create one task in the employee's own Tasks folder.
-
-        Writes only the mailbox Tasks item; it sends nothing and invites nobody,
-        so it needs Tasks create access and no send switch.
-        """
+        """Create in the employee's Tasks folder; requires create access, no send switch."""
         subject = (subject or "").strip()
         if not subject:
             raise ToolOperationError("INVALID_TASK", "任务主题不能为空。 ")
-        # Convert before the preview so a bad date fails the read-only phase.
+        # Reject invalid dates before preview.
         start = _ews_date(start_date)
         due = _ews_date(due_date)
         preview = require_confirmation(
@@ -168,7 +162,6 @@ class TaskOperations:
             raise ToolOperationError("INVALID_TASK", "指定项目不是当前员工的任务。 ")
         changes = {}
         if complete is not None:
-            # `Task.complete` is a method, not an attribute; map to status fields.
             if complete:
                 changes["status"] = Task.COMPLETED
                 changes["percent_complete"] = Decimal(100)
@@ -176,7 +169,7 @@ class TaskOperations:
                 changes["status"] = Task.NOT_STARTED
                 changes["percent_complete"] = Decimal(0)
         if due_date is not None:
-            # Task.due_date is an EWSDate field (a date, not a datetime).
+            # Task.due_date holds an EWSDate.
             changes["due_date"] = EWSDate.from_date(parse_datetime(due_date).date())
         if not changes:
             raise ToolOperationError("NO_CHANGES", "请至少指定 complete 或 due_date。 ")

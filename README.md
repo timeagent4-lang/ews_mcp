@@ -1,26 +1,24 @@
-# EWS MCP integration snapshot
+# EWS MCP
 
-本仓库保存当前可用源码及附件下载、工具合同、回执与日历限制等修复，用于合入内网完整项目。
-首次提交是当前工作区快照，不是完整原项目，也不是可直接独立部署的镜像。
+面向内网的 Exchange 邮件 MCP 服务，通过 OA 校验员工身份，以固定服务账号通过 DELEGATE 访问对应邮箱。
 
-**仅能使用网页爬虫获取代码：** 从 [GitHub 爬虫交付入口](docs/github-crawler-handoff.md) 开始，按固定版本的 GitHub／Raw 文本链接逐文件获取，无需 Git 或 ZIP 下载能力。
-
-开始接入请阅读 [内网 AI 接入说明](docs/intranet-integration.md)，其中包含可直接转交的提示词、文件清单、部署配置、验收及回滚要求。
-
-- 当前注册 28 个工具；删除未注册的本地镜像跟进工具后，保留其他禁用工具及会议通知副本行为。
-- 附件通过 `prepare_attachment_download` 生成内网 HTTP 签名链接，AI 执行器 GET 下载文件；字节不进入工具响应。
+- 公开 28 个工具（见 [tool_specs.py](tool_specs.py)）；`arguments` 为扁平对象，必填 `lanid`、`name`。
+- 写操作先预览，再携原业务参数、`operation_id` 和 `confirm_token` 确认，可选 `idempotency_key`。结果未知时用原 `operation_id` 查回执，不自动重试。
+- `EWS_MCP_SEND_ENABLED` 默认关闭，限制真实发送、会议通知及 OOF 执行；预览仍可用。
+- `prepare_attachment_download` 返回内网 HTTP 签名链接，供 AI 执行器 GET 下载；响应不含附件字节。
 - `check_availability` 返回各邮箱的忙闲区间，由调用方 Agent 选择公共时段；`interval_minutes` 为采样间隔（默认 30，范围 5–1440），不是会议时长。参数与迁移说明见 [忙闲查询](docs/availability.md)。
 - `list_tasks` 默认先筛选未完成任务，再按到期日降序分页；用返回的 `next_offset` 取后续页。参数、空结果和分页边界见 [任务列表](docs/task-listing.md)。
-- 配置统一使用 `lanid`／`OUTLOOK_ADMIN_LANID`。
-- 当前员工版以 2026-09-30 提交 `c4a2bd7` 为基线，已按用户提供的内网源码照片恢复忙闲、自动回复、任务等模块；OA、审计和联系人模块也已在仓库内。照片无法证明恢复内容与该提交逐字一致，来源边界及当时验证结果见 [源码恢复记录](docs/source-restoration.md)。
-- 本地邮件镜像与 `waiting_on` 已删除，不再使用 `EWS_MCP_CACHE_ENABLED`，服务状态也不再返回镜像覆盖或该开关。确认回执库、附件下载索引及附件缓存保留，`EWS_MCP_DATA_DIR` 仍需配置。
-- 源码恢复时的离线测试仍有既存失败，历史通过数量不能视为当前版本全部通过或生产联调完成；每次接入须执行下方验证命令并记录实际结果。
-- 照片、凭据、运行数据库及导出附件不入库。
 
-验证命令（使用目标环境 Python）：
+接入、验收及回滚见 [内网接入说明](docs/intranet-integration.md)，变量见 [.env.example](.env.example)。服务账号用 `OUTLOOK_ADMIN_LANID`；`EWS_MCP_DATA_DIR` 保存回执及附件缓存。
+
+来源、镜像移除及历史测试边界见 [源码恢复记录](docs/source-restoration.md) 和接入说明；网页取码见 [爬虫历史交付入口](docs/github-crawler-handoff.md)。凭据、照片及运行数据不入库。
+
+用目标环境 Python 验证；内网 OA 和 Exchange 另行联调：
 
 ```sh
+python -B -c "import mcp_server"
+python -m pip check
 python -B -m unittest discover -s tests -v
 ```
 
-更多依据见 [附件下载](docs/attachment-downloads.md)、[工具合同验证](docs/tool-contract-validation.md)、[描述核对](docs/tool-description-review.md)。
+当前测试与兼容变化见 [版本验证](docs/release-validation.md)；功能说明见 [附件下载](docs/attachment-downloads.md)。[工具合同验证](docs/tool-contract-validation.md) 与 [描述核对](docs/tool-description-review.md) 保留历史记录。
