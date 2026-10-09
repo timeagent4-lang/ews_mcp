@@ -1,10 +1,10 @@
-"""The tool vocabulary, wrapped in one strict unified params contract.
+"""The tool vocabulary, exposed through a strict flat arguments contract.
 
-33 tools are defined; 28 are registered. Disabled tool definitions are retained
+32 tools are defined; 28 are registered. Disabled tool definitions are retained
 but excluded from registration via ``DISABLED_TOOLS``.
 
-Mirrors the reference ``ews4s_oa_delegate`` registry: every tool exposes only a
-single ``arguments.params`` object; ``lanid`` / ``name`` are always required; IDs are
+Based on the reference ``ews4s_oa_delegate`` registry: business fields live directly
+in ``arguments``; ``lanid`` / ``name`` are always required; IDs are
 mailbox-scoped; write tools route through the persistent two-phase confirmation
 (``operation_id`` + ``confirm_token`` + optional ``idempotency_key``).
 """
@@ -81,7 +81,6 @@ _READ_TOOLS = frozenset(
         "get_contact",
         "check_availability",
         "get_oof_settings",
-        "waiting_on",
         "get_server_status",
         "list_flagged_messages",
     }
@@ -314,11 +313,6 @@ TOOLS: dict[str, list[dict]] = {
         _s("complete", "boolean", "Mark complete/incomplete.", default=None),
         _s("due_date", "string", "New due date.", default=None),
     ],
-    # --- mirror heuristic ---
-    "waiting_on": [
-        _s("id", "string", "Scoped message ID of the outgoing message.", required=True),
-        _s("days", "integer", "Mirror window in days (max 365).", default=30, maximum=365),
-    ],
     # --- oof ---
     "get_oof_settings": [],
     "set_oof": [
@@ -362,10 +356,9 @@ DESCRIPTIONS = {
     "list_tasks": "Read scoped Exchange tasks live, incomplete by default; use returned IDs for update_task.",
     "create_task": "Create one task in the OA employee's own Tasks folder; sends no mail and invites nobody.",
     "update_task": "Update a scoped task completion/due date using a checked change key; no fields means no write.",
-    "waiting_on": "Opt-in local mirror follow-up heuristic, not proof of no reply; requires current online Inbox/Sent permissions and complete bounded mirror coverage.",
     "get_oof_settings": "Read this OA mailbox out-of-office settings; folder delegation may not authorize this mailbox-level operation.",
     "set_oof": "Set employee out-of-office settings; omitting external_reply disables external replies, supplying nonempty external_reply enables audience All (shown in preview); internal text is never copied outward by default.",
-    "get_server_status": "Return the current mailbox, whether this adapter has an account, send/cache flags, available mirror coverage and the data-directory basename; no credentials or other mailbox statistics.",
+    "get_server_status": "Return the current mailbox, whether this adapter has an account, the send switch and the data-directory basename; no credentials or other mailbox statistics.",
 }
 
 # Notification-copy placement is deployment-dependent; employee Sent is not a
@@ -379,22 +372,19 @@ for _name in ("create_event", "update_event", "cancel_event"):
 # ---------------- deliberately unregistered tools ----------------
 # These definitions are retained but are NOT registered, so no external caller
 # can see or invoke them. Re-exposure also requires the corresponding business
-# module and deployment permissions. Three distinct reasons live here:
+# module and deployment permissions. Two distinct reasons live here:
 #   * delete_draft / delete_messages -- deletion-class policy: withheld by
 #     decision, not a defect.
 #   * get_oof_settings / set_oof -- OOF is a mailbox-level Exchange right this
 #     delegated service account does not hold on the current deployment; even a
 #     correct request is refused with ErrorAccessDenied, so the tool could only
 #     ever fail. Re-expose only if the right is actually granted.
-#   * waiting_on -- requires the local mirror (EWS_MCP_CACHE_ENABLED=true),
-#     which is off; without it the tool can only ever refuse.
 DISABLED_TOOLS = frozenset(
     {
         "delete_draft",
         "delete_messages",
         "get_oof_settings",
         "set_oof",
-        "waiting_on",
     }
 )
 

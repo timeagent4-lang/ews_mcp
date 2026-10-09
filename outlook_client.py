@@ -1,5 +1,4 @@
 import logging
-import os
 from datetime import datetime
 from typing import List, Optional
 
@@ -25,7 +24,6 @@ from calendar_operations import CalendarOperations
 from config import OutlookConfig, http_timeout
 from flag_operations import FlagOperations
 from mail_operations import MailOperations
-from mirror import MirrorStore, WaitingOnOperations
 from oof_operations import OofOperations
 from people_operations import PeopleOperations
 from status_operations import StatusOperations
@@ -46,22 +44,17 @@ class OutlookClient(
     AvailabilityOperations,
     OofOperations,
     StatusOperations,
-    WaitingOnOperations,
 ):
     """使用固定服务凭据访问当前请求者邮箱的 Exchange 客户端。
 
     聚合扩展的 28 工具能力: mail read / draft+mail writes / calendar /
-    people/(GAL+contacts) / tasks / availability / oof / status / waiting_on 镜像。
+    people/(GAL+contacts) / tasks / availability / oof / status。
     账户初始化与既有读写方法保持不变。
     """
 
     def __init__(self, config: OutlookConfig):
         self.config = config
         self.account = self._connect()
-        self._mirror = None
-        data_dir = os.getenv("EWS_MCP_DATA_DIR")
-        if data_dir:
-            self._mirror = MirrorStore(os.path.join(data_dir, "mirror.db"))
 
     def _connect(self) -> Account:
         try:

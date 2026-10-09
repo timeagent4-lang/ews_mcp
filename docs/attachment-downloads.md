@@ -103,8 +103,8 @@ python -c "import secrets; print(secrets.token_hex(32))"
 - 单实例/本地文件系统是本次部署目标。多个实例独立磁盘会出现链接找不到文件，
   不应直接复制部署；需要另行设计共享存储/路由。SQLite 索引不应直接放到不支持可靠锁的网络盘。
 - 服务内 Uvicorn 访问日志已对下载查询参数脱敏。网关访问日志及平台工具审计仍应对
-  签名 URL 脱敏，不记录完整 token。当前目录缺少
-  `utils.audit` 实现，需要内网核实其是否记录工具响应；不要将完整有效链接回传到聊天或工单。
+  签名 URL 脱敏，不记录完整 token。需要内网核实
+  `utils.audit` 的实际记录行为；不要将完整有效链接回传到聊天或工单。
 
 ## 错误与定位
 
@@ -151,5 +151,5 @@ python -c "import secrets; print(secrets.token_hex(32))"
 
 测试命令：`python -B -m unittest discover -s tests -v`。
 本地测试使用固定字节流代替 Exchange 网络，运行真实 FastMCP 工具结果及 SSE
-应用的 HTTP 路由。当前项目副本缺少 utils、mirror 和若干 operation 模块，
-不代表已验证整个生产 mcp_server 启动，也不替代真实邮箱、网关及审计联调。
+应用的 HTTP 路由。附件阶段的验证不代表已验证整个生产 mcp_server 启动，
+也不替代真实邮箱、网关及审计联调。后续源码恢复及邮件镜像移除见 [源码恢复记录](source-restoration.md)；附件下载索引和文件缓存不受镜像移除影响。

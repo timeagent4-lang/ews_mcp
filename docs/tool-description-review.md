@@ -1,5 +1,7 @@
 # 工具描述逐项复核（2026-09-22）
 
+本文是 2026-09-22 的复核记录，以下实现覆盖和工具描述均对应当时版本。2026-10-09 已移除邮件镜像：`get_server_status` 保留当前邮箱、account 是否存在、发送开关和数据目录末级名称，删除镜像覆盖及邮件缓存开关字段；当前源码状态见 [源码恢复记录](source-restoration.md)。
+
 本轮按最新工作区核对描述、公开参数、方法签名和实际分支。会议通知副本按用户决定保持现状；本轮源码仅修改 tool_specs.py 中的描述和注释，不修改发送、保存副本、确认流程或业务方法。
 
 ## 范围与结果
@@ -29,7 +31,7 @@
 | update_event | 组织者、明确单次/实例限制一致；补充 notify_attendees 需要发送开关；保留通知副本现状。 |
 | respond_to_event | 必填响应枚举一致；补充实际会发送响应且受发送开关约束。 |
 | cancel_event | 精确区分会议取消通知与“非会议且无参会人”预约移至已删除项目；不传说明不等于不发通知。 |
-| get_server_status | 明确实际返回当前邮箱、account 是否存在、send/cache 开关、已有镜像覆盖及数据目录末级名称，避免泛称运行计数器。 |
+| get_server_status | 当时明确实际返回当前邮箱、account 是否存在、send/cache 开关、已有镜像覆盖及数据目录末级名称；邮件镜像移除后的字段变化见上方说明。 |
 
 缺少实现，不能确认全部描述的 7 个注册工具：check_availability、find_people、get_contact、create_contact、list_tasks、create_task、update_task。本轮保留其现有声明，不编造模块。
 其中 update_task 的“checked change key”及“不传字段不写入”等声明仍需取得 task_operations.py 后核实。

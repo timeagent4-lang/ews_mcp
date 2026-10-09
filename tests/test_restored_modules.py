@@ -5,13 +5,12 @@ import os
 import subprocess
 import sys
 import unittest
-from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from exchangelib import EWSDate, EWSDateTime, Task
-from exchangelib.properties import ConversationId, FreeBusyView
+from exchangelib import EWSDate, Task
+from exchangelib.properties import FreeBusyView
 from tool_support import ToolOperationError
 
 
@@ -71,38 +70,6 @@ class AvailabilityTests(unittest.TestCase):
                 self.ops.check_availability("2026-10-09T09:00", "2026-10-09T10:00", ["a@example.com"])
         self.assertEqual(caught.exception.code, "AVAILABILITY_UNAVAILABLE")
         self.assertIs(caught.exception.__cause__, original)
-
-
-class MirrorTests(unittest.TestCase):
-    def setUp(self):
-        self.module = importlib.import_module("mirror")
-        self.store = self.module.MirrorStore(":memory:")
-        self.addCleanup(self.store._conn.close)
-
-    def test_disabled_cache_rejects_followup(self):
-        ops = self.module.WaitingOnOperations()
-        ops.config = SimpleNamespace(email="a@example.com")
-        ops._mirror = self.store
-        with patch.dict(os.environ, {"EWS_MCP_CACHE_ENABLED": "false"}):
-            with self.assertRaises(ToolOperationError) as caught:
-                ops.waiting_on("sent-id")
-        self.assertEqual(caught.exception.code, "MIRROR_DISABLED")
-
-    @unittest.expectedFailure
-    def test_known_source_defect_nonempty_snapshot_must_roundtrip(self):
-        self.store.replace_snapshot("a@example.com", "sent", [{
-            "item_id": "sent-id", "conversation_id": "conversation-id",
-            "received": "2026-10-09T01:00:00+00:00",
-        }], datetime(2026, 10, 1, tzinfo=timezone.utc), 2000)
-        self.assertEqual(self.store.sent_by_item("a@example.com", "sent-id")["item_id"], "sent-id")
-
-    @unittest.expectedFailure
-    def test_known_source_defect_snapshot_must_accept_exchange_values(self):
-        self.store.replace_snapshot("a@example.com", "sent", [{
-            "item_id": "sent-id", "conversation_id": ConversationId(id="conversation-id"),
-            "received": EWSDateTime.from_datetime(datetime(2026, 10, 9, 1, tzinfo=timezone.utc)),
-        }], datetime(2026, 10, 1, tzinfo=timezone.utc), 2000)
-        self.assertEqual(self.store.coverage["a@example.com:sent"]["count"], 1)
 
 
 class OofTests(unittest.TestCase):

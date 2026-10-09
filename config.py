@@ -48,7 +48,7 @@ class OutlookConfig:
 
 
 def data_dir() -> str:
-    """本机绝对路径，服务账号独占；用于镜像与确认数据库。"""
+    """本机绝对路径，服务账号独占；用于确认数据库与附件下载缓存。"""
     value = os.getenv("EWS_MCP_DATA_DIR", "").strip()
     if not value:
         raise ValueError("缺少 EWS_MCP_DATA_DIR（本机绝对路径）")
@@ -62,11 +62,6 @@ def _flag(name: str) -> bool:
 def send_enabled() -> bool:
     """默认禁止真实发送/会议通知/OOF 执行，仍允许预览。"""
     return _flag("EWS_MCP_SEND_ENABLED")
-
-
-def cache_enabled() -> bool:
-    """默认不镜像正文；启用后仅同步明确列出的文件夹。"""
-    return _flag("EWS_MCP_CACHE_ENABLED")
 
 
 def operations_db_path() -> str:

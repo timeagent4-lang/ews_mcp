@@ -1,5 +1,7 @@
 # 工具合同修复与离线验证
 
+本文保留 2026-09-22 合同修复阶段的验证记录，以下测试数量和缺失模块情况均为当时结果。后续已恢复员工版模块，并在 2026-10-09 移除邮件镜像；当前源码状态见 [源码恢复记录](source-restoration.md)。接入当前版本时需重新验证，不能沿用历史测试结论。
+
 本次业务源码仅修改 `tool_specs.py`、`mcp_server.py`、`calendar_operations.py`。
 保留现有注册、业务分发、附件下载和禁用工具集合；`tool_params.py` 未接入或修改。
 
@@ -50,7 +52,7 @@ python -B -m unittest discover -s tests -v
 测试使用实际 FastMCP 注册、MCP Client 内存传输、分发器、SQLite 回执存储，以及真实邮件/日历业务方法；Exchange 写方法均被替换为测试桩。
 已覆盖参数/default/枚举、AQS、公开 schema 的实际拒绝行为、预览/确认/查询、跨工具/邮箱拒绝、幂等/过期/不重复执行、日历角色及发送行为；包括建立 Exchange 连接期间预览过期时仍不得执行。
 
-完整 `import mcp_server` 仍因缺少 `utils` 失败；同时缺少 `utils/audit.py`、`utils/lanid_email.py`、`availability_operations.py`、`mirror.py`、`oof_operations.py`、`people_operations.py`、`task_operations.py`。
+当时完整 `import mcp_server` 因缺少 `utils` 失败；缺失文件包括 `utils/audit.py`、`utils/lanid_email.py`、`availability_operations.py`、`mirror.py`、`oof_operations.py`、`people_operations.py`、`task_operations.py`。这是历史恢复前的状态，当前不再依赖镜像模块。
 服务器测试仅在导入期间替换 OA、审计、Outlook 客户端依赖，没有补造生产模块。
 因此未验证真实 OA/审计、完整 OutlookClient 组合、真实 Exchange 行为和部署的 SSE/内网通信；不能视为完整集成测试通过。
 没有真实邮件发送或日历写入，也没有部署或 Git 提交。
