@@ -1,6 +1,6 @@
 """EWS MCP: OA+DELEGATE mail server; tool_specs defines the enabled tool set.
 
-Every tool exposes only ``arguments.params`` (lanid/name required). Read tools
+Every tool exposes flat ``arguments`` (lanid/name required). Read tools
 dispatch directly; every write tool routes through the persistent two-phase
 confirmation (operation_id / confirm_token / idempotency_key). Uncertain
 outcomes are never auto-retried; callers query by the original operation_id.

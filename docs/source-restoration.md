@@ -8,6 +8,12 @@
 
 下文保留恢复时的来源、验证结果和问题记录，属于历史记录，不代表当前仍包含镜像实现，也不是重新启用镜像的操作指南。当前版本的测试结果应以本次运行报告为准。
 
+### 旧参数模型移除后的离线验证
+
+已删除未参与运行调用链的 `tool_params.py`（629 行、25 个模型），唯一引用它的附件测试改为验证当前扁平 JSON Schema，并同步清理接入文档。真实服务导入成功，28 个工具的名称、输入 schema 及描述与删除前完全一致，现有参数校验保留。
+
+23 项附件测试通过；全量仍为 61 项，原有 16 个失败不变，错误从 4 个减为 3 个，没有新增失败。旧的 `DownloadHTTPTests.test_tool_registry_and_parameter_model` 已改为 `test_download_tool_validates_flat_arguments` 并通过；其余错误仍为 `AuditEntryTests.test_rejected_raw_arguments_reach_audit_hooks_without_business_execution`、`MCPContractTests.setUpClass`、`PublicSchemaTests.test_new_parameters_match_signatures_and_defaults`。16 个同名失败见下方镜像移除时的记录。未连接 OA / Exchange，未部署。
+
 ### 镜像移除后的离线验证
 
 - 新增的 2 项隔离客户端检查先在旧实现上失败，移除后通过：旧镜像库不可用不再阻止在线客户端初始化；状态只返回现有安全开关。

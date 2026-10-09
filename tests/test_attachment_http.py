@@ -78,15 +78,23 @@ class DownloadHTTPTests(unittest.IsolatedAsyncioTestCase):
             async with download_lifespan(self.server):
                 self.assertFalse(Path(expired["saved_path"]).exists())
 
-    async def test_tool_registry_and_parameter_model(self):
+    async def test_download_tool_validates_flat_arguments(self):
+        from jsonschema import Draft202012Validator, ValidationError
         from tool_specs import SPECS, READ_TOOLS
-        from tool_params import PrepareAttachmentDownloadParams
         self.assertIn("prepare_attachment_download", READ_TOOLS)
-        params = SPECS["prepare_attachment_download"]["inputSchema"]["properties"]["params"]
-        self.assertEqual(set(params["required"]), {"lanid", "name", "message_id", "attachment_id"})
-        self.assertNotIn("save", params["properties"])
-        model = PrepareAttachmentDownloadParams(lanid="test123", name="测试", message_id="m1", attachment_id="a1")
-        self.assertEqual(model.attachment_id, "a1")
+        validator = Draft202012Validator(SPECS["prepare_attachment_download"]["inputSchema"])
+        arguments = {"lanid": "test123", "name": "测试", "message_id": "m1", "attachment_id": "a1"}
+        validator.validate(arguments)
+        invalid = {
+            "legacy_wrapper": {"params": arguments},
+            "unknown_field": {**arguments, "save": True},
+            "invalid_id_type": {**arguments, "attachment_id": 42},
+        }
+        for field in ("lanid", "name", "message_id", "attachment_id"):
+            invalid[f"missing_{field}"] = {key: value for key, value in arguments.items() if key != field}
+        for case, payload in invalid.items():
+            with self.subTest(case=case), self.assertRaises(ValidationError):
+                validator.validate(payload)
 
     async def test_access_log_does_not_record_bearer_token(self):
         payload = self.store.issue(self.record["download_id"])

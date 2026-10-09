@@ -46,8 +46,8 @@ AI 执行器通过 HTTP GET 下载到自己的任务目录，核对大小和 SHA
 
 以下文件清单仅针对附件阶段。接入本次累计全部改动时，以 [内网完整项目接入说明](intranet-integration.md) 的合并清单为准，其中还包含日历、工具合同、审计入口和配置字段修复。
 
-先将这次变更的 5 个现有源码文件和新增的 `attachment_downloads.py` 一同发布：
-`config.py`、`mail_operations.py`、`mcp_server.py`、`tool_specs.py`、`tool_params.py`。
+先将这次变更的 4 个现有源码文件和新增的 `attachment_downloads.py` 一同发布：
+`config.py`、`mail_operations.py`、`mcp_server.py`、`tool_specs.py`。
 不用新增第三方依赖。默认禁用链接功能，但工具始终出现在列表中；禁用时调用明确报错。
 
 在现有容器配置中追加，保留原有 OA、Exchange、数据目录及其他设置：
