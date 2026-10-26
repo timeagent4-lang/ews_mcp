@@ -16,3 +16,4 @@ mcp==1.29.0
 # break the image at import time.
 jsonschema==4.26.0
 starlette==1.6.0
+Pillow==13.0.0

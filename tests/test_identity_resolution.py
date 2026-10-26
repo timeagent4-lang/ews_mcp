@@ -1,6 +1,7 @@
 import json
 import os
 import unittest
+from dataclasses import asdict
 from unittest.mock import Mock, patch
 
 from utils import lanid_email as oa
@@ -27,13 +28,13 @@ class IdentityResolutionTests(unittest.TestCase):
         self.post.return_value = self.response
 
     def resolve(self):
-        return oa.resolve_identity_by_lanid(" DOMAIN\\employee ", " 员工 ")
+        return oa.resolve_identity_by_lanid(" DOMAIN\\employee ")
 
     def test_single_contact_normalizes_identity_and_sends_only_lanid(self):
         identity = self.resolve()
-        self.assertEqual(identity.lanid, "employee")
-        self.assertEqual(identity.requested_name, "员工")
-        self.assertEqual(identity.email, "employee@example.com")
+        self.assertEqual(asdict(identity), {
+            "lanid": "employee", "email": "employee@example.com",
+        })
         args, kwargs = self.post.call_args
         self.assertEqual(args, ("https://oa.example.invalid/contacts",))
         self.assertEqual(kwargs["timeout"], 3)
@@ -48,12 +49,11 @@ class IdentityResolutionTests(unittest.TestCase):
                     self.resolve()
         self.post.assert_not_called()
 
-    def test_blank_identity_and_name_fail_before_network(self):
-        for lanid, name in (("", "员工"), ("DOMAIN\\", "员工"),
-                            ("employee", " "), ("employee", None)):
-            with self.subTest(lanid=lanid, name=name):
+    def test_blank_lanid_fails_before_network(self):
+        for lanid in (None, "", " \t ", "DOMAIN\\"):
+            with self.subTest(lanid=lanid):
                 with self.assertRaises(oa.IdentityResolutionError):
-                    oa.resolve_identity_by_lanid(lanid, name)
+                    oa.resolve_identity_by_lanid(lanid)
         self.post.assert_not_called()
 
     def test_ambiguous_missing_or_malformed_contact_is_rejected(self):
@@ -63,11 +63,23 @@ class IdentityResolutionTests(unittest.TestCase):
                 with self.assertRaises(oa.IdentityResolutionError):
                     self.resolve()
 
-    def test_name_must_match_exactly_after_trimming(self):
-        for name in (None, " ", "另一位员工"):
+    def test_missing_oa_name_does_not_block_email_resolution(self):
+        self.response.json.return_value = {
+            "Body": {"CtcInfArry": [{"EmailAdr": "EMPLOYEE@Example.COM"}]},
+        }
+        self.assertEqual(self.resolve().email, "employee@example.com")
+
+    def test_oa_name_value_does_not_affect_email_resolution(self):
+        for name in (None, "", " ", "另一位员工", 123, False, [], {}):
             with self.subTest(name=name):
                 self.response.json.return_value = {"Body": {"CtcInfArry": [{**CONTACT, "ChinNm1": name}]}}
-                with self.assertRaises(oa.IdentityNameMismatchError):
+                self.assertEqual(self.resolve().email, "employee@example.com")
+
+    def test_missing_or_malformed_response_body_is_rejected(self):
+        for payload in ({}, {"Body": None}, {"Body": []}, {"Body": "invalid"}):
+            with self.subTest(payload=payload):
+                self.response.json.return_value = payload
+                with self.assertRaises(oa.IdentityResolutionError):
                     self.resolve()
 
     def test_invalid_email_never_produces_resolved_identity(self):

@@ -96,7 +96,7 @@ class ToolConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             result = await client.call_tool("list_folders", IDENTITY)
         records = [json.loads(call.args[0]) for call in self.audit_logger.info.call_args_list]
         self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["identity_assurance"], "oa_name_match")
+        self.assertEqual(records[0]["identity_assurance"], "oa_lanid_resolved")
         self.assertEqual(records[0]["status"], "success")
         self.assertNotEqual(result.structured_content["results"]["thread"], loop_thread)
 

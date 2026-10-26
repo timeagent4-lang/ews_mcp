@@ -79,6 +79,8 @@ def require_send(action_desc: str) -> None:
 UNKNOWN_OUTCOME_CODES = frozenset(
     {
         "SEND_FAILED_OR_UNKNOWN",
+        "ATTACHMENT_FAILED_OR_UNKNOWN",
+        "ATTACHMENT_RECEIPT_INCOMPLETE",
         "CANCEL_OUTCOME_UNKNOWN",
         "AVAILABILITY_UNAVAILABLE",
         "OOF_WRITE_UNAVAILABLE",

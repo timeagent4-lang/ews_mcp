@@ -167,7 +167,7 @@ class HTMLDraftSchemaTests(unittest.TestCase):
     def test_identity_reply_target_and_confirmation_requirements_remain_enforced(self):
         params = {**IDENTITY, "mode": "reply", "reply_to": "original",
                   "body_format": "html", "body": FRAGMENT}
-        for missing in ("lanid", "name", "reply_to"):
+        for missing in ("lanid", "reply_to"):
             with self.subTest(missing=missing):
                 self.assertFalse(self.validator.is_valid({k: v for k, v in params.items() if k != missing}))
         for extra in ({"confirm_token": "token"}, {"operation_id": "operation"}):
@@ -190,7 +190,6 @@ def load_server():
     audit.install_tool_audit_fallback = lambda *args: None
     identity = ModuleType("utils.lanid_email")
     identity.IdentityResolutionError = type("IdentityResolutionError", (ValueError,), {})
-    identity.IdentityNameMismatchError = type("IdentityNameMismatchError", (ValueError,), {})
     identity.normalize_lanid = lambda value: value.strip().lower()
     identity.resolve_identity_by_lanid = Mock(side_effect=AssertionError("OA is offline"))
     outlook = ModuleType("outlook_client")

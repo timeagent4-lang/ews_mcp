@@ -1,6 +1,7 @@
 """Offline contracts through real MCP transport, audit and SQLite receipts."""
 import importlib.util
 import inspect
+import hashlib
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,8 @@ from jsonschema import Draft202012Validator
 
 from calendar_operations import CalendarOperations
 from confirmation import OperationStore
+from attachment_uploads import AttachmentUploadStore
+from config import UploadSettings
 from flag_operations import FlagOperations
 from mail_operations import MailOperations
 import outlook_client
@@ -25,7 +28,7 @@ import utils.lanid_email as identity_adapter
 from write_operations import WriteOperations
 
 
-IDENTITY = {"lanid": "employee", "name": "员工"}
+IDENTITY = {"lanid": "employee"}
 MAILBOX = "employee@example.com"
 READ_ARGUMENTS = {
     "list_folders": {},
@@ -34,6 +37,7 @@ READ_ARGUMENTS = {
     "get_thread": {"message_id": "message"},
     "get_attachment": {"message_id": "message"},
     "prepare_attachment_download": {"message_id": "message", "attachment_id": "attachment"},
+    "prepare_attachment_upload": {"filename": "report.txt", "size": 3, "sha256": "a" * 64},
     "get_mailbox_overview": {},
     "list_events": {"start": "2026-10-09", "end": "2026-10-10"},
     "get_event": {"event_id": "event"},
@@ -51,6 +55,7 @@ WRITE_ARGUMENTS = {
     "create_draft": {"subject": "report", "body": "content"},
     "update_draft": {"draft_id": "draft", "subject": "updated"},
     "send_draft": {"draft_id": "draft"},
+    "attach_draft_attachment": {"draft_id": "draft", "upload_id": "0" * 32, "is_inline": False},
     "set_message_flag": {"message_id": "message", "flag": "complete"},
     "update_messages": {"ids": ["message"], "set_read": True},
     "move_messages": {"ids": ["message"], "to_folder": "inbox"},
@@ -108,7 +113,8 @@ class PublicSchemaTests(unittest.TestCase):
 
     def test_known_business_schemas_only_expose_real_method_parameters(self):
         for name, spec in SPECS.items():
-            signature = inspect.signature(getattr(outlook_client.OutlookClient, name)).parameters
+            owner = AttachmentUploadStore.prepare if name == 'prepare_attachment_upload' else getattr(outlook_client.OutlookClient, name)
+            signature = inspect.signature(owner).parameters
             for field in TOOLS[name]:
                 with self.subTest(tool=name, field=field["name"]):
                     self.assertIn(field["name"], signature)
@@ -144,10 +150,13 @@ class PublicSchemaTests(unittest.TestCase):
             with self.subTest(tool=tool):
                 self.assertTrue(validator.is_valid(valid))
                 self.assertFalse(validator.is_valid({"params": valid}))
-                for field in ("lanid", "name"):
-                    self.assertFalse(validator.is_valid({k: v for k, v in valid.items() if k != field}))
-                    for value in ("", None, 123, True):
-                        self.assertFalse(validator.is_valid({**valid, field: value}))
+                self.assertFalse(validator.is_valid({k: v for k, v in valid.items() if k != "lanid"}))
+                for value in ("", None, 123, True):
+                    self.assertFalse(validator.is_valid({**valid, "lanid": value}))
+                for name in ("", "unverified legacy name"):
+                    self.assertTrue(validator.is_valid({**valid, "name": name}))
+                for name in (None, 123, True):
+                    self.assertFalse(validator.is_valid({**valid, "name": name}))
                 for hidden in ("params", "ctx", "_tool", "expected_version", "directory_target"):
                     self.assertFalse(validator.is_valid({**valid, hidden: "injected"}))
 
@@ -221,7 +230,7 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.store.close)
         self.business = Mock(config=SimpleNamespace(email=MAILBOX))
         self.business.send_draft.side_effect = lambda **kw: (
-            {"sent": True} if kw.get("confirm") else {"preview": {"items": [], "details": {}}})
+            {"sent": True} if kw.get("confirm") else {"preview": {"items": [], "details": {"canonical_draft_id": "d"}}})
         for patcher in (
             patch.dict(os.environ, {"EWS_MCP_DATA_DIR": self.tmp.name, "EWS_MCP_DOWNLOAD_ENABLED": "false"}),
             patch.object(self.server, "get_store", return_value=self.store),
@@ -238,7 +247,7 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
     def record(self, tool="send_draft", mailbox=MAILBOX, status="pending", key=None):
         row = self.store.create_preview(tool=tool, mailbox=mailbox, action=tool,
             business_params={"draft_id": "d"}, items=[{"private": "SECRET_PREVIEW"}],
-            details={}, idempotency_key=key)
+            details={"canonical_draft_id": "d"}, idempotency_key=key)
         if status != "pending":
             self.store.mark(row["operation_id"], status, result={"private": "SECRET_RESULT"})
         return row
@@ -249,7 +258,7 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual({t.name for t in listed}, set(READ_ARGUMENTS) | set(WRITE_ARGUMENTS))
             for t in listed:
                 self.assertEqual(t.inputSchema, SPECS[t.name]["inputSchema"])
-            self.assertEqual(len(listed), 28)
+            self.assertEqual(len(listed), 30)
             for arguments, code in (
                 ({**IDENTITY, "limit": 0}, "INVALID_PAGINATION"),
                 ({**IDENTITY, "is_unread": "false"}, "INVALID_PARAMS"),
@@ -277,22 +286,89 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
                     method = Mock(return_value={"marker": tool})
                     setattr(self.business, tool, method)
                     self.server.tool_audit.logger.reset_mock()
-                    result = await self.call(client, tool, **business)
+                    if tool == 'prepare_attachment_upload':
+                        with patch.object(self.server, '_uploads', return_value=SimpleNamespace(prepare=method)):
+                            result = await self.call(client, tool, **business)
+                        method.assert_called_once_with(lanid='employee', mailbox=MAILBOX, **business)
+                    else:
+                        result = await self.call(client, tool, **business)
+                        method.assert_called_once_with(**business)
                     self.assertFalse(result.is_error, result)
                     self.assertEqual(result.structured_content["results"], {"marker": tool})
-                    method.assert_called_once_with(**business)
-                    self.assertEqual(self.business.requester_lanid, "employee")
+                    if tool != 'prepare_attachment_upload':
+                        self.assertEqual(self.business.requester_lanid, "employee")
+                    self.server.tool_audit.logger.info.assert_called_once()
                     event = json.loads(self.server.tool_audit.logger.info.call_args.args[0])
-                    self.assertEqual(event["identity_assurance"], "oa_name_match")
+                    self.assertEqual(event["identity_assurance"], "oa_lanid_resolved")
                     self.assertEqual(event["status"], "success")
+                    self.assertIn("input_arguments", event)
+                    audited = {**IDENTITY, **business}
+                    if tool == 'prepare_attachment_upload':
+                        audited['filename'] = {'redacted':True, 'type':'string', 'length':10}
+                    self.assertEqual(event["input_arguments"], audited)
+                    self.assertIn("input_summary", event)
+                    if tool == "check_availability":
+                        self.assertNotIn("interval_minutes", event["input_arguments"])
+
+    async def test_lanid_only_and_legacy_names_use_the_same_oa_mailbox(self):
+        self.business.list_folders.return_value = {"folders": []}
+        response = Mock(status_code=200)
+        response.json.return_value = {"Body": {"CtcInfArry": [
+            {"EmailAdr": " Employee@Example.COM "},
+        ]}}
+        settings = {
+            "OA_BASE_URL": "https://oa.example.invalid", "OA_PATH": "/contacts",
+            "SVC_CD": "service", "SVC_SCN": "scene", "CNSMR_SYS_ID": "consumer",
+            "TLR_NO": "operator", "OA_TIMEOUT": "3",
+        }
+        with patch.dict(os.environ, settings), \
+                patch.object(identity_adapter.requests, "post", return_value=response), \
+                patch.object(self.server, "resolve_identity_by_lanid",
+                             side_effect=identity_adapter.resolve_identity_by_lanid):
+            async with Client(self.server.mcp) as client:
+                for legacy in ({}, {"name": "unrelated caller label"}, {"name": ""}):
+                    with self.subTest(legacy=legacy):
+                        result = await client.call_tool(
+                            "list_folders", {"lanid": "employee", **legacy}, raise_on_error=False)
+                        self.assertFalse(result.is_error, result)
+                        self.assertEqual(result.structured_content["results"], {"folders": []})
+        calls = self.server.OutlookConfig.from_service_env.call_args_list
+        self.assertEqual([call.args for call in calls], [("employee@example.com",)] * 3)
+
+    async def test_legacy_name_does_not_bind_confirmation_or_receipt(self):
+        async with Client(self.server.mcp) as client:
+            preview = (await self.call(client, draft_id="d", name="old caller label")).structured_content
+            self.business.send_draft.reset_mock()
+            confirmed = await self.call(client, draft_id="d", operation_id=preview["operation_id"],
+                                        confirm_token=preview["confirm_token"])
+            receipt = await self.call(client, operation_id=preview["operation_id"], name="changed label")
+        self.assertEqual(confirmed.structured_content["status"], "completed")
+        self.assertEqual(receipt.structured_content["results"], {"sent": True})
+        self.assertNotIn("name", self.store.get(preview["operation_id"])["business_params"])
+        self.business.send_draft.assert_called_once_with(
+            draft_id="d", confirm=True, confirmation_id=preview["confirm_token"])
 
     async def test_all_registered_writes_preview_confirm_and_replay_once(self):
         async with Client(self.server.mcp) as client:
             for tool, business in WRITE_ARGUMENTS.items():
                 with self.subTest(tool=tool):
+                    business = dict(business)
+                    details = {'canonical_draft_id': 'd'} if tool in ('send_draft','update_draft') else {}
+                    if tool == 'attach_draft_attachment':
+                        uploads = AttachmentUploadStore(UploadSettings(root=self.tmp.name, enabled=True, base_url='http://host'), self.store)
+                        row = uploads.prepare(lanid='employee', mailbox=MAILBOX, filename='report.txt', size=3, sha256=hashlib.sha256(b'abc').hexdigest())
+                        handle = uploads.begin_receive(row['upload_id'], row['upload_token'], 3, worker_id='r')
+                        handle.path.write_bytes(b'abc')
+                        uploads.publish_ready(handle, size=3, sha256=hashlib.sha256(b'abc').hexdigest())
+                        business['upload_id'] = row['upload_id']
+                        snapshot = uploads.open_verified(row['upload_id'], lanid='employee', mailbox=MAILBOX).metadata
+                        details = {'canonical_draft_id':'d', 'requester_lanid':'employee', 'attachment':snapshot}
+                        patcher = patch.object(self.server, '_uploads', return_value=uploads)
+                        patcher.start()
+                        self.addCleanup(patcher.stop)
                     method = Mock(side_effect=lambda _tool=tool, **kw: (
                         {"applied": _tool} if kw.get("confirm")
-                        else {"preview": {"items": [{"tool": _tool}], "details": {}}}))
+                        else {"preview": {"items": [{"tool": _tool}], "details": details}}))
                     setattr(self.business, tool, method)
                     preview = (await self.call(client, tool, **business)).structured_content
                     self.assertTrue(preview["confirmation_required"])
@@ -310,7 +386,8 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(result.structured_content["results"], {"applied": tool})
                         self.assertEqual(result.structured_content["replayed"], replayed)
                     self.assertEqual(method.call_count, 2)
-                    method.assert_called_with(**business, confirm=True, confirmation_id=token)
+                    injected = {'expected_attachment': details['attachment']} if tool == 'attach_draft_attachment' else {}
+                    method.assert_called_with(**business, confirm=True, confirmation_id=token, **injected)
                     self.server.OutlookClient.reset_mock()
                     receipt = await self.call(client, tool, operation_id=operation_id)
                     self.assertEqual(receipt.structured_content["results"], {"applied": tool})
@@ -327,7 +404,7 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
             for exc, code, kind, status in cases:
                 with self.subTest(error=code):
                     self.business.send_draft.side_effect = lambda **kw: {
-                        "preview": {"items": [], "details": {}}}
+                        "preview": {"items": [], "details": {"canonical_draft_id": "d-"+code}}}
                     preview = (await self.call(client, draft_id="d")).structured_content
                     self.business.send_draft.reset_mock()
                     self.business.send_draft.side_effect = exc
@@ -412,8 +489,6 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
                 for exc, code, assurance in (
                     (self.server.IdentityResolutionError("OA unavailable"),
                      "IDENTITY_LOOKUP_FAILED", "oa_lookup_failed"),
-                    (self.server.IdentityNameMismatchError("name mismatch"),
-                     "IDENTITY_NAME_MISMATCH", "oa_name_mismatch"),
                 ):
                     with self.subTest(error=code):
                         self.server.resolve_identity_by_lanid.side_effect = exc
@@ -436,7 +511,7 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.is_error)
         self.assertEqual(result.structured_content["results"], {"ready": True})
         self.assertEqual(self.business.requester_lanid, "Employee")
-        self.server.resolve_identity_by_lanid.assert_called_once_with(" DOMAIN\\Employee ", "员工")
+        self.server.resolve_identity_by_lanid.assert_called_once_with(" DOMAIN\\Employee ")
 
     async def test_receipt_confirmation_and_terminal_replay_are_scoped(self):
         async with Client(self.server.mcp) as client:
@@ -640,6 +715,47 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AuditEntryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejected_availability_arguments_are_audited_without_coercion_or_defaults(self):
+        audit_logger = Mock()
+        server = load_server(audit_logger=audit_logger)
+        cases = [
+            ("legacy duration", {
+                **IDENTITY, **READ_ARGUMENTS["check_availability"], "duration": 30,
+            }),
+            ("interval string", {
+                **IDENTITY, **READ_ARGUMENTS["check_availability"], "interval_minutes": "30",
+            }),
+            ("unknown field", {
+                **IDENTITY, **READ_ARGUMENTS["check_availability"],
+                "unknown": {"enabled": True, "count": 2, "values": ["text", 3, None]},
+            }),
+            ("nested params", {
+                "params": {
+                    **IDENTITY, **READ_ARGUMENTS["check_availability"], "duration": 30,
+                },
+            }),
+            ("explicit null", {
+                **IDENTITY, **READ_ARGUMENTS["check_availability"], "interval_minutes": None,
+            }),
+        ]
+        with patch.dict(os.environ, {"EWS_MCP_DOWNLOAD_ENABLED": "false"}):
+            async with Client(server.mcp) as client:
+                for case, arguments in cases:
+                    with self.subTest(case=case):
+                        audit_logger.reset_mock()
+                        result = await client.call_tool("check_availability", arguments, raise_on_error=False)
+                        self.assertTrue(result.is_error)
+                        self.assertEqual(result.structured_content["error_code"], "INVALID_PARAMS")
+                        audit_logger.info.assert_called_once()
+                        event = json.loads(audit_logger.info.call_args.args[0])
+                        self.assertEqual(event["status"], "failure")
+                        self.assertEqual(event["error_code"], "INVALID_PARAMS")
+                        self.assertIn("input_arguments", event)
+                        self.assertEqual(event["input_arguments"], arguments)
+                        self.assertIn("input_summary", event)
+        server.resolve_identity_by_lanid.assert_not_called()
+        server.OutlookClient.assert_not_called()
+
     async def test_rejected_raw_arguments_reach_audit_hooks_without_business_execution(self):
         audit_logger = Mock()
         server = load_server(audit_logger=audit_logger)
@@ -674,6 +790,13 @@ class AuditEntryTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(event["identity_assurance"], "not_verified")
                         self.assertEqual(event["lanid"], arguments.get("lanid"))
                         self.assertEqual(event["name"], arguments.get("name"))
+                        self.assertIn("input_arguments", event)
+                        self.assertEqual(set(event["input_arguments"]), set(arguments))
+                        if "confirm_token" in arguments:
+                            self.assertNotEqual(event["input_arguments"]["confirm_token"], "SECRET_TOKEN")
+                        else:
+                            self.assertEqual(event["input_arguments"], arguments)
+                        self.assertIn("input_summary", event)
                         self.assertNotIn("SECRET_TOKEN", serialized)
         server.resolve_identity_by_lanid.assert_not_called()
         server.OutlookClient.assert_not_called()

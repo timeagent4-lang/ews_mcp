@@ -83,14 +83,14 @@ class DownloadHTTPTests(unittest.IsolatedAsyncioTestCase):
         from tool_specs import SPECS, READ_TOOLS
         self.assertIn("prepare_attachment_download", READ_TOOLS)
         validator = Draft202012Validator(SPECS["prepare_attachment_download"]["inputSchema"])
-        arguments = {"lanid": "test123", "name": "测试", "message_id": "m1", "attachment_id": "a1"}
+        arguments = {"lanid": "test123", "message_id": "m1", "attachment_id": "a1"}
         validator.validate(arguments)
         invalid = {
             "legacy_wrapper": {"params": arguments},
             "unknown_field": {**arguments, "save": True},
             "invalid_id_type": {**arguments, "attachment_id": 42},
         }
-        for field in ("lanid", "name", "message_id", "attachment_id"):
+        for field in ("lanid", "message_id", "attachment_id"):
             invalid[f"missing_{field}"] = {key: value for key, value in arguments.items() if key != field}
         for case, payload in invalid.items():
             with self.subTest(case=case), self.assertRaises(ValidationError):

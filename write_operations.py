@@ -1,10 +1,14 @@
 """Scoped draft and ordinary mail mutations for the OA-resolved employee."""
 
 import hashlib
+import io
+import json
 import re
+import uuid
+import warnings
 from html import escape as _html_escape
 
-from exchangelib import HTMLBody, Mailbox, Message
+from exchangelib import FileAttachment, HTMLBody, Mailbox, Message
 from exchangelib.items.base import MOVE_TO_DELETED_ITEMS, NEVER_OVERWRITE
 
 from tool_support import (
@@ -166,7 +170,7 @@ def _validate_html_fragment(fragment):
 
 
 def _missing_cid_refs(fragment, attachments):
-    """Inline images must already exist on the draft; uploads are unsupported."""
+    """References must match images already attached to this draft."""
     referenced = {
         match.group(1).strip().strip("<>").lower()
         for match in _CID_REF_RE.finditer(str(fragment or ""))
@@ -197,7 +201,7 @@ def _html_prepend_body(draft, fragment):
             "CID_ATTACHMENT_MISSING",
             "新增片段引用的内嵌图片在草稿现有附件中不存在："
             + ", ".join(sorted(missing))
-            + "；本次不提供图片上传，请改为引用草稿中已有内嵌图片的 ContentId，或不引用内嵌图片。",
+            + "；请先上传并确认 attach_draft_attachment，再引用成功回执中的 ContentId。",
         )
     return HTMLBody(_prepend_html(str(draft.body or ""), fragment))
 
@@ -245,6 +249,36 @@ def _item_state(item):
         "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
         "attachments": attachments,
     }
+
+
+def _draft_version(draft):
+    encoded = json.dumps(_item_state(draft), sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    return {'changekey': draft.changekey, 'snapshot_sha256': hashlib.sha256(encoded).hexdigest()}
+
+
+def _check_draft_version(draft, expected_version):
+    if not expected_version:
+        raise ToolOperationError('PREVIEW_VERSION_REQUIRED', '请重新预览草稿后再确认。')
+    if _draft_version(draft) != expected_version:
+        raise ToolOperationError('DRAFT_CHANGED', '草稿在预览后发生变化，本次未执行；请重新预览。')
+
+
+def _inline_type(data):
+    from PIL import Image
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data), formats=['PNG', 'JPEG']) as image:
+                if (image.width > 8192 or image.height > 8192 or image.width * image.height > 16000000
+                        or getattr(image, 'n_frames', 1) != 1):
+                    raise ValueError('image limit')
+                format_ = image.format
+                image.verify()
+            with Image.open(io.BytesIO(data), formats=['PNG', 'JPEG']) as image:
+                image.load()
+        return 'image/png' if format_ == 'PNG' else 'image/jpeg'
+    except Exception:
+        raise ToolOperationError('INVALID_INLINE_IMAGE', '内嵌图片须为完整的单帧 PNG/JPEG，最大1600万像素且单边不超过8192。') from None
 
 
 class WriteOperations:
@@ -453,6 +487,7 @@ class WriteOperations:
                 "body_preview": str(body or "")[:500],
             }],
             details={
+                "canonical_draft_id": draft.id,
                 "subject": subject,
                 "body_length": (len(body) if body is not None else None),
                 "body_action": action,
@@ -480,8 +515,68 @@ class WriteOperations:
                 ) from exc
         return {"id": draft.id, "changekey": draft.changekey, "updated": bool(updates), "folder": "drafts"}
 
-    def send_draft(self, draft_id, confirm=False, confirmation_id=None):
+    def attach_draft_attachment(self, draft_id, upload_id, is_inline=False, confirm=False,
+                                confirmation_id=None, expected_version=None, expected_attachment=None):
+        if type(is_inline) is not bool:
+            raise ToolOperationError('INVALID_PARAMS', 'is_inline 必须为布尔值。')
         draft = self._write_draft(draft_id)
+        if confirm:
+            _check_draft_version(draft, expected_version)
+            if not isinstance(expected_attachment, dict) or expected_attachment.get('is_inline') != is_inline:
+                raise ToolOperationError('PREVIEW_VERSION_REQUIRED', '附件预览不完整，请重新预览。')
+        uploads = self.attachment_uploads
+        expected = None
+        if confirm:
+            expected = {**expected_attachment, 'content_type': expected_attachment.get('stored_content_type')}
+        verified = uploads.open_verified(upload_id, lanid=self.requester_lanid, mailbox=self.config.email,
+            operation_id=getattr(self, 'attachment_operation_id', None) if confirm else None, expected=expected)
+        sizes = [getattr(a, 'size', None) for a in draft.attachments or []]
+        if any(type(size) is not int or size < 0 for size in sizes):
+            raise ToolOperationError('ATTACHMENT_SIZE_UNKNOWN', '现有附件大小不可确认，已拒绝附加。')
+        if (len(sizes) + 1 > uploads.settings.draft_max_attachments
+                or sum(sizes) + verified.metadata['size'] > uploads.settings.draft_max_bytes):
+            raise ToolOperationError('DRAFT_ATTACHMENT_LIMIT', '草稿附件数量或总大小超过上限。')
+        mime = _inline_type(verified.content) if is_inline else verified.metadata['content_type']
+        content_id = expected_attachment.get('content_id') if confirm else (uuid.uuid4().hex + '@ews-mcp' if is_inline else None)
+        if is_inline and (not content_id or any(str(getattr(a, 'content_id', '') or '').strip().strip('<>').lower() == content_id.lower()
+                                               for a in draft.attachments or [])):
+            raise ToolOperationError('CID_CONFLICT', '草稿已有相同 ContentId，请重新预览。')
+        metadata = {**verified.metadata, 'stored_content_type': verified.metadata['content_type'],
+                    'content_type': mime, 'is_inline': is_inline, 'content_id': content_id}
+        if confirm and metadata != expected_attachment:
+            raise ToolOperationError('UPLOAD_CHANGED', '附件元数据与预览不一致，请重新预览。')
+        preview = require_confirmation(mailbox=self.config.email, action='attach_draft_attachment',
+            items=[_item_state(draft)], details={'canonical_draft_id': draft.id, 'version': _draft_version(draft),
+                'requester_lanid': self.requester_lanid, 'attachment': metadata}, confirm=confirm, confirmation_id=confirmation_id)
+        if preview is not None:
+            return preview
+        attachment = FileAttachment(name=metadata['filename'], content=verified.content, size=metadata['size'],
+                                    content_type=mime, is_inline=is_inline, content_id=content_id)
+        try:
+            draft.attach(attachment)
+        except Exception as exc:
+            code, message, _ = classify_submission_failure(exc, action='附加草稿附件',
+                unknown_code='ATTACHMENT_FAILED_OR_UNKNOWN', rejected_code='ATTACHMENT_REJECTED')
+            raise ToolOperationError(code, message) from exc
+        try:
+            identifier = getattr(getattr(attachment, 'attachment_id', None), 'id', None)
+            if not identifier or not draft.changekey or draft.changekey == expected_version['changekey']:
+                raise ValueError('incomplete attachment result')
+            current = self._write_draft(draft.id)
+            actual = next((a for a in current.attachments or [] if getattr(getattr(a, 'attachment_id', None), 'id', None) == identifier), None)
+            if (actual is None or not current.changekey or actual.size != metadata['size']
+                    or bool(actual.is_inline) != is_inline or (is_inline and actual.content_id != content_id)):
+                raise ValueError('incomplete attachment metadata')
+            return {'draft_id': current.id, 'attachment_id': identifier, 'changekey': current.changekey,
+                    'filename': actual.name, 'size': metadata['size'], 'content_type': actual.content_type,
+                    'sha256': metadata['sha256'], 'is_inline': bool(actual.is_inline), 'content_id': actual.content_id}
+        except Exception:
+            raise ToolOperationError('ATTACHMENT_RECEIPT_INCOMPLETE', '附件可能已写入但回执不完整，请查询原操作号，勿重复附加。') from None
+
+    def send_draft(self, draft_id, confirm=False, confirmation_id=None, expected_version=None):
+        draft = self._write_draft(draft_id)
+        if confirm:
+            _check_draft_version(draft, expected_version)
         if _address(draft.author) != self.config.email.lower():
             raise ToolOperationError(
                 "DRAFT_AUTHOR_MISMATCH", "草稿发件人不是当前员工，请先更新草稿再重新预览。"
@@ -492,6 +587,7 @@ class WriteOperations:
             mailbox=self.config.email,
             action="send_draft",
             items=[_item_state(draft)],
+            details={'version': _draft_version(draft), 'canonical_draft_id': draft.id},
             confirm=confirm,
             confirmation_id=confirmation_id,
         )

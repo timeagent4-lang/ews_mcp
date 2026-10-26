@@ -47,7 +47,7 @@ class MCPHTTPAuthTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(mcp_server, "resolve_identity_by_lanid") as oa, \
                 patch.object(mcp_server, "OutlookClient") as outlook:
             response = await mcp_server.healthz(None)
-        self.assertEqual(response.body, b'{"status":"ok","service":"ews_mcp","tool_count":28}')
+        self.assertEqual(response.body, b'{"status":"ok","service":"ews_mcp","tool_count":30}')
         oa.assert_not_called()
         outlook.assert_not_called()
 

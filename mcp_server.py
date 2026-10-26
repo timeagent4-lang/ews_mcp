@@ -1,10 +1,14 @@
 """OA+DELEGATE server with persistent write confirmation and receipt replay."""
 
 import atexit
+import asyncio
 import logging
 import os
 import re
 import secrets
+import threading
+import time
+import uuid
 from datetime import datetime, timezone
 
 import mcp.types as mcp_types
@@ -20,8 +24,9 @@ from starlette.responses import JSONResponse
 
 load_dotenv()
 
-from config import OutlookConfig, data_dir, preview_ttl_seconds
-from attachment_downloads import download_lifespan, download_tool_result, register_download_route
+from config import OutlookConfig, UploadSettings, data_dir, preview_ttl_seconds
+from attachment_downloads import download_tool_result, register_download_route
+from attachment_uploads import AttachmentUploadStore, attachment_lifespan, register_upload_route, MAX_ATTACHMENTS_IN_FLIGHT
 from confirmation import (
     STATUS_COMPLETED,
     STATUS_EXECUTING,
@@ -43,7 +48,6 @@ from utils.audit import (
     install_tool_audit_fallback,
 )
 from utils.lanid_email import (
-    IdentityNameMismatchError,
     IdentityResolutionError,
     normalize_lanid,
     resolve_identity_by_lanid,
@@ -56,7 +60,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("EwsOutlookServer", lifespan=download_lifespan)
+mcp = FastMCP("EwsOutlookServer", lifespan=attachment_lifespan)
+_ATTACHMENT_SLOTS = threading.BoundedSemaphore(MAX_ATTACHMENTS_IN_FLIGHT)
+_DRAFT_WRITES = frozenset(('update_draft', 'send_draft', 'attach_draft_attachment'))
 tool_audit = ToolAuditMiddleware()
 mcp.add_middleware(tool_audit)
 install_tool_audit_fallback(mcp, tool_audit)
@@ -115,7 +121,11 @@ class ToolInputValidationMiddleware(Middleware):
 # Audit wraps validation so rejected calls also reach its result handling.
 mcp.add_middleware(ToolInputValidationMiddleware())
 
-_NON_FAILURE_STATUSES = frozenset(("pending", "confirmed", "executing"))
+_NON_FAILURE_STATUSES = frozenset(("pending", "confirmed", "executing", "processing"))
+SEND_RESPONSE_WAIT_SECONDS = 30
+# Retain dispatch tasks after the caller stops waiting. Their worker capacity and
+# receipt persistence remain active until the synchronous dispatch really ends.
+_SEND_DISPATCH_TASKS = set()
 
 
 def install_failure_envelope(fastmcp) -> None:
@@ -158,12 +168,9 @@ def _set_identity_assurance(ctx: Context, value: str) -> None:
 
 
 def _resolve_mailbox(params: dict, ctx: Context | None) -> str:
-    """OA-verify every request, including receipt-only calls without Exchange."""
+    """Resolve the LANID through OA on every call, including receipt queries."""
     try:
-        identity = resolve_identity_by_lanid(params.get("lanid"), params.get("name"))
-    except IdentityNameMismatchError:
-        _set_identity_assurance(ctx, "oa_name_mismatch")
-        raise
+        identity = resolve_identity_by_lanid(params.get("lanid"))
     except IdentityResolutionError:
         _set_identity_assurance(ctx, "oa_lookup_failed")
         raise
@@ -172,7 +179,7 @@ def _resolve_mailbox(params: dict, ctx: Context | None) -> str:
     mailbox = email.strip().lower() if isinstance(email, str) else ""
     if not mailbox or "@" not in mailbox:
         raise ValueError("缺少或无效的目标邮箱")
-    _set_identity_assurance(ctx, "oa_name_match")
+    _set_identity_assurance(ctx, "oa_lanid_resolved")
     return mailbox
 
 
@@ -257,8 +264,6 @@ def _normalized_code(error_code: str) -> str:
 def _classify_exception(exc: Exception):
     """Return (code, kind, message), retaining raw Exchange ResponseCodes."""
     name = exc.__class__.__name__
-    if isinstance(exc, IdentityNameMismatchError):
-        return "IDENTITY_NAME_MISMATCH", "identity", sanitize(str(exc))
     if isinstance(exc, IdentityResolutionError):
         return "IDENTITY_LOOKUP_FAILED", "identity", sanitize(str(exc))
     if isinstance(exc, ConfirmationError):
@@ -378,11 +383,29 @@ def _wrap_batch(tool_name: str, result: dict) -> ToolResult:
 
 def _invoke_read(tool_name: str, params: dict, ctx: Context) -> ToolResult:
     try:
+        if tool_name == 'prepare_attachment_upload':
+            mailbox = _resolve_mailbox(params, ctx)
+            uploads = _uploads(get_store())
+            result = uploads.prepare(lanid=requester_lanid(params), mailbox=mailbox, **_business(params))
+            return download_tool_result(result)
         client = initialize_outlook_client(params, ctx)
         result = getattr(client, tool_name)(**_business(params))
         return _wrap_read_result(tool_name, result)
     except Exception as exc:
         return _tool_failure(tool_name, exc=exc)
+
+
+def _uploads(store):
+    try:
+        return AttachmentUploadStore(UploadSettings.from_env(), store)
+    except ValueError:
+        raise ToolOperationError('UPLOAD_CONFIG_INVALID', '附件上传配置无效，请联系管理员。') from None
+
+
+def _require_upload_owner(tool_name, record, lanid):
+    if tool_name == 'attach_draft_attachment' and record is not None:
+        if (record.get('details') or {}).get('requester_lanid') != lanid:
+            raise ToolOperationError('OPERATION_SCOPE_MISMATCH', '该上传操作不属于当前员工。')
 
 
 def _require_record_scope(tool_name, mailbox, record):
@@ -425,6 +448,7 @@ def _verified_directory_target(record, params):
 
 def _receipt(tool_name: str, record, *, mailbox, lanid=None, replay=False) -> ToolResult:
     _require_record_scope(tool_name, mailbox, record)
+    _require_upload_owner(tool_name, record, lanid)
     _require_directory_read(record, lanid)
     status = record["status"]
     result = record["result"]
@@ -525,6 +549,7 @@ def _require_unexpired_preview(record):
 def _preview_replay(tool_name: str, record, *, mailbox, lanid=None) -> ToolResult:
     """Reuse the valid preview's token without executing the write."""
     _require_record_scope(tool_name, mailbox, record)
+    _require_upload_owner(tool_name, record, lanid)
     _require_directory_read(record, lanid)
     return ToolResult(
         content=f"{tool_name} 待确认（预览返回）",
@@ -563,6 +588,8 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
     confirm_token = params.get("confirm_token")
     idem = params.get("idempotency_key")
     business = _business(params)
+    if tool_name == 'attach_draft_attachment' and not (operation_id and not confirm_token):
+        business.setdefault('is_inline', False)
 
     if operation_id and not confirm_token:
         return _query_receipt(tool_name, operation_id, mailbox, lanid=lanid)
@@ -572,6 +599,9 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
         record = store.find_by_idempotency_key(idem, mailbox=mailbox)
         if record is not None:
             _require_record_scope(tool_name, mailbox, record)
+            _require_upload_owner(tool_name, record, lanid)
+            if tool_name == 'attach_draft_attachment' and business != record['business_params']:
+                raise ConfirmationError('CONFIRMATION_MISMATCH', '幂等键对应不同附件参数，请使用原操作参数。')
             status = record["status"]
             if status != STATUS_PENDING:
                 return _receipt(tool_name, record, mailbox=mailbox, lanid=lanid, replay=True)
@@ -582,6 +612,7 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
     if confirm_token:
         existing = store.get(operation_id)
         _require_record_scope(tool_name, mailbox, existing)
+        _require_upload_owner(tool_name, existing, lanid)
         if existing is not None and (
             not secrets.compare_digest(confirm_token.encode("utf-8"), existing["confirm_token"].encode("utf-8"))
             or business != existing["business_params"]
@@ -599,6 +630,7 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
         if existing is not None and _is_batch_result(existing["result"]):
             # Replaying an executed batch could duplicate successful items.
             return _receipt(tool_name, existing, mailbox=mailbox, lanid=lanid, replay=True)
+        execution = None
         try:
             _require_unexpired_preview(existing)
             # Verify target and rights before claiming; stale confirmations stay pending.
@@ -607,7 +639,11 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
             # Connection setup may cross the TTL; check again before execution.
             client = initialize_outlook_client(params, ctx, mailbox=mailbox)
             _require_unexpired_preview(existing)
-            store.begin_confirm(operation_id, confirm_token, business)
+            if tool_name in _DRAFT_WRITES:
+                execution = store.begin_draft_confirm(operation_id, confirm_token, business,
+                    mailbox=mailbox, lanid=lanid, worker_id=uuid.uuid4().hex)
+            else:
+                store.begin_confirm(operation_id, confirm_token, business)
         except (ConfirmationError, ToolOperationError) as exc:
             if isinstance(exc, ConfirmationError) and exc.code == "CONFIRMATION_NOT_EXECUTABLE":
                 current = store.get(operation_id)
@@ -620,27 +656,51 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
             if recorded_version is not None:
                 # Use the server snapshot to reject edits since preview.
                 execute["expected_version"] = recorded_version
+            if tool_name == 'attach_draft_attachment':
+                client.attachment_uploads = _uploads(store)
+                client.attachment_operation_id = operation_id
+                execute['expected_attachment'] = (existing.get('details') or {}).get('attachment')
             if verified_target is not None:
                 # Reuse the verified target to avoid a second, conflicting resolution.
                 execute["directory_target"] = verified_target
-            result = getattr(client, tool_name)(**execute)
+            needs_slot = tool_name == 'attach_draft_attachment'
+            if needs_slot and not _ATTACHMENT_SLOTS.acquire(blocking=False):
+                raise ToolOperationError('UPLOAD_BUSY', '附件处理容量已满，请稍后用原操作确认。')
+            try:
+                result = getattr(client, tool_name)(**execute)
+            finally:
+                if needs_slot:
+                    _ATTACHMENT_SLOTS.release()
         except Exception as exc:
             # Ambiguous writes stay UNKNOWN and are never automatically retried.
             ambiguous = not is_definite_rejection(exc)
-            store.mark(
-                operation_id,
-                STATUS_UNKNOWN if ambiguous else STATUS_FAILED,
-                result=_failure_record(exc),
-            )
+            status = STATUS_UNKNOWN if ambiguous else STATUS_FAILED
+            try:
+                if execution:
+                    store.finish_draft_operation(execution, status, _failure_record(exc), definitely_not_applied=not ambiguous)
+                else:
+                    store.mark(operation_id, status, result=_failure_record(exc))
+            except Exception:
+                logger.error('write_receipt_persistence_failed tool=%s', tool_name)
+                return _tool_failure(tool_name, error_code='OPERATION_UNKNOWN', operation_id=operation_id)
             return _tool_failure(tool_name, exc=exc, operation_id=operation_id)
         # Keep post-write bookkeeping outside the submission exception handler:
         # a later failure must not make the write retryable.
         status, final_result = _classify_write_result(result)
-        store.mark(operation_id, status, result=final_result)
+        try:
+            if execution:
+                store.finish_draft_operation(execution, status, final_result)
+            else:
+                store.mark(operation_id, status, result=final_result)
+        except Exception:
+            logger.error('write_receipt_persistence_failed tool=%s', tool_name)
+            return _tool_failure(tool_name, error_code='OPERATION_UNKNOWN', operation_id=operation_id)
         return _receipt(tool_name, store.get(operation_id), mailbox=mailbox, lanid=lanid)
 
     # Preview handlers are read-only; persist their result for confirmation.
     client = initialize_outlook_client(params, ctx, mailbox=mailbox)
+    if tool_name == 'attach_draft_attachment':
+        client.attachment_uploads = _uploads(store)
     try:
         result = getattr(client, tool_name)(**business, confirm=False)
     except Exception as exc:
@@ -648,7 +708,7 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
     preview = result.get("preview") if isinstance(result, dict) else None
     items = preview.get("items") if isinstance(preview, dict) else None
     details = preview.get("details") if isinstance(preview, dict) else None
-    record = store.create_preview(
+    preview_args = dict(
         tool=tool_name,
         mailbox=mailbox,
         action=tool_name,
@@ -657,6 +717,13 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
         details=details,
         idempotency_key=idem,
     )
+    if tool_name == 'attach_draft_attachment':
+        for key in ('tool', 'action'):
+            preview_args.pop(key)
+        record = store.create_attachment_preview(**preview_args, upload_snapshot=details['attachment'],
+            canonical_draft_id=details['canonical_draft_id'], expires_at=time.time() + preview_ttl_seconds())
+    else:
+        record = store.create_preview(**preview_args)
     return ToolResult(
         content=f"{tool_name} 待确认",
         structured_content={
@@ -679,10 +746,56 @@ def _dispatch(tool_name: str, params: dict, ctx: Context) -> ToolResult:
         return _tool_failure(tool_name, exc=exc)
 
 
+def _send_dispatch_done(task):
+    _SEND_DISPATCH_TASKS.discard(task)
+    if not task.cancelled():
+        exc = task.exception()
+        if exc is not None:
+            logger.error("发送后台处理异常: error_type=%s", exc.__class__.__name__)
+
+
+def _send_wait_expired(params) -> ToolResult:
+    logger.warning("send_draft 等待达到上限，后台处理可能继续。")
+    operation_id = params.get("operation_id")
+    if not operation_id:
+        return _tool_failure(
+            "send_draft",
+            exc=ToolOperationError(
+                "RESPONSE_WAIT_TIMEOUT",
+                "预览等待超时，本次未执行发送。后台预览可能完成；请重新请求预览，"
+                "如已使用 idempotency_key，请沿用原值。",
+            ),
+        )
+    # This is request progress, not a receipt: OA or scope validation may still
+    # be pending. Never read stored data here using an unverified operation ID.
+    return ToolResult(
+        content="send_draft 处理中：等待已达到上限，请查询原操作号。",
+        structured_content={
+            "ok": False,
+            "status": "processing",
+            "operation_id": operation_id,
+            "results": None,
+            "wait_timed_out": True,
+            "note": "请求尚未取得最终结果，后台处理可能继续。请勿重新发送，仅用原操作号查询回执。",
+        },
+    )
+
+
 def _make_handler(tool_name):
     async def handler(ctx: Context = None, **params) -> ToolResult:
         # Keep synchronous OA/Exchange work off the loop; finish writes after cancellation.
-        return await to_thread.run_sync(_dispatch, tool_name, params, ctx)
+        if tool_name != "send_draft":
+            return await to_thread.run_sync(_dispatch, tool_name, params, ctx)
+        task = asyncio.create_task(to_thread.run_sync(_dispatch, tool_name, params, ctx))
+        _SEND_DISPATCH_TASKS.add(task)
+        task.add_done_callback(_send_dispatch_done)
+        try:
+            # Timeout the shielded wait, not the dispatch. Keeping its AnyIO
+            # limiter token also prevents timed-out sends from spawning extra
+            # active worker threads while earlier Exchange requests still run.
+            return await asyncio.wait_for(asyncio.shield(task), SEND_RESPONSE_WAIT_SECONDS)
+        except TimeoutError:
+            return _send_wait_expired(params)
 
     handler.__name__ = f"tool_{tool_name}"
     return handler
@@ -700,6 +813,7 @@ def _register_all():
 
 _register_all()
 register_download_route(mcp)
+register_upload_route(mcp)
 install_failure_envelope(mcp)
 
 

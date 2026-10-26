@@ -11,7 +11,8 @@ GET 下载读取这个缓存文件，不再访问 Exchange，不把文件内容�
 
 ```json
 {
-  "params": {
+  "name": "prepare_attachment_download",
+  "arguments": {
     "lanid": "员工LANID",
     "name": "员工姓名",
     "message_id": "邮件ID",
@@ -82,12 +83,12 @@ python -c "import secrets; print(secrets.token_hex(32))"
 首次上线请单独核对旧文件占用，避免把新缓存限额当成整个磁盘的占用上限。
 
 更改容器环境变量后重建容器，单纯 `docker restart` 不会更新环境变量。
-应用源码打包于镜像时需要重新构建镜像。重连 MCP 后工具总数为 28。
+应用源码打包于镜像时需要重新构建镜像。包含[附件上传](attachment-uploads.md)的当前版本，重连 MCP 后工具总数为 30。
 
 ## 凭证、过期与清理
 
 - 链接是 bearer 凭证，持有者可下载指定缓存文件；不宣称绑定 GET 请求者身份。
-- 签发链接前沿用现有 OA/邮箱/邮件/附件检查。OA 姓名匹配不替代外层调用者认证，
+- 签发链接前沿用现有 OA/邮箱/邮件/附件检查。OA 按 LANID 解析邮箱不替代外层调用者认证，
   现有平台/网关的授权边界必须保留。
 - 链接只含随机 ID、到期时间及签名，不含邮箱、磁盘路径或 Exchange 凭据。
 - 有效期内允许重复 GET；第一版重试从文件开头下载，不提供 Range 断点续传。

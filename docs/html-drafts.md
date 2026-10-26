@@ -1,6 +1,6 @@
 # HTML 草稿调用说明
 
-`create_draft` 可创建新邮件、回复、全部回复或转发草稿，不会发送邮件。所有工具的 `arguments` 都是平铺对象，每次必须提供 `lanid` 和与 OA 校验结果一致的中文姓名 `name`；不要再包一层 `params`。本文身份、邮箱和 ID 均为示例占位值。
+`create_draft` 可创建新邮件、回复、全部回复或转发草稿，不会发送邮件。所有工具的 `arguments` 都是平铺对象，每次必须提供 `lanid` 及工具所需业务参数；不要再包一层 `params`。邮箱仅来自 OA 按 LANID 查询的唯一结果，仍检查结果唯一性和邮箱有效性。`name` 仅为可选兼容字段，传入时忽略，不用于验证或授权。本文身份、邮箱和 ID 均为示例占位值。
 
 ## 正文与原邮件
 
@@ -13,7 +13,7 @@
 
 默认 `body_format="text"`，原有纯文本调用行为不变；写 HTML 时应显式传 `"html"`。正文上限为 **65,536 个字符**，标签及样式内容也计入。
 
-内联 CSS（`style="..."`）是邮件客户端兼容性建议，不是 CSS 白名单或所有样式均能显示的保证。当前没有图片上传接口，写入 `cid:` 不会自动创建附件，也不承诺新增片段可以复用原邮件中的 CID；原邮件的内嵌图片是否保留须由内网 Exchange 和 Outlook 验收。
+内联 CSS（`style="..."`）是邮件客户端兼容性建议，不是 CSS 白名单或所有样式均能显示的保证。写入 `cid:` 不会自动创建附件；新图片先按[附件上传流程](attachment-uploads.md)上传并确认附加，再使用成功回执的实际 `content_id` 更新正文。原邮件的内嵌图片是否保留须由内网 Exchange 和 Outlook 验收。
 
 ## 新建 HTML 草稿：预览
 
@@ -24,7 +24,6 @@
   "name": "create_draft",
   "arguments": {
     "lanid": "example_lanid",
-    "name": "示例姓名",
     "mode": "new",
     "subject": "项目进度",
     "body": "<!doctype html><html><body><p style=\"color:#1f4e79\">本周进度已更新。</p><table style=\"border-collapse:collapse\"><tr><td style=\"border:1px solid #999;padding:6px\">开发完成</td></tr></table></body></html>",
@@ -43,7 +42,6 @@
   "name": "create_draft",
   "arguments": {
     "lanid": "example_lanid",
-    "name": "示例姓名",
     "mode": "reply",
     "reply_to": "原邮件ID",
     "body": "<p style=\"color:#1f4e79\">已收到，请查看以下进度。</p><table style=\"border-collapse:collapse\"><tr><td style=\"border:1px solid #999;padding:6px\">开发完成</td></tr></table>",
@@ -65,7 +63,6 @@
   "name": "create_draft",
   "arguments": {
     "lanid": "example_lanid",
-    "name": "示例姓名",
     "mode": "reply",
     "reply_to": "原邮件ID",
     "body": "<p style=\"color:#1f4e79\">已收到，请查看以下进度。</p><table style=\"border-collapse:collapse\"><tr><td style=\"border:1px solid #999;padding:6px\">开发完成</td></tr></table>",
@@ -76,7 +73,7 @@
 }
 ```
 
-新建草稿或其他写工具也使用同样的确认方法。改正文或其他业务参数时重新预览。结果未知时，用同一工具仅传 `lanid`、`name`、原 `operation_id` 查询回执；不要盲目重新创建或重复发送。创建草稿与发送仍是不同操作，沿用已有发送开关和确认机制。
+新建草稿或其他写工具也使用同样的确认方法。改正文或其他业务参数时重新预览。结果未知时，用同一工具仅传 `lanid`、原 `operation_id` 查询回执；不要盲目重新创建或重复发送。创建草稿与发送仍是不同操作，沿用已有发送开关和确认机制。
 
 ## 已有草稿的 HTML 前置规则
 

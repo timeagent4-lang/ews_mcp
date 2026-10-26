@@ -1,4 +1,4 @@
-"""通过 OA/ESB 联系人接口校验请求者姓名并解析邮箱。"""
+"""通过 OA/ESB 联系人接口按 LANID 解析邮箱。"""
 
 import itertools
 import json
@@ -59,15 +59,9 @@ class IdentityResolutionError(PermissionError):
     """LANID 无法唯一解析为有效邮箱。"""
 
 
-class IdentityNameMismatchError(IdentityResolutionError):
-    """显式姓名与 OA 联系人姓名不一致。"""
-
-
 @dataclass(frozen=True)
 class ResolvedIdentity:
     lanid: str
-    requested_name: str
-    oa_name: str
     email: str
 
 
@@ -204,32 +198,10 @@ def _normalize_email(value: object) -> str:
     return email
 
 
-def _normalize_expected_name(value: object) -> str:
-    if not isinstance(value, str):
-        raise IdentityNameMismatchError("请求者姓名无效")
-    normalized = value.strip()
-    if not normalized:
-        raise IdentityNameMismatchError("请求者姓名无效")
-    return normalized
-
-
-def _normalize_oa_name(value: object) -> str:
-    if not isinstance(value, str):
-        raise IdentityNameMismatchError("OA 联系人姓名无效")
-    normalized = value.strip()
-    if not normalized:
-        raise IdentityNameMismatchError("OA 联系人姓名无效")
-    return normalized
-
-
-def resolve_identity_by_lanid(
-    lanid: str,
-    expected_name: str,
-) -> ResolvedIdentity:
-    """按 LANID 查唯一联系人，并校验姓名与邮箱。"""
+def resolve_identity_by_lanid(lanid: str) -> ResolvedIdentity:
+    """按 LANID 查唯一联系人，并返回有效邮箱。"""
 
     normalized_lanid = normalize_lanid(lanid)
-    normalized_expected_name = _normalize_expected_name(expected_name)
     settings = _load_settings()
     url = settings["OA_BASE_URL"].rstrip("/") + settings["OA_PATH"]
     request_body = _build_request_body(normalized_lanid, settings)
@@ -263,13 +235,7 @@ def resolve_identity_by_lanid(
     if not isinstance(contact, dict):
         raise IdentityResolutionError("LANID 未对应有效联系人")
 
-    oa_name = _normalize_oa_name(contact.get("ChinNm1"))
-    if oa_name != normalized_expected_name:
-        raise IdentityNameMismatchError("请求者姓名与 OA 联系人不一致")
-
     return ResolvedIdentity(
         lanid=normalized_lanid,
-        requested_name=normalized_expected_name,
-        oa_name=oa_name,
         email=_normalize_email(contact.get("EmailAdr")),
     )

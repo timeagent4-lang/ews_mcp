@@ -72,6 +72,7 @@ def _attachment_info(value):
         "content_type": value.content_type,
         "kind": "item" if isinstance(value, ItemAttachment) else "file",
         "is_inline": value.is_inline,
+        "content_id": value.content_id,
     }
 
 

@@ -2,6 +2,8 @@
 
 import json
 import logging
+import math
+import re
 import sys
 import time
 import uuid
@@ -19,6 +21,89 @@ _UNICODE_LINE_SEPARATOR_ESCAPES = {
     0x2029: "\\u2029",
 }
 _AUDIT_EMITTED = ContextVar("mail_mcp.audit_emitted", default=False)
+_MAX_INPUT_BYTES = 16384
+_PRIVATE_FIELDS = frozenset({
+    "subject", "body", "message", "internalreply", "externalreply", "content",
+    "contentbytes", "contentbase64", "base64", "attachmentdata", "attachment", "attachments",
+    "filename", "path", "filepath", "localpath", "serverpath", "savedpath",
+})
+_SECRET_PARTS = (
+    "password", "passwd", "secret", "token", "apikey", "accesskey",
+    "authorization", "cookie", "credential", "privatekey", "idempotencykey", "signature",
+)
+_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_BEARER_RE = re.compile(r"\bbearer\s+[^\s,;]+", re.IGNORECASE)
+
+
+def _json_type(value):
+    if value is None:
+        return "null"
+    for kind, name in ((bool, "boolean"), (str, "string"), (dict, "object"),
+                       (list, "array"), (int, "integer"), (float, "number")):
+        if isinstance(value, kind):
+            return name
+    return type(value).__name__
+
+
+def _snapshot_arguments(arguments):
+    """Capture bounded, redacted input before validation or downstream mutation."""
+    nodes_left = 400
+
+    def text(value):
+        value = _URL_RE.sub("<redacted-url>", value)
+        value = _BEARER_RE.sub("Bearer <redacted>", value)
+        return value if len(value) <= 512 else value[:512] + "<truncated>"
+
+    def visit(value, field="", depth=0):
+        nonlocal nodes_left
+        normalized = re.sub(r"[^a-z0-9]", "", field.lower())
+        if value is not None and (
+            normalized in _PRIVATE_FIELDS or normalized in {"key", "pwd", "sig"}
+            or any(part in normalized for part in _SECRET_PARTS)
+        ):
+            metadata = {"redacted": True, "type": _json_type(value)}
+            if isinstance(value, (str, list, dict)):
+                metadata["length"] = len(value)
+            return metadata
+        nodes_left -= 1
+        if nodes_left < 0 or depth > 6:
+            return {"truncated": True, "type": _json_type(value)}
+        if isinstance(value, dict):
+            result = {}
+            for index, (key, item) in enumerate(value.items()):
+                if index >= 100:
+                    result["<truncated>"] = {"remaining_fields": len(value) - index}
+                    break
+                key = key if isinstance(key, str) else "<non-string-key>"
+                result[text(key)] = visit(item, key, depth + 1)
+            return result
+        if isinstance(value, list):
+            result = [visit(item, depth=depth + 1) for item in value[:100]]
+            if len(value) > 100:
+                result.append({"truncated": True, "remaining_items": len(value) - 100})
+            return result
+        if isinstance(value, str):
+            return text(value)
+        if value is None or isinstance(value, (bool, int)):
+            return value
+        if isinstance(value, float) and math.isfinite(value):
+            return value
+        return {"type": _json_type(value)}
+
+    snapshot = visit(arguments)
+    serialized = _single_line_json(snapshot).encode("utf-8")
+    if len(serialized) <= _MAX_INPUT_BYTES:
+        return snapshot
+    bounded = {
+        "truncated": True,
+        "preview": serialized[:_MAX_INPUT_BYTES // 4].decode("utf-8", errors="ignore"),
+    }
+    if isinstance(snapshot, dict):
+        bounded.update({
+            key: snapshot[key] for key in ("lanid", "name")
+            if isinstance(snapshot.get(key), str)
+        })
+    return bounded
 
 
 def _params_dict(arguments):
@@ -30,6 +115,8 @@ def _safe_string(value):
 
 
 def _text_length(value):
+    if isinstance(value, dict) and value.get("redacted"):
+        return value.get("length")
     return len(value) if isinstance(value, str) else None
 
 
@@ -43,6 +130,7 @@ def summarize_arguments(tool_name, arguments):
     params = _params_dict(arguments)
     requester = {
         "lanid": _safe_string(params.get("lanid")),
+        # Optional legacy caller label; OA resolution verifies only the LANID.
         "name": _safe_string(params.get("name")),
     }
     if tool_name == "summary_yesterday":
@@ -89,7 +177,9 @@ def _single_line_json(record):
         record,
         ensure_ascii=False,
         separators=(",", ":"),
-    ).translate(_UNICODE_LINE_SEPARATOR_ESCAPES)
+    ).translate(_UNICODE_LINE_SEPARATOR_ESCAPES).encode(
+        "utf-8", errors="backslashreplace",
+    ).decode("utf-8")
 
 
 def _classify_result(result):
@@ -98,7 +188,14 @@ def _classify_result(result):
     if structured is None:
         structured = getattr(root, "structuredContent", None)
 
-    if isinstance(structured, dict) and structured.get("ok") is False:
+    if (
+        isinstance(structured, dict)
+        and structured.get("status") == "processing"
+        and structured.get("wait_timed_out") is True
+    ):
+        status = "processing"
+        error_code = None
+    elif isinstance(structured, dict) and structured.get("ok") is False:
         error_code = structured.get("error_code")
         status = (
             "rejected"
@@ -147,6 +244,7 @@ def _emit_audit_record(
         "error_code": error_code,
         "duration_ms": round((time.perf_counter() - started) * 1000),
         "input_summary": input_summary,
+        "input_arguments": arguments,
     }
     if result_count is not None:
         record["result_count"] = result_count
@@ -162,7 +260,7 @@ class ToolAuditMiddleware(Middleware):
         started_at = datetime.now(timezone.utc)
         started = time.perf_counter()
         tool_name = context.message.name
-        arguments = context.message.arguments or {}
+        arguments = _snapshot_arguments(context.message.arguments)
         fastmcp_context = context.fastmcp_context
         if fastmcp_context is not None:
             fastmcp_context.set_state(
@@ -218,6 +316,7 @@ def install_tool_audit_fallback(fastmcp, middleware):
         event_id = str(uuid.uuid4())
         started_at = datetime.now(timezone.utc)
         started = time.perf_counter()
+        arguments = _snapshot_arguments(request.params.arguments)
         result = None
         raised = False
         try:
@@ -240,7 +339,7 @@ def install_tool_audit_fallback(fastmcp, middleware):
                     _emit_audit_record(
                         middleware.logger,
                         tool_name=request.params.name,
-                        arguments=request.params.arguments or {},
+                        arguments=arguments,
                         assurance="not_verified",
                         status=status,
                         error_code=error_code,

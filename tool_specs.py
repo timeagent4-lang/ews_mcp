@@ -56,6 +56,7 @@ _READ_TOOLS = frozenset(
         "get_thread",
         "get_attachment",
         "prepare_attachment_download",
+        "prepare_attachment_upload",
         "get_mailbox_overview",
         "list_events",
         "get_event",
@@ -135,6 +136,12 @@ TOOLS: dict[str, list[dict]] = {
         _s("message_id", "string", "Scoped message ID owning the attachment.", required=True),
         _s("attachment_id", "string", "Exact attachment ID returned for this message; required.", required=True),
     ],
+    "prepare_attachment_upload": [
+        _s("filename", "string", "File name; path components are removed. Bytes are uploaded by the executor, never passed in MCP.", required=True, min_length=1),
+        _s("size", "integer", "Exact file length in bytes, including zero-byte files; server configuration determines the upper limit.", required=True, minimum=0),
+        _s("sha256", "string", "SHA-256 of the exact bytes, 64 hexadecimal characters.", required=True, min_length=64, max_length=64),
+        _s("content_type", "string", "Optional MIME type; inline images are independently decoded and verified.", default=None, min_length=1, max_length=255),
+    ],
     "get_mailbox_overview": [
         _s("limit", "integer", "Recent-unread cap.", default=5, minimum=1, maximum=100),
     ],
@@ -143,7 +150,7 @@ TOOLS: dict[str, list[dict]] = {
         _s("mode", "string", "Draft mode; reply/reply_all/forward require reply_to; new forbids reply_to.", default="new", enum=["new", "reply", "reply_all", "forward"]),
         _s("subject", "string", "Subject; omitted for reply/forward uses RE:/FW: prefix.", default=""),
         _s("body", "string", "With mode=reply/reply_all/forward this is only your new content: plain text by default, or an HTML fragment with body_format=html (no html/head/body/doctype). Empty content is allowed. Exchange appends the quoted original natively, so do not paste the original back and do not pass a cleaned plain-text copy of it. With mode=new it is the complete body of the new message.", default="", max_length=65536),
-        _s("body_format", "string", "How to read body. text (default) submits plain text and keeps the quoted original's body type. html submits body verbatim: mode=new accepts a complete HTML body or fragment; reply/reply_all/forward accept only the new HTML fragment through EWS NewBodyContent, and Exchange includes the quoted original in HTML. Inline CSS is recommended for email compatibility; final rendering depends on the email client. No image upload is provided and cid: references do not create attachments.", default="text", enum=["text", "html"]),
+        _s("body_format", "string", "How to read body. text (default) submits plain text and keeps the quoted original's body type. html submits body verbatim: mode=new accepts a complete HTML body or fragment; reply/reply_all/forward accept only the new HTML fragment through EWS NewBodyContent, and Exchange includes the quoted original in HTML. Inline CSS is recommended for email compatibility; final rendering depends on the email client. cid: references do not create attachments; upload and confirm attach_draft_attachment first, then use its actual content_id.", default="text", enum=["text", "html"]),
         _s("to_emails", "string", "To recipients, ; separated.", default=""),
         _s("cc_emails", "string", "Cc recipients, ; separated.", default=""),
         _s("bcc_emails", "string", "Bcc recipients, ; separated.", default=""),
@@ -154,7 +161,7 @@ TOOLS: dict[str, list[dict]] = {
         _s("draft_id", "string", "Scoped draft ID.", required=True),
         _s("subject", "string", "New subject; omit to leave unchanged.", default=None),
         _s("body", "string", "Body content, read according to body_action and body_format. Omit it to leave the body untouched, which is what you want when changing only recipients or subject; supplying body_format or body_action without body is rejected rather than ignored. With prepend+html this is an HTML fragment only (e.g. <p>, <table>); a full document containing html/head/body/doctype is refused, not trimmed.", default=None, max_length=65536),
-        _s("body_format", "string", "How to read body. With body_action=replace (default): text submits plain text keeping the draft's body type, html submits body verbatim as the complete replacement body so tables and inline style= render. With body_action=prepend: text (default) adds escaped plain text, html adds a raw HTML fragment at the start of the existing body -- fragment only, the draft must already be HTML, and any cid: image it references must match an existing attachment (no image upload).", default=None, enum=["text", "html"]),
+        _s("body_format", "string", "How to read body. With body_action=replace (default): text submits plain text keeping the draft's body type, html submits body verbatim as the complete replacement body so tables and inline style= render. With body_action=prepend: text (default) adds escaped plain text, html adds a raw HTML fragment at the start of the existing body -- fragment only, the draft must already be HTML, and any cid: image it references must match an existing attachment. Confirm attach_draft_attachment before referencing a new image.", default=None, enum=["text", "html"]),
         _s("body_action", "string", "replace (default) makes body the whole new body, including any quoted original. prepend treats body as one new piece inserted at the start of the server-read existing body, keeping that body's tables, styles, quoted mail and inline images, so the original is never resubmitted. prepend takes plain text, or an HTML fragment with body_format=html.", default=None, enum=["replace", "prepend"]),
         _s("to_emails", "string", "New to recipients; omit to leave unchanged.", default=None),
         _s("cc_emails", "string", "New cc recipients; omit to leave unchanged.", default=None),
@@ -165,6 +172,11 @@ TOOLS: dict[str, list[dict]] = {
     ],
     "send_draft": [
         _s("draft_id", "string", "Scoped draft ID to send.", required=True),
+    ],
+    "attach_draft_attachment": [
+        _s("draft_id", "string", "Existing ordinary employee draft to attach to.", required=True),
+        _s("upload_id", "string", "Temporary upload identifier returned by prepare_attachment_upload after successful HTTP PUT; this is not an EWS item ID.", required=True, min_length=32, max_length=32),
+        _s("is_inline", "boolean", "True for a verified single-frame PNG/JPEG CID image; use the successful receipt's content_id in HTML.", default=False),
     ],
     "set_message_flag": [
         _s("message_id", "string", "Scoped message ID to flag.", required=True),
@@ -308,6 +320,8 @@ TOOLS: dict[str, list[dict]] = {
 }
 
 DESCRIPTIONS = {
+    "prepare_attachment_upload": "Authorize a local temporary upload after OA resolution without connecting Exchange. Returns upload_id, upload_url, upload_token, upload_expires_at and limits. The executor sends the original bytes with HTTP PUT and Authorization: Bearer upload_token, using exact Content-Length. Treat the token as a private temporary credential. Ready files are immutable; repeated PUT returns 409. Then preview/confirm attach_draft_attachment. No Base64, URL fetching or server paths.",
+    "attach_draft_attachment": "Add one completed upload to an existing ordinary employee draft after preview and confirmation; preserves body, recipients and existing attachments. The upload belongs to its OA LANID/mailbox and is consumed by one logical operation. Inline supports verified single-frame PNG/JPEG and a stable server-generated CID; update HTML using the successful content_id, then obtain a fresh send_draft preview showing the final message. Stale draft/file versions are rejected. Unknown outcomes must only query the original receipt; never attach again automatically. Receipt queries do not require the cached upload to exist.",
     "list_folders": "Report which folders this employee can access, with each one's item and unread counts; an inaccessible folder is reported in coverage, it does not block the others.",
     "find_message": "Search one authorized employee mail folder: query matches subject text and supports structured filters; aqs is exclusive with nonempty query and structured filters. This does not search the service account mailbox; not finding a meeting notice in employee Sent does not establish delivery failure.",
     "get_message": "Read one scoped message with paginated body and attachment inventory; clean_body defaults to false, so HTML is preserved unless explicitly cleaned; stale IDs require a new search.",
@@ -318,7 +332,7 @@ DESCRIPTIONS = {
     "create_draft": "Create a new draft or native EWS reply/reply_all/forward draft without sending; use an original message ID, not a consumed draft ID. body_format=html accepts the full body for a new message, or only a new HTML fragment for reply/forward; Exchange supplies the quoted original. Plain text remains the default and preserves an HTML original's body type.",
     "update_draft": "Update supplied draft fields and align the draft author with the OA employee when needed; empty values clear supported fields. body_action=replace (default) makes body the whole new body, including any quoted original. body_action=prepend adds body as one new piece of content at the start of the server-read existing body, keeping that body's tables, styles, quoted mail and inline images, so the original is never resubmitted; prepend takes plain text, or an HTML fragment with body_format=html when the draft is already HTML (fragment only, no html/head/body, and any cid: image it references must already exist on the draft). To change only recipients or subject, omit body (and do not pass body_format/body_action). The preview snapshots the draft version, confirm refuses a draft that was edited since preview, and the save itself uses EWS conflict detection.",
     "delete_draft": "Move one draft to DeletedItems; requires DeletedItems access; never permanently deletes or falls back to hard delete.",
-    "send_draft": "Send one existing employee draft and save a copy in employee Sent; source draft ID is consumed, not a sent/received ID; no auto resend; idempotency_key persists across restarts.",
+    "send_draft": "Send one existing employee draft and save a copy in employee Sent; source draft ID is consumed, not a sent/received ID; no auto resend; idempotency_key persists across restarts. Each call waits at most 30 seconds. status=processing with wait_timed_out=true means no final result yet, not proof of submission or success; background processing may continue. Query with lanid and the original operation_id only, without confirm_token or business fields; do not resend. A preview without operation_id returns RESPONSE_WAIT_TIMEOUT instead and never sends mail.",
     "update_messages": "Update read status/categories of ordinary mail only; meeting request/cancellation objects are rejected per item.",
     "set_message_flag": "Set the Outlook follow-up flag (flagged/complete/clear) on one ordinary message; meeting request/cancellation objects are rejected.",
     "list_flagged_messages": "List items with open or completed follow-up flags in one authorized mail folder, open flags by default; status=all includes both states and excludes unflagged items.",
@@ -348,6 +362,8 @@ for _name in ("create_event", "update_event", "cancel_event"):
         "a missing copy alone does not establish sending failure or justify resending."
     )
 
+DESCRIPTIONS['send_draft'] += ' The preview snapshots the draft; confirmation rejects observed changes to body, recipients or attachments and requires a fresh preview.'
+
 # Deletion is disabled by policy; the service lacks mailbox-level OOF permission.
 DISABLED_TOOLS = frozenset(
     {
@@ -359,7 +375,7 @@ DISABLED_TOOLS = frozenset(
 )
 
 TOOL_NAMES = [name for name in TOOLS if name not in DISABLED_TOOLS]
-assert len(TOOL_NAMES) == 28, f"expected 28 registered tools, got {len(TOOL_NAMES)}"
+assert len(TOOL_NAMES) == 30, f"expected 30 registered tools, got {len(TOOL_NAMES)}"
 
 READ_TOOLS = frozenset(_READ_TOOLS) & frozenset(TOOL_NAMES)
 
@@ -424,23 +440,23 @@ def public_tools():
         params = dict(business_schema)
         params["properties"]["lanid"] = {
             "type": "string", "minLength": 1, "maxLength": 128,
-            "description": "Requester LANID; verified against OA on every call.",
+            "description": "Requester LANID; resolves to a unique OA mailbox on every call.",
         }
         params["properties"]["name"] = {
-            "type": "string", "minLength": 1, "maxLength": 128,
-            "description": "Requester Chinese name; must match the OA ChinNm.",
+            "type": "string", "maxLength": 128,
+            "description": "Optional legacy caller label; ignored for identity resolution and authorization.",
         }
-        params["required"] = ["lanid", "name"] + [
+        params["required"] = ["lanid"] + [
             f for f in business_required if f not in ("lanid", "name")
         ]
 
         description = (
             DESCRIPTIONS[name]
-            + " OA verification is required on every call; the target mailbox comes only from OA."
+            + " Every call resolves the target mailbox only through an OA lookup by lanid; name is optional and is not checked."
         )
 
         if name not in _READ_TOOLS:
-            params["required"] = ["lanid", "name"]
+            params["required"] = ["lanid"]
             params["properties"].update(
                 {
                     "confirm_token": {
@@ -529,4 +545,4 @@ def public_tools():
 
 
 SPECS = {tool["name"]: tool for tool in public_tools()}
-assert len(SPECS) == 28
+assert len(SPECS) == 30

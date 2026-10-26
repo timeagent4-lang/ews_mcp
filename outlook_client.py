@@ -47,7 +47,7 @@ class OutlookClient(
 ):
     """使用固定服务凭据访问当前请求者邮箱的 Exchange 客户端。
 
-    聚合扩展的 28 工具能力: mail read / draft+mail writes / calendar /
+    聚合 Exchange 工具能力: mail read / draft+mail writes / calendar /
     people/(GAL+contacts) / tasks / availability / oof / status。
     账户初始化与既有读写方法保持不变。
     """

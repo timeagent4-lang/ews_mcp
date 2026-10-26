@@ -88,6 +88,63 @@ def downloads_enabled() -> bool:
     return _flag("EWS_MCP_DOWNLOAD_ENABLED")
 
 
+def uploads_enabled() -> bool:
+    return _flag("EWS_MCP_UPLOAD_ENABLED")
+
+
+@dataclass(frozen=True)
+class UploadSettings:
+    root: str
+    enabled: bool = False
+    base_url: str = ""
+    ttl_seconds: int = 600
+    retention_seconds: int = 86400
+    max_bytes: int = 10 * 1024 * 1024
+    max_cache_bytes: int = 1024 * 1024 * 1024
+    max_files: int = 1000
+    cleanup_seconds: int = 300
+    draft_max_bytes: int = 20 * 1024 * 1024
+    draft_max_attachments: int = 20
+    preview_ttl_seconds: int = 1800
+
+    def __post_init__(self):
+        if not os.path.isabs(self.root):
+            raise ValueError("EWS_MCP_DATA_DIR 必须是绝对路径")
+        for key in ("ttl_seconds", "retention_seconds", "max_bytes", "max_cache_bytes",
+                    "max_files", "cleanup_seconds", "draft_max_bytes", "draft_max_attachments"):
+            if type(getattr(self, key)) is not int or getattr(self, key) <= 0:
+                raise ValueError("附件上传配置必须是正整数")
+        if self.max_bytes > self.max_cache_bytes or self.max_bytes > self.draft_max_bytes:
+            raise ValueError("单文件上限不得超过缓存或草稿附件总上限")
+        if self.enabled:
+            url = urlsplit(self.base_url)
+            if (url.scheme not in ("http", "https") or not url.hostname or url.username is not None
+                    or url.password is not None or url.query or url.fragment
+                    or any(c.isspace() or ord(c) < 32 for c in self.base_url)):
+                raise ValueError("EWS_MCP_PUBLIC_BASE_URL 无效")
+            _ = url.port
+            if type(self.preview_ttl_seconds) is not int or self.preview_ttl_seconds <= 0:
+                raise ValueError("启用上传需要正的预览有效期")
+
+    @classmethod
+    def from_env(cls):
+        defaults = cls(root=data_dir())
+        values = {}
+        for field_name, suffix in (
+            ("ttl_seconds", "TTL_SECONDS"), ("retention_seconds", "RETENTION_SECONDS"),
+            ("max_bytes", "MAX_BYTES"), ("max_cache_bytes", "CACHE_MAX_BYTES"),
+            ("max_files", "CACHE_MAX_FILES"), ("cleanup_seconds", "CLEANUP_SECONDS"),
+            ("draft_max_bytes", "DRAFT_MAX_BYTES"), ("draft_max_attachments", "DRAFT_MAX_ATTACHMENTS"),
+        ):
+            try:
+                values[field_name] = int(os.getenv("EWS_MCP_UPLOAD_" + suffix, str(getattr(defaults, field_name))))
+            except ValueError:
+                raise ValueError("附件上传配置必须是正整数") from None
+        return cls(root=data_dir(), enabled=uploads_enabled(),
+                   base_url=os.getenv("EWS_MCP_PUBLIC_BASE_URL", "").strip().rstrip("/"),
+                   preview_ttl_seconds=preview_ttl_seconds(), **values)
+
+
 @dataclass(frozen=True)
 class DownloadSettings:
     root: str
