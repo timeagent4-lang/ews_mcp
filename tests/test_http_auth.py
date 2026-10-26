@@ -56,6 +56,7 @@ class MCPStartupTests(unittest.TestCase):
     def test_missing_key_refuses_startup(self):
         with patch.dict(mcp_server.os.environ, {"EWS_MCP_API_KEY": " "}), \
                 patch.object(mcp_server, "configure_store"), \
+                patch.object(mcp_server, "configure_logging"), \
                 patch.object(mcp_server, "data_dir", return_value="fixture"), \
                 patch.object(mcp_server.atexit, "register"), \
                 patch.object(mcp_server.mcp, "run") as run:
@@ -67,6 +68,7 @@ class MCPStartupTests(unittest.TestCase):
         with patch.dict(mcp_server.os.environ, {"EWS_MCP_API_KEY": "fixture-key",
                          "EWS_MCP_HOST": "127.0.0.1", "EWS_MCP_PORT": "7805"}), \
                 patch.object(mcp_server, "configure_store", return_value=Mock()), \
+                patch.object(mcp_server, "configure_logging") as logging_setup, \
                 patch.object(mcp_server, "data_dir", return_value="fixture"), \
                 patch.object(mcp_server.atexit, "register"), \
                 patch.object(mcp_server.mcp, "run") as run:
@@ -74,7 +76,8 @@ class MCPStartupTests(unittest.TestCase):
         kwargs = run.call_args.kwargs
         self.assertEqual(kwargs["transport"], "streamable-http")
         self.assertEqual(kwargs["path"], "/mcp")
-        self.assertEqual(kwargs["uvicorn_config"], {"access_log": False})
+        self.assertEqual(kwargs["uvicorn_config"], {"access_log": False, "log_config": None})
+        logging_setup.assert_called_once()
         auth = kwargs["middleware"][0]
         self.assertIsInstance(auth, Middleware)
         self.assertIs(auth.cls, mcp_server.MCPKeyAuthMiddleware)

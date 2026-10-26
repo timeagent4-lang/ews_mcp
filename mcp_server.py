@@ -52,6 +52,7 @@ from utils.lanid_email import (
     normalize_lanid,
     resolve_identity_by_lanid,
 )
+from utils.logging_config import configure_logging
 
 logging.basicConfig(
     level=logging.INFO,
@@ -235,11 +236,14 @@ def _log_tool_error(tool_name: str, exc: Exception, error_kind: str = None) -> N
             "%s 执行失败(程序异常): error_type=%s", tool_name, exc.__class__.__name__
         )
         return
+    cause = _exchange_cause(exc)
     logger.error(
-        "%s 执行失败: error_type=%s detail=%s",
+        "%s 执行失败: error_code=%s error_type=%s exchange_code=%s detail=%s",
         tool_name,
+        getattr(exc, 'code', exc.__class__.__name__),
         exc.__class__.__name__,
-        sanitize(str(exc), 200),
+        cause.__class__.__name__ if cause is not None else None,
+        sanitize(str(cause if cause is not None else exc), 200),
     )
 
 
@@ -853,6 +857,7 @@ class MCPKeyAuthMiddleware:
 
 
 def main():
+    configure_logging(os.getenv('EWS_MCP_LOG_DIR', '').strip() or os.path.join(data_dir(), 'logs'))
     store = configure_store(os.path.join(data_dir(), "operations.db"))
     # Close explicitly to checkpoint SQLite's WAL.
     atexit.register(store.close)
@@ -871,9 +876,13 @@ def main():
             HTTPMiddleware(MCPKeyAuthMiddleware, api_key=api_key),
         ],
         # Avoid writing the key, which travels in the query string, to the log.
-        uvicorn_config={"access_log": False},
+        uvicorn_config={"access_log": False, "log_config": None},
     )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logger.exception('EWS MCP 启动或运行失败')
+        raise SystemExit(1)

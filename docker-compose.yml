@@ -27,9 +27,21 @@ services:
       EWS_MCP_HOST: "0.0.0.0"
       EWS_MCP_PORT: "7805"
       EWS_MCP_DATA_DIR: /data/ews_mcp
+      EWS_MCP_LOG_DIR: /logs
     volumes:
       - ./.env:/app/.env:ro
       - ews_mcp_data:/data/ews_mcp
+      # Pre-create this host directory for the image's appuser; see docs/logging.md.
+      - type: bind
+        source: ${EWS_MCP_LOG_HOST_DIR:-./logs}
+        target: /logs
+        bind:
+          create_host_path: false
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - genie
 

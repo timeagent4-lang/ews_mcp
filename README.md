@@ -11,6 +11,7 @@
 - `check_availability` 返回各邮箱的忙闲区间，由调用方 Agent 选择公共时段；`interval_minutes` 为采样间隔（默认 30，范围 5–1440），不是会议时长。参数与迁移说明见 [忙闲查询](docs/availability.md)。
 - `list_tasks` 默认先筛选未完成任务，再按到期日降序分页；用返回的 `next_offset` 取后续页。参数、空结果和分页边界见 [任务列表](docs/task-listing.md)。
 - 审计日志的 `input_arguments` 保存校验前的实际参数，保留字段、类型及嵌套结构，失败调用也记录。正文、附件及令牌等敏感值脱敏，超长输入标记截断（上限 16 KiB）。
+- 错误与审计日志按日期分别落盘，保留最近30个自然日；宿主机目录、权限和控制台降噪见 [日志说明](docs/logging.md)。
 
 接入、验收及回滚见 [内网接入说明](docs/intranet-integration.md)，变量见 [.env.example](.env.example)。服务账号用 `OUTLOOK_ADMIN_LANID`；`EWS_MCP_DATA_DIR` 保存回执及附件缓存。
 

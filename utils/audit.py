@@ -248,7 +248,10 @@ def _emit_audit_record(
     }
     if result_count is not None:
         record["result_count"] = result_count
-    logger.info(_single_line_json(record))
+    logger.info(_single_line_json(record), extra={
+        'audit_status': status, 'audit_tool': tool_name,
+        'audit_error_code': error_code, 'audit_event_id': event_id,
+    })
 
 
 class ToolAuditMiddleware(Middleware):

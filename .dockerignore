@@ -19,6 +19,7 @@ htmlcov
 .data
 data
 exports
+logs
 **/*.db
 **/*.db-shm
 **/*.db-wal

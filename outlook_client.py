@@ -59,7 +59,7 @@ class OutlookClient(
     def _connect(self) -> Account:
         try:
             account = self._create_account(self.config.email)
-            logger.info("Exchange 邮箱连接成功")
+            logger.debug("Exchange 邮箱连接成功")
             return account
         except Exception as exc:
             logger.error("连接失败: error_type=%s", exc.__class__.__name__)
