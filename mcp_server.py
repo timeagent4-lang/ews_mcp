@@ -2,6 +2,7 @@
 
 import atexit
 import asyncio
+import json
 import logging
 import os
 import re
@@ -53,6 +54,7 @@ from utils.lanid_email import (
     resolve_identity_by_lanid,
 )
 from utils.logging_config import configure_logging
+from utils.tool_results import ACTIVE_STATUSES, json_result, result_is_error
 
 logging.basicConfig(
     level=logging.INFO,
@@ -101,11 +103,58 @@ def _validate_arguments(tool_name, arguments):
     validator = _INPUT_VALIDATORS.get(tool_name)
     if validator is None:
         raise ToolOperationError("UNKNOWN_TOOL", "该工具未注册或已禁用。")
-    error = next(validator.iter_errors(arguments), None)
+    errors = list(validator.iter_errors(arguments))
+    error = errors[0] if errors else None
     if error is not None:
+        if isinstance(arguments, dict):
+            if "lanid" not in arguments:
+                raise ToolOperationError("INVALID_PARAMS", "缺少必填参数 lanid，请传入当前登录用户的 LANID")
+            extra = sorted(set(arguments) - set(validator.schema["properties"]))
+            if extra:
+                raise ToolOperationError("INVALID_PARAMS", "请求包含不支持的参数")
+            # Prefer the field constraint over a nested branch-combination error.
+            error = next((e for e in errors if e.absolute_path), error)
         code = _schema_error_code(validator.schema, error)
-        # Never echo the invalid instance: it may contain a confirmation token.
-        raise ToolOperationError(code, _SCHEMA_ERROR_MESSAGES[code])
+        raise ToolOperationError(code, _schema_error_message(validator.schema, error, arguments))
+
+
+def _schema_error_message(schema, error, arguments):
+    """Describe constraints without echoing invalid values or credentials."""
+    if error.absolute_path:
+        path = list(error.absolute_path)
+        field = str(path[0]) + "".join(f"[{part}]" for part in path[1:])
+        rule = error.schema
+        if error.validator == "type":
+            label = {"integer": "整数", "string": "字符串", "boolean": "布尔值", "array": "数组"}.get(rule.get("type"), "有效类型")
+            return f"参数 {field} 必须是{label}"
+        if error.validator in ("minimum", "maximum"):
+            if "minimum" in rule and "maximum" in rule:
+                return f"参数 {field} 必须在 {rule['minimum']}–{rule['maximum']} 之间"
+            if "minimum" in rule:
+                return f"参数 {field} 必须大于或等于 {rule['minimum']}"
+            return f"参数 {field} 必须小于或等于 {rule['maximum']}"
+        if error.validator == "minLength":
+            return f"参数 {field} 不能为空" if rule.get("minLength") == 1 else f"参数 {field} 长度不足"
+        if error.validator == "enum":
+            return f"参数 {field} 必须是 " + "、".join(map(str, rule["enum"]))
+        return f"参数 {field} 不符合要求"
+    if isinstance(arguments, dict):
+        if "oneOf" in schema and ("operation_id" in arguments or "confirm_token" in arguments):
+            return "确认执行需要 operation_id、confirm_token 和原预览业务参数"
+        if error.validator == "required":
+            return "缺少必填参数 " + "、".join(key for key in error.validator_value if key not in arguments)
+        required = schema.get("required", [])
+        if "oneOf" in schema:
+            required = required + schema["oneOf"][0]["required"]
+        missing = [key for key in required if key not in arguments]
+        if missing:
+            return "缺少必填参数 " + "、".join(missing)
+        for child in error.context:
+            if child.validator == "required":
+                missing = [key for key in child.validator_value if key not in arguments]
+                if missing:
+                    return "缺少必填参数 " + "、".join(missing)
+    return _SCHEMA_ERROR_MESSAGES[_schema_error_code(schema, error)]
 
 
 class ToolInputValidationMiddleware(Middleware):
@@ -122,7 +171,6 @@ class ToolInputValidationMiddleware(Middleware):
 # Audit wraps validation so rejected calls also reach its result handling.
 mcp.add_middleware(ToolInputValidationMiddleware())
 
-_NON_FAILURE_STATUSES = frozenset(("pending", "confirmed", "executing", "processing"))
 SEND_RESPONSE_WAIT_SECONDS = 30
 # Retain dispatch tasks after the caller stops waiting. Their worker capacity and
 # receipt persistence remain active until the synchronous dispatch really ends.
@@ -130,7 +178,7 @@ _SEND_DISPATCH_TASKS = set()
 
 
 def install_failure_envelope(fastmcp) -> None:
-    """Set isError on business failures without dropping structuredContent.
+    """Mirror structured results as JSON text and derive MCP isError.
 
     FastMCP's raise path drops structuredContent, so wrap the low-level result.
     """
@@ -146,15 +194,10 @@ def install_failure_envelope(fastmcp) -> None:
         result = await original_handler(request)
         root = getattr(result, "root", None)
         structured = getattr(root, "structuredContent", None)
-        if (
-            isinstance(structured, dict)
-            and structured.get("ok") is False
-            and structured.get("status") not in _NON_FAILURE_STATUSES
-        ):
-            try:
-                root.isError = True
-            except Exception:  # pragma: no cover - defensive; model is mutable
-                logger.warning("无法为失败结果设置 isError=true")
+        if isinstance(structured, dict):
+            root.isError = result_is_error(structured)
+            root.content = [mcp_types.TextContent(
+                type="text", text=json.dumps(structured, ensure_ascii=False, separators=(",", ":")))]
         return result
 
     low_level_server.request_handlers[
@@ -293,7 +336,9 @@ def _classify_exception(exc: Exception):
 def _failure_record(exc: Exception) -> dict:
     """Persist root-cause details for later receipt replay."""
     code, kind, message = _classify_exception(exc)
-    record = {"error_code": code}
+    record = {"error_code": code, "error_kind": kind}
+    if getattr(exc, "request_id", None):
+        record["request_id"] = exc.request_id
     if kind == "exchange":
         record["error_code_normalized"] = _normalized_code(code)
     else:
@@ -329,7 +374,6 @@ def _tool_failure(
         _log_tool_error(tool_name, exc, error_kind)
 
     payload = {
-        "ok": False,
         "error_code": error_code,
         "error_kind": error_kind,
         "results": results,
@@ -348,10 +392,7 @@ def _tool_failure(
     if operation_id:
         payload["operation_id"] = operation_id
 
-    content = f"{tool_name} 执行失败: {error_code}"
-    if message:
-        content += f" - {message}"
-    return ToolResult(content=content, structured_content=payload)
+    return json_result(payload)
 
 
 def _business(params: dict) -> dict:
@@ -368,21 +409,20 @@ def _wrap_read_result(tool_name: str, result) -> ToolResult:
             "results": result["items"],
             **{k: v for k, v in result.items() if k != "items"},
         }
-        return ToolResult(content=f"{tool_name} 执行成功", structured_content=payload)
-    return ToolResult(
-        content=f"{tool_name} 执行成功", structured_content={"results": result}
-    )
+        if payload.get("partial"):
+            payload["message"] = "查询部分完成，结果不完整"
+        return json_result(payload)
+    return json_result({"results": result})
 
 
 def _wrap_batch(tool_name: str, result: dict) -> ToolResult:
     rows = result["results"]
     failed = sum(row.get("success") is False for row in rows)
-    payload = {**result, "ok": failed == 0,
+    payload = {**result,
                "success_count": len(rows) - failed, "failed_count": failed}
     if failed:
         payload["error_code"] = "BATCH_FAILED" if failed == len(rows) else "BATCH_PARTIAL_FAILURE"
-    status = ("执行成功" if failed == 0 else "执行失败" if failed == len(rows) else "部分失败")
-    return ToolResult(content=f"{tool_name} {status}", structured_content=payload)
+    return json_result(payload)
 
 
 def _invoke_read(tool_name: str, params: dict, ctx: Context) -> ToolResult:
@@ -456,9 +496,6 @@ def _receipt(tool_name: str, record, *, mailbox, lanid=None, replay=False) -> To
     _require_directory_read(record, lanid)
     status = record["status"]
     result = record["result"]
-    if result is None and status not in (STATUS_COMPLETED, STATUS_PARTIAL):
-        result = {"status": status}
-    ok = status == STATUS_COMPLETED
     stored_failure = (
         result
         if isinstance(result, dict)
@@ -476,7 +513,6 @@ def _receipt(tool_name: str, record, *, mailbox, lanid=None, replay=False) -> To
         else None
     )
     payload = {
-        "ok": ok,
         "operation_id": record["operation_id"],
         "status": status,
         "results": None if stored_failure else result,
@@ -486,7 +522,7 @@ def _receipt(tool_name: str, record, *, mailbox, lanid=None, replay=False) -> To
         payload["error_code"] = stored_failure["error_code"]
         if stored_failure.get("error_code_normalized"):
             payload["error_code_normalized"] = stored_failure["error_code_normalized"]
-        for inherited in ("exchange_code", "exchange_message"):
+        for inherited in ("exchange_code", "exchange_message", "error_kind", "request_id"):
             if stored_failure.get(inherited):
                 payload[inherited] = stored_failure[inherited]
         if stored_failure.get("message"):
@@ -501,8 +537,8 @@ def _receipt(tool_name: str, record, *, mailbox, lanid=None, replay=False) -> To
         payload["failed_count"] = failed
     elif status == STATUS_PARTIAL:
         payload["error_code"] = "BATCH_PARTIAL_FAILURE"
-    elif status not in (STATUS_COMPLETED,):
-        payload["error_code"] = "OPERATION_UNKNOWN"
+    elif status in (STATUS_UNKNOWN, STATUS_FAILED):
+        payload["error_code"] = "OPERATION_UNKNOWN" if status == STATUS_UNKNOWN else "OPERATION_FAILED"
     if status == STATUS_COMPLETED:
         note = None
     elif status == STATUS_PARTIAL:
@@ -513,16 +549,22 @@ def _receipt(tool_name: str, record, *, mailbox, lanid=None, replay=False) -> To
             if batch is not None
             else "执行失败：请查询原操作号确认后重试。"
         )
+    elif status == STATUS_PENDING:
+        note = "等待确认执行。"
+    elif status in ACTIVE_STATUSES:
+        note = "操作尚未取得最终结果。"
+    elif tool_name == "send_draft":
+        note = "发送结果未知，请在已发送邮件中核实实际结果；勿盲目重发。"
     else:
-        note = "结果未知或未完成：请勿盲目重发，仅查询原操作号。"
+        note = "执行结果未知，请核实实际结果；勿盲目重试。"
     structured = {**payload, **({"note": note} if note else {})}
-    return ToolResult(content=f"{tool_name} {status}", structured_content=structured)
+    return json_result(structured)
 
 def _query_receipt(tool_name: str, operation_id: str, mailbox: str, lanid=None) -> ToolResult:
     record = get_store().get(operation_id)
     if record is None:
         return _tool_failure(
-            tool_name, error_code="OPERATION_UNKNOWN", results=None,
+            tool_name, exc=ConfirmationError("OPERATION_NOT_FOUND", "未找到 operation_id 对应的操作记录"), results=None,
             operation_id=operation_id,
         )
     return _receipt(tool_name, record, mailbox=mailbox, lanid=lanid)
@@ -555,17 +597,14 @@ def _preview_replay(tool_name: str, record, *, mailbox, lanid=None) -> ToolResul
     _require_record_scope(tool_name, mailbox, record)
     _require_upload_owner(tool_name, record, lanid)
     _require_directory_read(record, lanid)
-    return ToolResult(
-        content=f"{tool_name} 待确认（预览返回）",
-        structured_content={
-            "ok": True,
+    return json_result({
+            "status": STATUS_PENDING,
             "confirmation_required": True,
             "operation_id": record["operation_id"],
             "confirm_token": record["confirm_token"],
             "preview": {"items": record["items"], "details": record["details"]},
             "replayed": True,
-        },
-    )
+        })
 
 
 def _is_batch_result(result) -> bool:
@@ -615,6 +654,8 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
 
     if confirm_token:
         existing = store.get(operation_id)
+        if existing is None:
+            raise ConfirmationError("OPERATION_NOT_FOUND", "未找到 operation_id 对应的操作记录")
         _require_record_scope(tool_name, mailbox, existing)
         _require_upload_owner(tool_name, existing, lanid)
         if existing is not None and (
@@ -654,6 +695,8 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
                 if current is not None:
                     return _receipt(tool_name, current, mailbox=mailbox, lanid=lanid, replay=True)
             return _tool_failure(tool_name, exc=exc, operation_id=operation_id)
+        if execution:
+            client.submission_started = False
         try:
             execute = {**business, "confirm": True, "confirmation_id": confirm_token}
             recorded_version = (existing.get("details") or {}).get("version")
@@ -677,7 +720,8 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
                     _ATTACHMENT_SLOTS.release()
         except Exception as exc:
             # Ambiguous writes stay UNKNOWN and are never automatically retried.
-            ambiguous = not is_definite_rejection(exc)
+            submitted = not execution or client.submission_started
+            ambiguous = submitted and not is_definite_rejection(exc)
             status = STATUS_UNKNOWN if ambiguous else STATUS_FAILED
             try:
                 if execution:
@@ -687,7 +731,8 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
             except Exception:
                 logger.error('write_receipt_persistence_failed tool=%s', tool_name)
                 return _tool_failure(tool_name, error_code='OPERATION_UNKNOWN', operation_id=operation_id)
-            return _tool_failure(tool_name, exc=exc, operation_id=operation_id)
+            _log_tool_error(tool_name, exc, _classify_exception(exc)[1])
+            return _receipt(tool_name, store.get(operation_id), mailbox=mailbox, lanid=lanid)
         # Keep post-write bookkeeping outside the submission exception handler:
         # a later failure must not make the write retryable.
         status, final_result = _classify_write_result(result)
@@ -728,16 +773,13 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
             canonical_draft_id=details['canonical_draft_id'], expires_at=time.time() + preview_ttl_seconds())
     else:
         record = store.create_preview(**preview_args)
-    return ToolResult(
-        content=f"{tool_name} 待确认",
-        structured_content={
-            "ok": True,
+    return json_result({
+            "status": STATUS_PENDING,
             "confirmation_required": True,
             "operation_id": record["operation_id"],
             "confirm_token": record["confirm_token"],
             "preview": result,
-        },
-    )
+        })
 
 
 def _dispatch(tool_name: str, params: dict, ctx: Context) -> ToolResult:
@@ -772,17 +814,13 @@ def _send_wait_expired(params) -> ToolResult:
         )
     # This is request progress, not a receipt: OA or scope validation may still
     # be pending. Never read stored data here using an unverified operation ID.
-    return ToolResult(
-        content="send_draft 处理中：等待已达到上限，请查询原操作号。",
-        structured_content={
-            "ok": False,
+    return json_result({
             "status": "processing",
             "operation_id": operation_id,
             "results": None,
             "wait_timed_out": True,
-            "note": "请求尚未取得最终结果，后台处理可能继续。请勿重新发送，仅用原操作号查询回执。",
-        },
-    )
+            "message": "邮箱服务不稳定 请五分钟后查看结果",
+        })
 
 
 def _make_handler(tool_name):

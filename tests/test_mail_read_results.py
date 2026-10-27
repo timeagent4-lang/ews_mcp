@@ -97,14 +97,21 @@ class MailReadResultTests(unittest.TestCase):
                 self.assertEqual(result["next_offset"], next_offset)
                 self.assertFalse(result["partial"])
 
-    def test_query_failure_is_not_converted_to_an_empty_success(self):
+    def test_query_failure_is_reported_as_incomplete_source(self):
         folder = folder_with_rows([])
         failure = ErrorAccessDenied("query denied after folder resolution")
         folder.filter.side_effect = failure
         self.setup_thread(folder, folder_with_rows([]))
-        with self.assertRaises(ErrorAccessDenied) as caught:
-            self.mail.get_thread("source")
-        self.assertIs(caught.exception, failure)
+        result = self.mail.get_thread("source")
+        self.assertEqual(result["items"], [])
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["coverage"], {"inbox": "denied", "sent": "ok"})
+
+    def test_yielded_exception_is_a_failed_source_not_a_message(self):
+        self.setup_thread(folder_with_rows([ErrorAccessDenied("denied")]), folder_with_rows([row("b")]))
+        result = self.mail.get_thread("source")
+        self.assertEqual(result["items"], [{"id": "b"}])
+        self.assertTrue(result["partial"])
 
 
 if __name__ == "__main__":

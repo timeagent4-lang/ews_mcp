@@ -6,7 +6,7 @@ from __future__ import annotations
 SIDE_READ = "read"
 SIDE_WRITE = "write"
 
-_BIG_TEXT = frozenset({"body", "message", "internal_reply", "external_reply", "query"})
+_BIG_TEXT = frozenset({"body", "message", "internal_reply", "external_reply", "query", "notes"})
 
 _ID_FIELDS = frozenset(
     {
@@ -39,13 +39,11 @@ for _code, _names in (
 del _code, _names, _name
 
 _ID_HINT = (
-    "Use the exact mailbox-scoped ID returned by this service, or a raw EWS ID. "
-    "Cross-mailbox / unscoped short aliases are rejected."
+    "Use mailbox-scoped returned/raw EWS IDs; no short aliases."
 )
 
 _FOLDER_HINT = (
-    "Use a well-known alias as returned by list_folders and accepted by this "
-    "field's enum. Raw EWS folder IDs are rejected."
+    "Use a listed folder alias, never a raw folder ID."
 )
 
 _READ_TOOLS = frozenset(
@@ -104,16 +102,15 @@ TOOLS: dict[str, list[dict]] = {
     # --- mail read ---
     "list_folders": [],
     "find_message": [
-        _s("query", "string", "Subject contains this text; may combine with structured filters.", default=""),
-        _s("aqs", "string", "Exchange AQS; cannot combine with nonempty query or structured filters. Omit when unused.", min_length=1),
+        _s("query", "string", "Subject contains this text; combines with the other filters.", default=""),
         _s("folder", "string", "Mail folder to search.", default="inbox", enum=["inbox", "drafts", "sent"]),
-        _s("since", "string", "Inclusive start: received time for inbox, sent time for sent, created time for drafts. Datetimes without a timezone use Asia/Shanghai.", default=None),
-        _s("until", "string", "Exclusive end using the same folder time field as since; a date-only value means midnight at the start of that date in Asia/Shanghai.", default=None),
+        _s("since", "string", "Inclusive start: inbox received time, sent sent time, drafts created time. Missing timezone uses Asia/Shanghai.", default=None),
+        _s("until", "string", "Exclusive end, using since's time field. A date means its starting midnight in Asia/Shanghai.", default=None),
         _s("is_unread", "boolean", "True unread only, False read only; omit for no filter.", default=None),
         _s("has_attachments", "boolean", "True/False attachment filter.", default=None),
         _s("limit", "integer", "Max results.", default=10, minimum=1, maximum=100),
         _s("offset", "integer", "Pagination offset.", default=0, minimum=0),
-        _s("include_body", "boolean", "Return up to 10000 body characters per message without automatically cleaning HTML; use get_message to read further.", default=True),
+        _s("include_body", "boolean", "Include up to 10000 body characters, preserving HTML; get_message reads further.", default=True),
     ],
     "get_message": [
         _s("message_id", "string", "Scoped message ID.", required=True),
@@ -129,28 +126,28 @@ TOOLS: dict[str, list[dict]] = {
     "get_attachment": [
         _s("message_id", "string", "Scoped message ID owning the attachment.", required=True),
         _s("attachment_id", "string", "Scoped attachment ID; omit to list.", default=None),
-        _s("mode", "string", "info returns metadata only; auto/text read supported text attachments, otherwise return metadata with a notice. Omit attachment_id to list metadata in any mode.", default="auto", enum=["auto", "info", "text"]),
+        _s("mode", "string", "info: metadata only; auto/text: supported text or metadata with a notice. Without attachment_id, list metadata.", default="auto", enum=["auto", "info", "text"]),
 
     ],
     "prepare_attachment_download": [
         _s("message_id", "string", "Scoped message ID owning the attachment.", required=True),
-        _s("attachment_id", "string", "Exact attachment ID returned for this message; required.", required=True),
+        _s("attachment_id", "string", "Attachment ID returned for this message.", required=True),
     ],
     "prepare_attachment_upload": [
-        _s("filename", "string", "File name; path components are removed. Bytes are uploaded by the executor, never passed in MCP.", required=True, min_length=1),
-        _s("size", "integer", "Exact file length in bytes, including zero-byte files; server configuration determines the upper limit.", required=True, minimum=0),
-        _s("sha256", "string", "SHA-256 of the exact bytes, 64 hexadecimal characters.", required=True, min_length=64, max_length=64),
-        _s("content_type", "string", "Optional MIME type; inline images are independently decoded and verified.", default=None, min_length=1, max_length=255),
+        _s("filename", "string", "File name; path components are removed. Upload bytes over HTTP, never MCP.", required=True, min_length=1),
+        _s("size", "integer", "Exact byte length; zero allowed, server limit applies.", required=True, minimum=0),
+        _s("sha256", "string", "File SHA-256, 64 hexadecimal characters.", required=True, min_length=64, max_length=64),
+        _s("content_type", "string", "MIME type; inline images are decoded and verified separately.", default=None, min_length=1, max_length=255),
     ],
     "get_mailbox_overview": [
         _s("limit", "integer", "Recent-unread cap.", default=5, minimum=1, maximum=100),
     ],
     # --- draft / mail writes ---
     "create_draft": [
-        _s("mode", "string", "Draft mode; reply/reply_all/forward require reply_to; new forbids reply_to.", default="new", enum=["new", "reply", "reply_all", "forward"]),
+        _s("mode", "string", "reply/reply_all/forward require reply_to; new forbids it.", default="new", enum=["new", "reply", "reply_all", "forward"]),
         _s("subject", "string", "Subject; omitted for reply/forward uses RE:/FW: prefix.", default=""),
-        _s("body", "string", "With mode=reply/reply_all/forward this is only your new content: plain text by default, or an HTML fragment with body_format=html (no html/head/body/doctype). Empty content is allowed. Exchange appends the quoted original natively, so do not paste the original back and do not pass a cleaned plain-text copy of it. With mode=new it is the complete body of the new message.", default="", max_length=65536),
-        _s("body_format", "string", "How to read body. text (default) submits plain text and keeps the quoted original's body type. html submits body verbatim: mode=new accepts a complete HTML body or fragment; reply/reply_all/forward accept only the new HTML fragment through EWS NewBodyContent, and Exchange includes the quoted original in HTML. Inline CSS is recommended for email compatibility; final rendering depends on the email client. cid: references do not create attachments; upload and confirm attach_draft_attachment first, then use its actual content_id.", default="text", enum=["text", "html"]),
+        _s("body", "string", "New content only for reply/reply_all/forward; Exchange quotes the original. With new, the complete body. Empty allowed.", default="", max_length=65536),
+        _s("body_format", "string", "text preserves the original's body type. html: full body/fragment for new; fragment only for reply/reply_all/forward (no html/head/body/doctype). Confirm CID uploads first and use the returned content_id.", default="text", enum=["text", "html"]),
         _s("to_emails", "string", "To recipients, ; separated.", default=""),
         _s("cc_emails", "string", "Cc recipients, ; separated.", default=""),
         _s("bcc_emails", "string", "Bcc recipients, ; separated.", default=""),
@@ -160,9 +157,9 @@ TOOLS: dict[str, list[dict]] = {
     "update_draft": [
         _s("draft_id", "string", "Scoped draft ID.", required=True),
         _s("subject", "string", "New subject; omit to leave unchanged.", default=None),
-        _s("body", "string", "Body content, read according to body_action and body_format. Omit it to leave the body untouched, which is what you want when changing only recipients or subject; supplying body_format or body_action without body is rejected rather than ignored. With prepend+html this is an HTML fragment only (e.g. <p>, <table>); a full document containing html/head/body/doctype is refused, not trimmed.", default=None, max_length=65536),
-        _s("body_format", "string", "How to read body. With body_action=replace (default): text submits plain text keeping the draft's body type, html submits body verbatim as the complete replacement body so tables and inline style= render. With body_action=prepend: text (default) adds escaped plain text, html adds a raw HTML fragment at the start of the existing body -- fragment only, the draft must already be HTML, and any cid: image it references must match an existing attachment. Confirm attach_draft_attachment before referencing a new image.", default=None, enum=["text", "html"]),
-        _s("body_action", "string", "replace (default) makes body the whole new body, including any quoted original. prepend treats body as one new piece inserted at the start of the server-read existing body, keeping that body's tables, styles, quoted mail and inline images, so the original is never resubmitted. prepend takes plain text, or an HTML fragment with body_format=html.", default=None, enum=["replace", "prepend"]),
+        _s("body", "string", "Omit to preserve the body; body_format/body_action require body. prepend+html accepts fragments only, without html/head/body/doctype.", default=None, max_length=65536),
+        _s("body_format", "string", "text keeps the draft's body type. html replaces with verbatim HTML; prepend requires an HTML draft and a fragment whose CIDs already exist. Confirm new image attachments first.", default=None, enum=["text", "html"]),
+        _s("body_action", "string", "replace overwrites the whole body, including quotes. prepend adds only new content before the server-read body, preserving quotes, styles and images.", default=None, enum=["replace", "prepend"]),
         _s("to_emails", "string", "New to recipients; omit to leave unchanged.", default=None),
         _s("cc_emails", "string", "New cc recipients; omit to leave unchanged.", default=None),
         _s("bcc_emails", "string", "New bcc recipients; omit to leave unchanged.", default=None),
@@ -174,14 +171,14 @@ TOOLS: dict[str, list[dict]] = {
         _s("draft_id", "string", "Scoped draft ID to send.", required=True),
     ],
     "attach_draft_attachment": [
-        _s("draft_id", "string", "Existing ordinary employee draft to attach to.", required=True),
-        _s("upload_id", "string", "Temporary upload identifier returned by prepare_attachment_upload after successful HTTP PUT; this is not an EWS item ID.", required=True, min_length=32, max_length=32),
-        _s("is_inline", "boolean", "True for a verified single-frame PNG/JPEG CID image; use the successful receipt's content_id in HTML.", default=False),
+        _s("draft_id", "string", "Existing ordinary draft.", required=True),
+        _s("upload_id", "string", "Temporary upload ID after successful HTTP PUT; not an EWS ID.", required=True, min_length=32, max_length=32),
+        _s("is_inline", "boolean", "Verified single-frame PNG/JPEG CID image; use the receipt's content_id in HTML.", default=False),
     ],
     "set_message_flag": [
         _s("message_id", "string", "Scoped message ID to flag.", required=True),
         _s("flag", "string", "Follow-up state to apply.", required=True, enum=["flagged", "complete", "clear"]),
-        _s("due_date", "string", "ISO due date: flagged sets it (omission clears it); complete updates it when supplied (omission preserves it). Not allowed with clear; all flag dates are removed.", default=None),
+        _s("due_date", "string", "ISO date. flagged: omit to clear; complete: omit to preserve. clear forbids this field and removes all flag dates.", default=None),
     ],
     "list_flagged_messages": [
         _s("folder", "string", "Mail folder to list.", default="inbox", enum=["inbox", "drafts", "sent"]),
@@ -203,7 +200,7 @@ TOOLS: dict[str, list[dict]] = {
     ],
     # --- calendar ---
     "list_events": [
-        _s("start", "string", "Window start datetime; values without a timezone use Asia/Shanghai.", required=True),
+        _s("start", "string", "Window start; missing timezone uses Asia/Shanghai.", required=True),
         _s("end", "string", "ISO end.", required=True),
         _s("offset", "integer", "Pagination offset.", default=0, minimum=0),
         _s("limit", "integer", "Page size.", default=20, minimum=1, maximum=100),
@@ -221,7 +218,7 @@ TOOLS: dict[str, list[dict]] = {
         _s("send_invitations", "boolean", "Email attendees (requires send switch + confirm).", default=False),
     ],
     "update_event": [
-        _s("event_id", "string", "Scoped event ID.", required=True),
+        _s("event_id", "string", "Scoped calendar event ID.", required=True),
         _s("subject", "string", "New subject.", default=None),
         _s("body", "string", "New body.", default=None, max_length=65536),
         _s("start", "string", "New start.", default=None),
@@ -230,20 +227,20 @@ TOOLS: dict[str, list[dict]] = {
         _s("notify_attendees", "boolean", "Notify attendees (requires send switch + confirm).", default=False),
     ],
     "respond_to_event": [
-        _s("event_id", "string", "Scoped event ID.", required=True),
+        _s("event_id", "string", "Calendar event ID, not a meeting-request mail ID.", required=True),
         _s("response", "string", "Attendee response.", required=True, enum=["accept", "tentative", "decline"]),
         _s("message", "string", "Response message.", default=None),
     ],
     "cancel_event": [
         _s("event_id", "string", "Organizer-owned scoped event ID.", required=True),
-        _s("message", "string", "Cancellation note; omitting it does not suppress meeting cancellation notices.", default=None),
+        _s("message", "string", "Cancellation note; omission still sends meeting notices.", default=None),
     ],
     # --- availability ---
     "check_availability": [
         _s("start", "string", "Window start.", required=True),
         _s("end", "string", "Window end.", required=True),
-        _s("attendees", "array", "Attendee emails to check; trimmed, lowercased and deduplicated.", required=True, items="string", min_items=1, max_items=100),
-        _s("interval_minutes", "integer", "Free/busy sampling interval in minutes, not a requested meeting duration.", default=30, minimum=5, maximum=1440),
+        _s("attendees", "array", "Emails; trimmed, lowercased and deduplicated.", required=True, items="string", min_items=1, max_items=100),
+        _s("interval_minutes", "integer", "Sampling interval in minutes, not meeting duration.", default=30, minimum=5, maximum=1440),
     ],
     # --- people / contacts ---
     "find_people": [
@@ -253,7 +250,7 @@ TOOLS: dict[str, list[dict]] = {
         _s(
             "directory_id",
             "string",
-            "Administrator-configured team shared directory; optional and requires source=contacts, which must be passed explicitly. Searches only that directory. Omit for the employee's own Contacts folder.",
+            "Configured team directory only; requires explicit source=contacts. Omit for personal Contacts/GAL.",
             default=None,
             min_length=1,
         ),
@@ -263,7 +260,7 @@ TOOLS: dict[str, list[dict]] = {
         _s(
             "directory_id",
             "string",
-            "Administrator-configured team shared directory; optional. With it, contact_id is read as an item ID inside that directory only and an email address never resolves through GAL. Omit to read the employee's own Contacts.",
+            "Configured team directory; contact_id must be an item ID within it, never a GAL email.",
             default=None,
             min_length=1,
         ),
@@ -272,18 +269,22 @@ TOOLS: dict[str, list[dict]] = {
         _s(
             "display_name",
             "string",
-            "Name saved on the contact itself; not the requester's name (that is the top-level name field) and it never selects a mailbox.",
+            "Contact's display name, separate from the caller's name.",
             required=True,
             min_length=1,
         ),
-        _s("email", "string", "Single contact email address; never selects the target mailbox.", required=True),
+        _s("email", "string", "Optional contact email; validated when supplied, never selects the mailbox.", default=None),
         _s("phone", "string", "Business phone.", default=None),
         _s("company_name", "string", "Company name.", default=None),
         _s("job_title", "string", "Job title.", default=None),
+        _s("department", "string", "Department.", default=None),
+        _s("mobile_phone", "string", "Mobile phone.", default=None),
+        _s("office", "string", "Office location.", default=None),
+        _s("notes", "string", "Plain text notes.", default=None, max_length=65536),
         _s(
             "directory_id",
             "string",
-            "Administrator-configured team shared directory to create in; optional. Only employees with create permission for that directory may use it, and the preview shows the resolved target. Omit to create in the employee's own Contacts.",
+            "Configured team directory requiring create permission; omit for personal Contacts.",
             default=None,
             min_length=1,
         ),
@@ -293,7 +294,7 @@ TOOLS: dict[str, list[dict]] = {
         _s("folder", "string", "Task folder alias.", default="tasks", enum=["tasks"]),
         _s("incomplete_only", "boolean", "Only incomplete tasks.", default=True),
         _s("limit", "integer", "Page size.", default=50, minimum=1, maximum=100),
-        _s("offset", "integer", "Offset in the filtered task list; use the returned next_offset.", default=0, minimum=0),
+        _s("offset", "integer", "Filtered-list offset; follow next_offset.", default=0, minimum=0),
     ],
     "create_task": [
         _s("subject", "string", "Task subject.", required=True),
@@ -320,49 +321,48 @@ TOOLS: dict[str, list[dict]] = {
 }
 
 DESCRIPTIONS = {
-    "prepare_attachment_upload": "Authorize a local temporary upload after OA resolution without connecting Exchange. Returns upload_id, upload_url, upload_token, upload_expires_at and limits. The executor sends the original bytes with HTTP PUT and Authorization: Bearer upload_token, using exact Content-Length. Treat the token as a private temporary credential. Ready files are immutable; repeated PUT returns 409. Then preview/confirm attach_draft_attachment. No Base64, URL fetching or server paths.",
-    "attach_draft_attachment": "Add one completed upload to an existing ordinary employee draft after preview and confirmation; preserves body, recipients and existing attachments. The upload belongs to its OA LANID/mailbox and is consumed by one logical operation. Inline supports verified single-frame PNG/JPEG and a stable server-generated CID; update HTML using the successful content_id, then obtain a fresh send_draft preview showing the final message. Stale draft/file versions are rejected. Unknown outcomes must only query the original receipt; never attach again automatically. Receipt queries do not require the cached upload to exist.",
-    "list_folders": "Report which folders this employee can access, with each one's item and unread counts; an inaccessible folder is reported in coverage, it does not block the others.",
-    "find_message": "Search one authorized employee mail folder: query matches subject text and supports structured filters; aqs is exclusive with nonempty query and structured filters. This does not search the service account mailbox; not finding a meeting notice in employee Sent does not establish delivery failure.",
-    "get_message": "Read one scoped message with paginated body and attachment inventory; clean_body defaults to false, so HTML is preserved unless explicitly cleaned; stale IDs require a new search.",
-    "get_thread": "Read a scoped conversation from employee Inbox and Sent; successful results include folder coverage and partial status. Each body is capped at 10000 characters; use get_message to read further. This does not search service-account Sent; missing meeting notices do not establish delivery failure.",
-    "get_attachment": "List attachment metadata or read supported text files; the 5 MiB input and 20000-character output limits apply to text reading, not metadata listing. Other file types return metadata only. To download an original file, use prepare_attachment_download and then HTTP GET its URL from the employee execution environment.",
-    "prepare_attachment_download": "Prepare an original file attachment for HTTP download after checking its message and mailbox scope. Returns download_url, filename, content_type, size, sha256 and expires_at; no file bytes or server paths. The URL is a temporary bearer credential: download into the task workspace, verify SHA-256, and do not publish it. Retry GET while valid; call this tool again after expiry. Requires server download configuration; item attachments are unsupported.",
-    "get_mailbox_overview": "Read Inbox total/unread counts and recent unread messages only.",
-    "create_draft": "Create a new draft or native EWS reply/reply_all/forward draft without sending; use an original message ID, not a consumed draft ID. body_format=html accepts the full body for a new message, or only a new HTML fragment for reply/forward; Exchange supplies the quoted original. Plain text remains the default and preserves an HTML original's body type.",
-    "update_draft": "Update supplied draft fields and align the draft author with the OA employee when needed; empty values clear supported fields. body_action=replace (default) makes body the whole new body, including any quoted original. body_action=prepend adds body as one new piece of content at the start of the server-read existing body, keeping that body's tables, styles, quoted mail and inline images, so the original is never resubmitted; prepend takes plain text, or an HTML fragment with body_format=html when the draft is already HTML (fragment only, no html/head/body, and any cid: image it references must already exist on the draft). To change only recipients or subject, omit body (and do not pass body_format/body_action). The preview snapshots the draft version, confirm refuses a draft that was edited since preview, and the save itself uses EWS conflict detection.",
-    "delete_draft": "Move one draft to DeletedItems; requires DeletedItems access; never permanently deletes or falls back to hard delete.",
-    "send_draft": "Send one existing employee draft and save a copy in employee Sent; source draft ID is consumed, not a sent/received ID; no auto resend; idempotency_key persists across restarts. Each call waits at most 30 seconds. status=processing with wait_timed_out=true means no final result yet, not proof of submission or success; background processing may continue. Query with lanid and the original operation_id only, without confirm_token or business fields; do not resend. A preview without operation_id returns RESPONSE_WAIT_TIMEOUT instead and never sends mail.",
-    "update_messages": "Update read status/categories of ordinary mail only; meeting request/cancellation objects are rejected per item.",
-    "set_message_flag": "Set the Outlook follow-up flag (flagged/complete/clear) on one ordinary message; meeting request/cancellation objects are rejected.",
-    "list_flagged_messages": "List items with open or completed follow-up flags in one authorized mail folder, open flags by default; status=all includes both states and excludes unflagged items.",
-    "move_messages": "Move ordinary non-draft mail between this employee's Inbox and Sent only; use the returned NEW ID after moving; old ID is not rebound.",
-    "delete_messages": "Move ordinary mail to DeletedItems only; soft/permanent deletion is prohibited; batch outcomes identify failed/uncertain items; no auto retries.",
-    "list_events": "List calendar occurrences in a time window with pagination and instance expansion. has_more is a full-page hint; the next page may still be empty.",
-    "get_event": "Read one scoped calendar event with organizer, attendees, response and recurrence metadata.",
-    "create_event": "Create an event returning its real ID; invitations off by default; send_invitations=true emails attendees and requires the send switch.",
-    "update_event": "Update an organizer-owned single event or explicit occurrence; recurring masters rejected; notify_attendees=false is silent; empty location clears it.",
-    "respond_to_event": "Accept, decline or tentatively respond as an attendee, sending a response after confirmation and the send switch check; organizer-owned and recurring-master objects are rejected.",
-    "cancel_event": "Cancel an organizer-owned event: meetings send native EWS cancellation notices and require the send switch; only a non-meeting appointment with no attendees is moved to Deleted Items without a notice. Omitting message does not suppress cancellation notices; recurring masters rejected.",
-    "check_availability": "Return per-attendee free/busy intervals, including tentative, OOF and unknown; missing or unusable data stays unknown. Callers choose shared times and schedule meetings separately.",
-    "find_people": "Search the organization directory (GAL) and/or the OA mailbox Contacts folder independently; different sources with separate permissions and coverage. With directory_id, search only that administrator-configured team shared directory using source=contacts; gal/auto cannot be combined with it and are rejected.",
-    "get_contact": "Read a scoped Contacts item, or resolve an exact unique email in the organization directory; directory address cannot switch the target mailbox. With directory_id, read an item ID inside that team shared directory only: the employee's directory permission is checked first, the item's parent folder must be that directory, and an email address never falls through to GAL. The result names the directory it came from.",
-    "create_contact": "Create one contact in the OA employee's own Contacts folder, or in an administrator-configured team shared directory when directory_id is given; never touches the GAL and sends no mail. A shared-directory create requires create permission for that directory, and the preview and receipt both name the resolved target; the confirmed target is re-verified, so a re-pointed directory requires a fresh preview.",
-    "list_tasks": "Read scoped Exchange tasks live, incomplete by default; filter before pagination and follow next_offset until null. Returns has_more, offset and limit; use returned IDs for update_task.",
-    "create_task": "Create one task in the OA employee's own Tasks folder; sends no mail and invites nobody.",
-    "update_task": "Update a scoped task completion/due date using a checked change key; no fields means no write.",
-    "get_oof_settings": "Read this OA mailbox out-of-office settings; folder delegation may not authorize this mailbox-level operation.",
-    "set_oof": "Set employee out-of-office settings; omitting external_reply disables external replies, supplying nonempty external_reply enables audience All (shown in preview); internal text is never copied outward by default.",
-    "get_server_status": "Return the current mailbox, whether this adapter has an account, the send switch and the data-directory basename; no credentials or other mailbox statistics.",
+    "prepare_attachment_upload": "Authorize a local upload without Exchange. Returns upload_id, private upload_url/upload_token, expiry and limits. HTTP PUT exact bytes and Content-Length with Bearer upload_token; repeat PUT of a ready file returns 409. Then attach_draft_attachment. No Base64, URL fetching or server paths.",
+    "attach_draft_attachment": "Attach one completed, owner-scoped upload to an ordinary draft; preserve existing content. One logical operation consumes it. Inline: verified single-frame PNG/JPEG; use the returned content_id, then get a fresh send preview. Reject stale draft/file versions. Unknown: query the original receipt even if the upload expired; never reattach automatically.",
+    "list_folders": "Probe folder access and return counts plus coverage; inaccessible folders do not fail the probe.",
+    "find_message": "Search mail by subject, dates, read state and attachments. Missing meeting notices in Sent do not prove delivery failure.",
+    "get_message": "Read a message, paginated body and attachments. Preserve HTML unless clean_body=true; search again for stale IDs.",
+    "get_thread": "Read Inbox/Sent conversation mail with source coverage; partial=true retains available results. Body cap: 10000 characters; get_message reads further. Excludes service-account Sent; missing meeting notices do not prove delivery failure.",
+    "get_attachment": "List metadata or read supported text: 5 MiB input, 20000 output characters. Other types return metadata. For original bytes use prepare_attachment_download, then HTTP GET.",
+    "prepare_attachment_download": "Return a private temporary download_url, filename, content_type, size, sha256 and expiry for a scoped file attachment. HTTP GET into the task workspace and verify SHA-256; never publish the URL. Retry until expiry, then prepare again. Requires download configuration; item attachments unsupported.",
+    "get_mailbox_overview": "Read Inbox total/unread counts and recent unread mail.",
+    "create_draft": "Create a new or native reply/forward draft without sending; use the original message ID. MeetingRequest supports reply/reply_all only, without changing RSVP; use respond_to_event with the calendar ID for RSVP. Other meeting objects remain unsupported.",
+    "update_draft": "Update supplied fields; empty values clear supported fields. Align the draft author with the employee. Preview snapshots the version; confirmation rejects later changes and save detects conflicts.",
+    "delete_draft": "Move a draft to DeletedItems; requires access and never falls back to permanent deletion.",
+    "send_draft": "Send a draft and save in employee Sent; consumes its ID. No automatic resend; idempotency survives restart. Wait at most 30 seconds: processing with wait_timed_out=true returns '邮箱服务不稳定 请五分钟后查看结果' while the same task continues. After five minutes query the original receipt and verify actual Sent; processing does not prove submission/success. Preview timeout returns RESPONSE_WAIT_TIMEOUT without sending.",
+    "update_messages": "Update read state/categories of ordinary mail; reject meeting requests/cancellations per item.",
+    "set_message_flag": "Set an ordinary message's follow-up flag; reject meeting requests/cancellations.",
+    "list_flagged_messages": "List open follow-up flags by default; status=all includes completed flags, never unflagged mail.",
+    "move_messages": "Move ordinary non-draft mail between Inbox and Sent; use the returned new ID afterward.",
+    "delete_messages": "Move ordinary mail to DeletedItems; no soft/permanent deletion or automatic retries. Report failed/uncertain batch items.",
+    "list_events": "List expanded calendar occurrences with pagination. has_more hints at a full page; the next may be empty.",
+    "get_event": "Read an event's organizer, attendees, responses and recurrence; unavailable response times are null.",
+    "create_event": "Create an event; invitations default off. Sending invitations requires the send switch.",
+    "update_event": "Update an organizer-owned event/occurrence; reject recurring masters. notify_attendees=false is silent; empty location clears it.",
+    "respond_to_event": "RSVP using a calendar event ID: accept, tentative or decline. Requires attendee membership and send switch; rejects organizer-owned events and recurring masters.",
+    "cancel_event": "Cancel an organizer-owned event; reject recurring masters. Meetings send native cancellation notices and require the send switch, even without message. Only appointments with no attendees move to DeletedItems silently.",
+    "check_availability": "Return per-attendee free/busy, tentative, OOF or unknown intervals; unusable data stays unknown. Does not choose or book a meeting.",
+    "find_people": "Search GAL/personal Contacts independently with source coverage; partial=true retains available results. With directory_id, search only that authorized directory and require source=contacts.",
+    "get_contact": "Read personal Contacts by ID or GAL by exact unique email. directory_id restricts reads to an authorized directory and verifies item ownership; returns directory identity.",
+    "create_contact": "Create a personal or authorized team contact; email is optional. No GAL writes or mail. Preview/receipt identify the team target; confirmation rechecks it, requiring a fresh preview if changed.",
+    "list_tasks": "Read live tasks, incomplete by default; filter before paging. Follow next_offset until null; use returned IDs for update_task.",
+    "create_task": "Create a personal task without sending mail or invitations.",
+    "update_task": "Update task completion/due date with change-key checking; no fields means no write.",
+    "get_oof_settings": "Read mailbox out-of-office settings; folder delegation may not grant access.",
+    "set_oof": "Set out-of-office replies. Omit external_reply to disable external replies; nonempty text enables audience All in preview. Internal text is never copied externally by default.",
+    "get_server_status": "Return mailbox, account presence, send switch and data-directory basename; no credentials or other mailbox statistics.",
 }
 
 for _name in ("create_event", "update_event", "cancel_event"):
     DESCRIPTIONS[_name] += (
-        " Meeting notification copies are not guaranteed to appear in employee Sent; "
-        "a missing copy alone does not establish sending failure or justify resending."
+        " Meeting notices may be absent from employee Sent; absence does not justify resending."
     )
 
-DESCRIPTIONS['send_draft'] += ' The preview snapshots the draft; confirmation rejects observed changes to body, recipients or attachments and requires a fresh preview.'
+DESCRIPTIONS['send_draft'] += ' Preview snapshots body, recipients and attachments; observed changes require a fresh preview.'
 
 # Deletion is disabled by policy; the service lacks mailbox-level OOF permission.
 DISABLED_TOOLS = frozenset(
@@ -440,11 +440,11 @@ def public_tools():
         params = dict(business_schema)
         params["properties"]["lanid"] = {
             "type": "string", "minLength": 1, "maxLength": 128,
-            "description": "Requester LANID; resolves to a unique OA mailbox on every call.",
+            "description": "Logged-in requester LANID; resolves the mailbox through OA on each call.",
         }
         params["properties"]["name"] = {
             "type": "string", "maxLength": 128,
-            "description": "Optional legacy caller label; ignored for identity resolution and authorization.",
+            "description": "Optional legacy label; ignored for identity and authorization.",
         }
         params["required"] = ["lanid"] + [
             f for f in business_required if f not in ("lanid", "name")
@@ -452,7 +452,7 @@ def public_tools():
 
         description = (
             DESCRIPTIONS[name]
-            + " Every call resolves the target mailbox only through an OA lookup by lanid; name is optional and is not checked."
+            + " Mailbox comes only from lanid."
         )
 
         if name not in _READ_TOOLS:
@@ -463,19 +463,19 @@ def public_tools():
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 2048,
-                        "description": "Return the preview token unchanged to execute the identical operation.",
+                        "description": "Preview token for the identical operation.",
                     },
                     "operation_id": {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 128,
-                        "description": "With identity only: query a receipt without repeating any write.",
+                        "description": "With lanid only: query the saved receipt without writing.",
                     },
                     "idempotency_key": {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 128,
-                        "description": "Optional caller-chosen key; a completed key returns its receipt and never re-executes.",
+                        "description": "Caller key; completed operations replay the receipt without execution.",
                     },
                 }
             )
@@ -488,8 +488,8 @@ def public_tools():
                          [f["name"] for f in fields] + ["confirm_token", "idempotency_key"]]}},
             ]
             description += (
-                " All writes require a preview, then identical params plus operation_id and "
-                "confirm_token. Query operation_id after an uncertain response; never blindly retry."
+                " Preview first; confirm with identical params, operation_id and confirm_token. "
+                "If uncertain, query the original operation_id; never retry blindly."
             )
 
         if name == "create_draft":
@@ -522,15 +522,6 @@ def public_tools():
                 "then": {
                     "required": ["source"],
                     "properties": {"source": {"const": "contacts"}},
-                },
-            }]
-        elif name == "find_message":
-            params["allOf"] = [{
-                "if": {"required": ["aqs"]},
-                "then": {
-                    "properties": {"query": {"const": ""}},
-                    "not": {"anyOf": [{"required": [key]} for key in
-                                      ("since", "until", "is_unread", "has_attachments")]},
                 },
             }]
 

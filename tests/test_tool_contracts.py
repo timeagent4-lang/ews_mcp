@@ -89,7 +89,7 @@ class PublicSchemaTests(unittest.TestCase):
 
     def test_new_parameters_match_signatures_and_defaults(self):
         for tool, owner, fields in (
-            ("find_message", MailOperations, ("query", "aqs", "folder")),
+            ("find_message", MailOperations, ("query", "folder")),
             ("list_flagged_messages", FlagOperations, ("folder", "status")),
             ("create_draft", WriteOperations, ("mode",)),
             ("respond_to_event", CalendarOperations, ("response",)),
@@ -102,7 +102,7 @@ class PublicSchemaTests(unittest.TestCase):
                     default = signature.parameters[name].default
                     if default is not None and default is not inspect.Parameter.empty:
                         self.assertEqual(props[name]["default"], default)
-        self.assertTrue(self.valid("find_message", aqs="subject:hello"))
+        self.assertFalse(self.valid("find_message", aqs="subject:hello"))
         self.assertFalse(self.valid("respond_to_event", event_id="e"))
         self.assertFalse(self.valid("respond_to_event", event_id="e", response="yes"))
         for response in ("accept", "tentative", "decline"):
@@ -160,7 +160,7 @@ class PublicSchemaTests(unittest.TestCase):
                 for hidden in ("params", "ctx", "_tool", "expected_version", "directory_target"):
                     self.assertFalse(validator.is_valid({**valid, hidden: "injected"}))
 
-    def test_draft_mode_and_aqs_conditional_contracts(self):
+    def test_draft_mode_and_structured_search_contracts(self):
         for mode in ("reply", "reply_all", "forward"):
             self.assertFalse(self.valid("create_draft", mode=mode))
             self.assertTrue(self.valid("create_draft", mode=mode, reply_to="original"))
@@ -170,7 +170,7 @@ class PublicSchemaTests(unittest.TestCase):
         for extra in ({"query": "hello"}, {"is_unread": False}, {"has_attachments": False},
                       {"since": "2026-01-01"}, {"until": "2026-01-01"}):
             self.assertFalse(self.valid("find_message", aqs="subject:hello", **extra))
-        self.assertTrue(self.valid("find_message", aqs="subject:hello", query=""))
+        self.assertFalse(self.valid("find_message", aqs="subject:hello", query=""))
 
     def test_existing_implementation_bounds_and_nullable_fields(self):
         for tool in ("find_message", "get_thread", "get_mailbox_overview", "list_events"):
@@ -201,21 +201,9 @@ class SearchBehaviorTests(unittest.TestCase):
         self.folder.filter.return_value.only.return_value.order_by.return_value.__getitem__.return_value = []
         self.mail._tool_folder = Mock(return_value=self.folder)
 
-    def test_aqs_alone_uses_positional_exchange_filter(self):
-        self.mail.find_message(aqs="subject:hello", folder="sent")
-        self.folder.filter.assert_called_once_with("subject:hello")
-        self.mail._tool_folder.assert_called_once_with("sent")
-
     def test_keyword_combines_with_structured_filters(self):
         self.mail.find_message(query="hello", is_unread=False, has_attachments=True)
         self.folder.filter.assert_called_once_with(subject__contains="hello", is_read=True, has_attachments=True)
-
-    def test_mixed_aqs_rejected_before_exchange(self):
-        for extra in ({"query": "x"}, {"is_unread": False}, {"has_attachments": False},
-                      {"since": "2026-01-01"}, {"until": "2026-01-02"}):
-            with self.assertRaises(ToolOperationError):
-                self.mail.find_message(aqs="subject:x", **extra)
-        self.folder.filter.assert_not_called()
 
 
 class MCPContractTests(unittest.IsolatedAsyncioTestCase):
@@ -403,17 +391,22 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
         async with Client(self.server.mcp) as client:
             for exc, code, kind, status in cases:
                 with self.subTest(error=code):
+                    exc.request_id = "request-" + code
                     self.business.send_draft.side_effect = lambda **kw: {
                         "preview": {"items": [], "details": {"canonical_draft_id": "d-"+code}}}
                     preview = (await self.call(client, draft_id="d")).structured_content
                     self.business.send_draft.reset_mock()
-                    self.business.send_draft.side_effect = exc
+                    def submit(**kwargs):
+                        self.business.submission_started = True
+                        raise exc
+                    self.business.send_draft.side_effect = submit
                     confirm = {"draft_id": "d", "operation_id": preview["operation_id"],
                                "confirm_token": preview["confirm_token"]}
                     result = await self.call(client, **confirm)
                     self.assertTrue(result.is_error)
                     self.assertEqual(result.structured_content["error_code"], code)
                     self.assertEqual(result.structured_content["error_kind"], kind)
+                    self.assertEqual(result.structured_content["request_id"], exc.request_id)
                     self.assertNotIn("SECRET_PROGRAM_DETAIL", str(result))
                     self.assertEqual(self.store.get(preview["operation_id"])["status"], status)
                     replay_params = [{"operation_id": preview["operation_id"]}]
@@ -424,6 +417,7 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
                         self.assertTrue(replay.is_error)
                         self.assertEqual(replay.structured_content["status"], status)
                         self.assertEqual(replay.structured_content["error_code"], code)
+                        self.assertEqual(replay.structured_content["request_id"], exc.request_id)
                         self.assertNotIn("SECRET_PROGRAM_DETAIL", str(replay))
                         if kind == "exchange":
                             self.assertEqual(replay.structured_content["error_code_normalized"],
@@ -453,7 +447,7 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
                         result = await self.call(client, "update_messages", **params)
                         payload = result.structured_content
                         self.assertEqual(result.is_error, failures != 0)
-                        self.assertEqual(payload["ok"], failures == 0)
+                        self.assertNotIn("ok", payload)
                         self.assertEqual(payload["status"], status)
                         self.assertEqual(payload.get("error_code"), code)
                         self.assertEqual(payload["results"], {"results": rows})
@@ -481,6 +475,61 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
                 result = await self.call(client, draft_id="d", operation_id=op, confirm_token=token)
                 self.assertEqual(result.structured_content["status"], "completed")
             self.business.send_draft.assert_called_once_with(draft_id="d", confirm=True, confirmation_id=token)
+
+    async def test_wire_json_mirrors_structured_results_for_every_result_kind(self):
+        self.business.find_people.return_value = {"items": [], "sources": {"gal": "ok"}}
+        async with Client(self.server.mcp) as client:
+            results = [await self.call(client, "find_people", query="同事"),
+                       await self.call(client, "get_message")]
+            preview = await self.call(client, draft_id="d")
+            results.append(preview)
+            payload = preview.structured_content
+            results.append(await self.call(client, operation_id=payload["operation_id"]))
+            results.append(await self.call(client, draft_id="d", operation_id=payload["operation_id"],
+                                           confirm_token=payload["confirm_token"]))
+        for result in results:
+            with self.subTest(payload=result.structured_content):
+                self.assertEqual(len(result.content), 1)
+                self.assertEqual(json.loads(result.content[0].text), result.structured_content)
+                self.assertNotIn("ok", result.structured_content)
+        self.assertEqual(preview.structured_content["status"], "pending")
+
+    async def test_active_receipts_are_progress_and_audit_the_actual_status(self):
+        async with Client(self.server.mcp) as client:
+            for status in ("pending", "confirmed", "executing"):
+                row = self.record(status=status)
+                self.server.tool_audit.logger.reset_mock()
+                result = await self.call(client, operation_id=row["operation_id"])
+                self.assertFalse(result.is_error)
+                self.assertNotIn("error_code", result.structured_content)
+                self.assertEqual(result.structured_content["status"], status)
+                audit = json.loads(self.server.tool_audit.logger.info.call_args.args[0])
+                self.assertEqual(audit["status"], status)
+                self.assertIsNone(audit["error_code"])
+
+    async def test_missing_operation_is_distinct_from_unknown_outcome(self):
+        async with Client(self.server.mcp) as client:
+            for params in ({"operation_id": "missing"},
+                           {"draft_id": "d", "operation_id": "missing", "confirm_token": "token"}):
+                result = await self.call(client, **params)
+                self.assertTrue(result.is_error)
+                self.assertEqual(result.structured_content["error_code"], "OPERATION_NOT_FOUND")
+                self.assertEqual(result.structured_content["message"], "未找到 operation_id 对应的操作记录")
+                self.assertNotIn("status", result.structured_content)
+        self.business.send_draft.assert_not_called()
+
+    async def test_incomplete_read_is_not_a_failed_operation(self):
+        self.business.find_people.return_value = {
+            "items": [{"display_name": "Alex"}], "partial": True,
+            "sources": {"gal": "ok", "contacts": "denied"}}
+        async with Client(self.server.mcp) as client:
+            result = await self.call(client, "find_people", query="Alex")
+        self.assertFalse(result.is_error)
+        self.assertNotIn("status", result.structured_content)
+        self.assertNotIn("error_code", result.structured_content)
+        self.assertEqual(result.structured_content["message"], "查询部分完成，结果不完整")
+        audit = json.loads(self.server.tool_audit.logger.info.call_args.args[0])
+        self.assertEqual(audit["status"], "incomplete")
 
     async def test_oa_failure_blocks_receipt_query(self):
         row = self.record(status="completed")
@@ -660,14 +709,37 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
         mail._tool_folder = Mock(return_value=folder)
         self.business.find_message.side_effect = mail.find_message
         async with Client(self.server.mcp) as client:
-            for params in ({"aqs": "subject:x", "folder": "sent"},
+            for params in ({"query": "x", "folder": "sent"},
                            {"query": "x", "is_unread": False}):
                 result = await self.call(client, "find_message", **params)
                 self.assertFalse(result.is_error)
             self.assertEqual(folder.filter.call_count, 2)
             result = await self.call(client, "find_message", aqs="subject:x", has_attachments=False)
             self.assertEqual(result.structured_content["error_code"], "INVALID_PARAMS")
+            self.assertEqual(result.structured_content["message"], "请求包含不支持的参数")
             self.assertEqual(folder.filter.call_count, 2)
+
+    async def test_parameter_errors_describe_the_actual_constraint(self):
+        cases = [
+            ("get_message", {}, "缺少必填参数 message_id"),
+            ("create_draft", {"mode": "reply"}, "缺少必填参数 reply_to"),
+            ("update_messages", {"ids": [123]}, "参数 ids[0] 必须是字符串"),
+            ("find_message", {"limit": "20"}, "参数 limit 必须是整数"),
+            ("find_message", {"limit": 101}, "参数 limit 必须在 1–100 之间"),
+            ("send_draft", {"draft_id": "d", "operation_id": "op"},
+             "确认执行需要 operation_id、confirm_token 和原预览业务参数"),
+        ]
+        async with Client(self.server.mcp) as client:
+            missing = await client.call_tool("get_message", {}, raise_on_error=False)
+            self.assertEqual(missing.structured_content["message"],
+                             "缺少必填参数 lanid，请传入当前登录用户的 LANID")
+            for tool, params, message in cases:
+                with self.subTest(tool=tool, params=params):
+                    result = await self.call(client, tool, **params)
+                    self.assertTrue(result.is_error)
+                    self.assertEqual(result.structured_content["message"], message)
+                    self.assertNotIn("missing_fields", result.structured_content)
+        self.business.find_message.assert_not_called()
 
     async def test_search_lookahead_error_keeps_exchange_error_at_mcp_entry(self):
         from exchangelib.errors import ErrorAccessDenied

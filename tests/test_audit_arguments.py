@@ -70,13 +70,14 @@ class AuditArgumentTests(unittest.IsolatedAsyncioTestCase):
             "idempotency_key": "IDEMPOTENCY_SECRET", "subject": "SUBJECT_SECRET",
             "internal_reply": "INTERNAL_SECRET", "external_reply": "EXTERNAL_SECRET",
             "message": "MESSAGE_SECRET", "content_base64": "BASE64_SECRET",
+            "notes": "CONTACT_NOTES_SECRET",
             "confirm_token": None,
             "query": "同事",
         })
         for secret in (
             "CONFIRM_SECRET", "PASSWORD_SECRET", "API_SECRET", "AUTH_SECRET",
             "IDEMPOTENCY_SECRET", "SUBJECT_SECRET", "INTERNAL_SECRET",
-            "EXTERNAL_SECRET", "MESSAGE_SECRET", "BASE64_SECRET", "敏感正文",
+            "EXTERNAL_SECRET", "MESSAGE_SECRET", "BASE64_SECRET", "CONTACT_NOTES_SECRET", "敏感正文",
         ):
             self.assertNotIn(secret, serialized)
         snapshot = event["input_arguments"]

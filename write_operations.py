@@ -10,6 +10,9 @@ from html import escape as _html_escape
 
 from exchangelib import FileAttachment, HTMLBody, Mailbox, Message
 from exchangelib.items.base import MOVE_TO_DELETED_ITEMS, NEVER_OVERWRITE
+from exchangelib.items.calendar_item import MeetingRequest
+
+from mail_replies import meeting_text_reply
 
 from tool_support import (
     ToolOperationError,
@@ -332,7 +335,9 @@ class WriteOperations:
         else:
             if not reply_to:
                 raise ToolOperationError("ORIGINAL_REQUIRED", "回复或转发需要原邮件 ID。")
-            original = _ordinary_message(self._tool_item(reply_to))
+            original = self._tool_item(reply_to)
+            if not (type(original) is MeetingRequest and mode in ("reply", "reply_all")):
+                original = _ordinary_message(original)
             new_body = HTMLBody(body) if html_reply else _new_body(body, original.body)
             target_subject = subject or (
                 ("FW: " if mode == "forward" else "RE: ") + (original.subject or "")
@@ -373,7 +378,11 @@ class WriteOperations:
                     raise ToolOperationError(
                         "REPLY_RECIPIENT_REQUIRED", "原邮件没有可用的回复收件人，请明确指定。"
                     )
-                if mode == "reply_all":
+                if type(original) is MeetingRequest:
+                    draft = meeting_text_reply(
+                        original, mode=mode, subject=target_subject, body=new_body,
+                        author=author, to=to, cc=cc, bcc=bcc)
+                elif mode == "reply_all":
                     draft = original.create_reply_all(
                         subject=target_subject, body=new_body, author=author
                     )
@@ -508,6 +517,7 @@ class WriteOperations:
         if updates:
             try:
                 # NeverOverwrite 使 Exchange 拒绝覆盖本次读取后发生的并发修改。
+                self.submission_started = True
                 draft.save(update_fields=list(updates), conflict_resolution=NEVER_OVERWRITE)
             except Exception as exc:
                 raise ToolOperationError(
@@ -553,25 +563,17 @@ class WriteOperations:
         attachment = FileAttachment(name=metadata['filename'], content=verified.content, size=metadata['size'],
                                     content_type=mime, is_inline=is_inline, content_id=content_id)
         try:
+            self.submission_started = True
             draft.attach(attachment)
         except Exception as exc:
             code, message, _ = classify_submission_failure(exc, action='附加草稿附件',
                 unknown_code='ATTACHMENT_FAILED_OR_UNKNOWN', rejected_code='ATTACHMENT_REJECTED')
             raise ToolOperationError(code, message) from exc
-        try:
-            identifier = getattr(getattr(attachment, 'attachment_id', None), 'id', None)
-            if not identifier or not draft.changekey or draft.changekey == expected_version['changekey']:
-                raise ValueError('incomplete attachment result')
-            current = self._write_draft(draft.id)
-            actual = next((a for a in current.attachments or [] if getattr(getattr(a, 'attachment_id', None), 'id', None) == identifier), None)
-            if (actual is None or not current.changekey or actual.size != metadata['size']
-                    or bool(actual.is_inline) != is_inline or (is_inline and actual.content_id != content_id)):
-                raise ValueError('incomplete attachment metadata')
-            return {'draft_id': current.id, 'attachment_id': identifier, 'changekey': current.changekey,
-                    'filename': actual.name, 'size': metadata['size'], 'content_type': actual.content_type,
-                    'sha256': metadata['sha256'], 'is_inline': bool(actual.is_inline), 'content_id': actual.content_id}
-        except Exception:
-            raise ToolOperationError('ATTACHMENT_RECEIPT_INCOMPLETE', '附件可能已写入但回执不完整，请查询原操作号，勿重复附加。') from None
+        return {'draft_id': draft.id,
+                'attachment_id': getattr(getattr(attachment, 'attachment_id', None), 'id', None),
+                'changekey': draft.changekey, 'filename': metadata['filename'],
+                'size': metadata['size'], 'content_type': mime, 'sha256': metadata['sha256'],
+                'is_inline': is_inline, 'content_id': content_id}
 
     def send_draft(self, draft_id, confirm=False, confirmation_id=None, expected_version=None):
         draft = self._write_draft(draft_id)
@@ -594,8 +596,10 @@ class WriteOperations:
         if preview:
             return preview
         require_send("发送邮件")
+        sent_folder = self._tool_folder("sent")
         try:
-            draft.send(save_copy=True, copy_to_folder=self._tool_folder("sent"))
+            self.submission_started = True
+            draft.send(save_copy=True, copy_to_folder=sent_folder)
         except Exception as exc:
             # A timeout can mean the send succeeded; a definite rejection did not.
             code, message, _ = classify_submission_failure(
@@ -604,6 +608,12 @@ class WriteOperations:
                 unknown_code="SEND_FAILED_OR_UNKNOWN",
                 rejected_code="SEND_REJECTED",
             )
+            if code == "SEND_FAILED_OR_UNKNOWN":
+                message = (
+                    "邮箱服务不稳定 请五分钟后查看结果"
+                    if "timeout" in exc.__class__.__name__.lower()
+                    else "发送结果未知，请核实实际已发送邮件，勿重复提交。"
+                )
             raise ToolOperationError(code, message) from exc
         return {"id": draft.id, "sent": True, "copy_folder": "sent"}
 

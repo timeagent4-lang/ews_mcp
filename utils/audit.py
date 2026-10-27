@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from fastmcp.server.middleware import Middleware
 from mcp import types as mcp_types
+from utils.tool_results import ACTIVE_STATUSES, result_is_error
 
 
 AUDIT_IDENTITY_STATE_KEY = "mail_mcp.identity_assurance"
@@ -23,7 +24,7 @@ _UNICODE_LINE_SEPARATOR_ESCAPES = {
 _AUDIT_EMITTED = ContextVar("mail_mcp.audit_emitted", default=False)
 _MAX_INPUT_BYTES = 16384
 _PRIVATE_FIELDS = frozenset({
-    "subject", "body", "message", "internalreply", "externalreply", "content",
+    "subject", "body", "message", "notes", "internalreply", "externalreply", "content",
     "contentbytes", "contentbase64", "base64", "attachmentdata", "attachment", "attachments",
     "filename", "path", "filepath", "localpath", "serverpath", "savedpath",
 })
@@ -188,14 +189,10 @@ def _classify_result(result):
     if structured is None:
         structured = getattr(root, "structuredContent", None)
 
-    if (
-        isinstance(structured, dict)
-        and structured.get("status") == "processing"
-        and structured.get("wait_timed_out") is True
-    ):
-        status = "processing"
+    if isinstance(structured, dict) and structured.get("status") in ACTIVE_STATUSES:
+        status = structured["status"]
         error_code = None
-    elif isinstance(structured, dict) and structured.get("ok") is False:
+    elif isinstance(structured, dict) and (result_is_error(structured) or structured.get("ok") is False):
         error_code = structured.get("error_code")
         status = (
             "rejected"
@@ -205,6 +202,9 @@ def _classify_result(result):
     elif getattr(root, "isError", False) is True:
         status = "failure"
         error_code = "MCP_TOOL_ERROR"
+    elif isinstance(structured, dict) and structured.get("partial") is True:
+        status = "incomplete"
+        error_code = None
     else:
         status = "success"
         error_code = None

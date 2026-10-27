@@ -273,7 +273,6 @@ class MailOperations:
     def find_message(
         self,
         query="",
-        aqs=None,
         folder="inbox",
         since=None,
         until=None,
@@ -288,13 +287,6 @@ class MailOperations:
             raise ToolOperationError(
                 "INVALID_FOLDER", "邮件搜索仅支持 inbox、drafts、sent。"
             )
-        if aqs is not None and (
-            query
-            or any(v is not None for v in (since, until, is_unread, has_attachments))
-        ):
-            raise ToolOperationError(
-                "INVALID_QUERY", "AQS 不能与 query 或结构化筛选混用。"
-            )
         target = self._tool_folder(folder)
         time_field = (
             "datetime_created"
@@ -303,31 +295,26 @@ class MailOperations:
             if folder == "sent"
             else "datetime_received"
         )
-        if aqs is not None:
-            if not isinstance(aqs, str) or not aqs.strip():
-                raise ToolOperationError("INVALID_QUERY", "AQS 不能为空。")
-            queryset = target.filter(aqs)
-        else:
-            filters = {}
-            if query:
-                filters["subject__contains"] = query
-            if since is not None:
-                filters[time_field + "__gte"] = EWSDateTime.from_datetime(
-                    parse_datetime(since).astimezone(LOCAL_TIMEZONE)
-                )
-            if until is not None:
-                filters[time_field + "__lt"] = EWSDateTime.from_datetime(
-                    parse_datetime(until).astimezone(LOCAL_TIMEZONE)
-                )
-            if since is not None and until is not None and parse_datetime(since) >= parse_datetime(until):
-                raise ToolOperationError(
-                    "INVALID_DATETIME_RANGE", "since 必须早于 until。"
-                )
-            if is_unread is not None:
-                filters["is_read"] = not is_unread
-            if has_attachments is not None:
-                filters["has_attachments"] = has_attachments
-            queryset = target.filter(**filters)
+        filters = {}
+        if query:
+            filters["subject__contains"] = query
+        if since is not None:
+            filters[time_field + "__gte"] = EWSDateTime.from_datetime(
+                parse_datetime(since).astimezone(LOCAL_TIMEZONE)
+            )
+        if until is not None:
+            filters[time_field + "__lt"] = EWSDateTime.from_datetime(
+                parse_datetime(until).astimezone(LOCAL_TIMEZONE)
+            )
+        if since is not None and until is not None and parse_datetime(since) >= parse_datetime(until):
+            raise ToolOperationError(
+                "INVALID_DATETIME_RANGE", "since 必须早于 until。"
+            )
+        if is_unread is not None:
+            filters["is_read"] = not is_unread
+        if has_attachments is not None:
+            filters["has_attachments"] = has_attachments
+        queryset = target.filter(**filters)
         rows = list(
             queryset.only(*SIMPLE_FIELDS)
             .order_by("-" + time_field)[offset : offset + limit + 1]
@@ -379,16 +366,20 @@ class MailOperations:
         for name in ("inbox", "sent"):
             try:
                 target = self._tool_folder(name)
+                queryset = (
+                    target.filter(conversation_id=source.conversation_id)
+                    .only(*SIMPLE_FIELDS)
+                    .order_by("datetime_sent")
+                )
+                folder_rows = list(queryset[: offset + limit + 1])
+                for row in folder_rows:
+                    if isinstance(row, Exception):
+                        raise row
             except Exception as exc:  # noqa: BLE001 - per-folder coverage
                 coverage[name] = _folder_coverage(exc)
                 continue
             coverage[name] = "ok"
-            queryset = (
-                target.filter(conversation_id=source.conversation_id)
-                .only(*SIMPLE_FIELDS)
-                .order_by("datetime_sent")
-            )
-            rows.extend((row, name) for row in queryset[: offset + limit + 1])
+            rows.extend((row, name) for row in folder_rows)
         if not any(status == "ok" for status in coverage.values()):
             raise ToolOperationError(
                 "THREAD_FOLDERS_UNAVAILABLE", "收件箱与已发送邮件均不可访问，无法读取会话。"

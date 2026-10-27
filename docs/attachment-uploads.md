@@ -88,9 +88,9 @@ finally:
 }
 ```
 
-确认时复制原业务参数，仅添加返回的操作号和确认令牌。成功回执包含 `draft_id`、`attachment_id`、最新已知 `changekey`、filename、size、content_type、sha256、is_inline、content_id；没有文件字节或服务器路径。inline成功后才使用 `<img src="cid:实际content_id">`，不要猜CID或把预览当作已附加成功。
+确认时复制原业务参数，仅添加返回的操作号和确认令牌。SDK 正常返回即表示附加成功，不依赖额外读回或服务器估算大小相等。回执包含 `draft_id` 及本次提交的 filename、size、content_type、sha256、is_inline、content_id；`attachment_id` 和 `changekey` 在 SDK 可取得时返回，缺失不把成功改为 unknown。没有文件字节或服务器路径。inline成功后才使用 `<img src="cid:实际content_id">`，不要猜CID或把预览当作已附加成功。
 
-查询回执只传 `lanid` 与原 `operation_id`，不带草稿ID、upload_id或confirm_token。结果为unknown时禁止自动重新附加或发送；回执不依赖暂存文件仍存在。send_draft仍最多等待30秒，processing表示后台可能继续，详见[发送等待](send-response-wait.md)。
+查询回执只传 `lanid` 与原 `operation_id`，不带草稿ID、upload_id或confirm_token。附件结果为 unknown 时继续隔离，禁止自动重新附加或发送；回执不依赖暂存文件仍存在。send_draft 最多等待30秒，无结果返回 processing，后台继续一次，由调用方五分钟后查询实际已发送邮件。发送任务结束后的 unknown 不永久占用草稿，与附件 unknown 的隔离规则不同，详见[发送等待](send-response-wait.md)。
 
 ## 上传与幂等
 
@@ -131,11 +131,11 @@ EWS_MCP_PREVIEW_TTL_SECONDS=1800
 
 预览与引用、确认与执行占用、最终回执与资源释放分别在同一SQLite事务提交。正在接收/读取、有效预览、执行和unknown隔离保护的文件不能被清理。删除先标deleting、物理删除成功才释放配额。默认未引用ready保留24小时；有效预览可延长保护，不能只按24小时删除。上传启用需要正预览TTL。
 
-重启仍将活跃业务操作转unknown；只有预览、未执行的引用可释放，中断receiving作废，已有有效prepared/ready可保留。执行中或可能已提交的操作保留草稿隔离与核查线索；不会自动重附加或发送。禁用上传后，服务仍清理已有过期上传缓存。只支持单实例及可靠本地文件系统，不能直接在共享网络盘或多实例上复制此部署。
+重启将活跃业务操作转unknown；未执行的预览引用可释放，中断receiving作废，已有有效prepared/ready可保留。附件执行中或可能已提交的操作保留草稿隔离与核查线索；发送操作结束及重启后释放发送占用，同操作号仍去重。不会自动重附加或发送。禁用上传后，服务仍清理已有过期上传缓存。只支持单实例及可靠本地文件系统，不能直接在共享网络盘或多实例上复制此部署。
 
-### unknown的受控维护
+### 附件 unknown 的受控维护
 
-先查询原回执。若仍executing且原进程已经终止，走正常启动恢复后再查询；维护对象必须已为unknown。停止本实例，备份数据库及文件卷；在获准邮箱核查真实附件ID/CID、大小/摘要或实际已发送结果。暂时未找到不能证明未提交，证据不足保持隔离。
+本节只处理附件附加的 unknown 隔离。先查询原回执；若仍executing且原进程已经终止，走正常启动恢复后再查询，维护对象必须已为unknown。停止本实例，备份数据库及文件卷；在获准邮箱核查真实附件ID/CID及内容，不能仅用 Exchange 估算大小与原字节数不同判定失败。暂时未找到不能证明未提交，证据不足保持隔离。
 
 有充分证据后，用一次本地维护事务执行以下步骤；不在服务运行时编辑数据库，不直接删除claim，不重放EWS请求：
 
@@ -158,7 +158,7 @@ EWS_MCP_PREVIEW_TTL_SECONDS=1800
 | PUT | 408 / 429 / 503 | 接收超时、接收容量或存储不可用 |
 | PUT | 409 | 正在接收或已经封存；不可覆盖 |
 | MCP | DRAFT_CHANGED / PREVIEW_VERSION_REQUIRED | 重新读取并预览，不复用旧确认 |
-| MCP | DRAFT_BUSY | 同草稿执行中或unknown隔离，查询原操作 |
-| MCP | ATTACHMENT_FAILED_OR_UNKNOWN / ATTACHMENT_RECEIPT_INCOMPLETE / OPERATION_UNKNOWN | 可能已提交，禁止自动附加或发送 |
+| MCP | DRAFT_BUSY | 同草稿任务仍在执行，或附件附加结果未知而隔离；查询原操作 |
+| MCP | ATTACHMENT_FAILED_OR_UNKNOWN | 附件可能已提交，保留隔离，不自动重新附加或发送 |
 
 内网验收使用获准测试对象：从Agent真实执行环境上传一个PDF/表格和一个logo；附加后下载取回比对原字节与SHA-256；新建/回复/全部回复/转发分别检查原文和旧inline保留；最终重新预览发送，验证收件人及已发送副本的普通附件与CID显示。另验收PUT代理限制、过期、错误owner、并发确认和日志脱敏。离线SDK/XML/MCP测试通过不能代替这些结果。

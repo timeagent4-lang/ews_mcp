@@ -118,13 +118,25 @@ class DraftAttachmentTests(unittest.TestCase):
             with self.assertRaises(ToolOperationError) as caught: self.execute(upload_id, details)
             self.assertEqual(caught.exception.code, 'DRAFT_CHANGED')
 
-    def test_attachment_incomplete_receipt_is_unknown(self):
+    def test_sdk_success_without_optional_receipt_fields_is_success(self):
         upload_id = self.ready(b'abc')
         details = self.preview(upload_id)
         with patch.object(Message, 'attach', return_value=None):
-            with self.assertRaises(ToolOperationError) as caught: self.execute(upload_id, details)
-        self.assertEqual(caught.exception.code, 'ATTACHMENT_RECEIPT_INCOMPLETE')
-        self.assertFalse(is_definite_rejection(caught.exception))
+            result = self.execute(upload_id, details)
+        self.assertIsNone(result['attachment_id'])
+        self.assertEqual(result['size'], 3)
+
+    def test_sdk_success_is_not_reclassified_by_readback_or_exchange_encoded_size(self):
+        upload_id = self.ready(b'abc')
+        details = self.preview(upload_id)
+        self.ops._tool_item.side_effect = [self.draft, TimeoutError('unnecessary readback')]
+        def exchange(service, *, parent_item, items):
+            return FileAttachment(size=368, attachment_id=AttachmentId(id='new-att', root_id='draft', root_changekey='v2'))
+        with patch.object(CreateAttachment, 'get', autospec=True, side_effect=exchange):
+            result = self.execute(upload_id, details)
+        self.assertEqual(result['size'], 3)
+        self.assertEqual(result['attachment_id'], 'new-att')
+        self.assertEqual(self.ops._tool_item.call_count, 2)  # preview + one pre-submit read
 
     def test_draft_limits_include_existing_attachments_with_unknown_sizes_rejected(self):
         for size in (None, 20 * 1024 * 1024):

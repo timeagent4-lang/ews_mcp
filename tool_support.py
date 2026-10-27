@@ -57,11 +57,13 @@ def parse_local_datetime(value):
 
 
 def iso_datetime(value):
-    return (
-        parse_local_datetime(value).isoformat()
-        if value is not None
-        else None
-    )
+    if value is None:
+        return None
+    local = parse_local_datetime(value)
+    # Historical IANA offsets can include seconds; RFC 3339 permits HH:MM only.
+    if local.utcoffset().total_seconds() % 60:
+        local = local.astimezone(ZoneInfo("UTC"))
+    return local.isoformat()
 
 
 def require_send(action_desc: str) -> None:

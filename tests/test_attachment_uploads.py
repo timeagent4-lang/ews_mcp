@@ -172,7 +172,7 @@ class UploadStoreTests(unittest.TestCase):
             store.finish_cleanup(deletion)
         self.assertEqual(self.operations.get(operation['operation_id'])['result'], {'attachment_id': 'a'})
 
-    def test_different_drafts_are_independent_and_restart_preserves_unknown_fence(self):
+    def test_different_drafts_are_independent_and_restart_releases_send_claims(self):
         operations = []
         for draft in ('first', 'second'):
             record = self.operations.create_preview(tool='send_draft', mailbox='employee@example.com', action='send_draft',
@@ -184,7 +184,7 @@ class UploadStoreTests(unittest.TestCase):
         other = OperationStore(self.operations.db_path)
         self.addCleanup(other.close)
         self.assertTrue(all(other.get(record['operation_id'])['status'] == 'unknown' for record, _ in operations))
-        self.assertEqual(other._conn.execute('SELECT COUNT(*) FROM draft_claims').fetchone()[0], 2)
+        self.assertEqual(other._conn.execute('SELECT COUNT(*) FROM draft_claims').fetchone()[0], 0)
 
     def test_upload_settings_reject_unbounded_preview_and_invalid_limits(self):
         for extra in ({'preview_ttl_seconds':0}, {'base_url':'http://user:secret@host'}, {'max_bytes':-1}, {'max_cache_bytes':1}):

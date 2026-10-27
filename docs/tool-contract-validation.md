@@ -2,28 +2,40 @@
 
 本文保留 2026-09-22 合同修复阶段的验证记录，以下测试数量和缺失模块情况均为当时结果。后续已恢复员工版模块，并在 2026-10-09 移除邮件镜像；未使用的 `tool_params.py` 也已从当前版本删除。当前源码状态见 [源码恢复记录](source-restoration.md)。接入当前版本时需重新验证，不能沿用历史测试结论。
 
-本次业务源码仅修改 `tool_specs.py`、`mcp_server.py`、`calendar_operations.py`。
-保留现有注册、业务分发、附件下载和禁用工具集合；`tool_params.py` 未接入或修改。
+历史合同修复阶段仅修改 `tool_specs.py`、`mcp_server.py`、`calendar_operations.py`；以下注明日期的测试数量仍为历史记录。
+
+## 当前结果合同（2026-10-27）
+
+- `structuredContent` 的同一对象完整序列化为 JSON `TextContent`；MCP 外层保留 `isError`，业务结果不返回重复的 `ok`。
+- 写预览为 `pending`；`confirmed`、`executing`、`processing` 表示尚未完成，无 `error_code`、`isError=false`。`completed` 无错误码；`failed`、`partial`、`unknown` 保留具体错误码且 `isError=true`。
+- 参数、权限或令牌拒绝只表示本次调用被拒绝，不把原操作标为失败。缺少操作记录为 `OPERATION_NOT_FOUND`，不同于执行结果未知；首次返回、查询和重复确认使用一致的已记录结果。
+- 普通读取不增加生命周期 `status`。联系人及线程查询区分成功零匹配、部分完成和全部来源失败：部分可用时保留结果及覆盖信息，`partial=true`、`isError=false`；全部失败返回具体错误。`list_folders` 返回访问情况探测报告，即使全部不可访问也不伪装为探测失败。
+- `message` 只说明具体缺参、类型、范围或确认参数组合，例如“缺少必填参数 lanid，请传入当前登录用户的 LANID”。不增加缺失字段列表，不回显敏感参数值。
+- `create_contact` 的 `display_name` 必填，`email` 可省略；传入时校验格式。保留 `phone/company_name/job_title`，增加 `department/mobile_phone/office/notes`；创建预览、保存、回执及详情一致，备注为纯文本。联系人范围和工具数量不变。
+- `create_draft` 的 `reply/reply_all` 支持会议邀请邮件 ID，创建普通文字回复，不改变参会状态；RSVP 仍通过日历 ID 调用 `respond_to_event`。其他会议消息及会议邀请转发不扩展。
+- `last_response_time` 的已知年 1 占位值返回 `null`，保留参会响应类型；有效历史时间若出现秒级时区偏移则以 UTC 表达同一时刻，全天日期不变。
+- 发送等待和实际结果核实见[发送等待说明](send-response-wait.md)。本地回执不是 Exchange 邮件当前状态查询。
 
 ## 公开参数与调用入口
 
-- 补充 `respond_to_event.response`、`create_draft.mode`、`find_message.aqs/folder`、`list_flagged_messages.folder/status`。
-- `find_message.query` 可省略，默认空串，只做主题包含搜索，可结合结构化过滤。AQS 不能混用非空 query 或任何结构化过滤（包括显式 false）。
+- 当前调用合同：`arguments` 为扁平对象，必填 `lanid` 及工具所需业务参数，不使用 `params` 包裹。邮箱仅来自 OA 按 LANID 查询的唯一结果，仍检查结果唯一性和邮箱有效性；兼容字段 `name` 可省略，传入时忽略，不用于验证或授权。以下历史测试结论不能替代此合同的重新验证。
+- `respond_to_event.response`、`create_draft.mode`、`find_message.folder`、`list_flagged_messages.folder/status` 采用公开 schema 的枚举。
+- `find_message.query` 可省略，默认空串，只做主题包含搜索，可结合文件夹、时间、已读及附件条件。
 - 回复、回复全部、转发草稿必须给 `reply_to`；默认新建模式不接受原邮件引用。
 - 对照现有邮件、日历、标记模块：分页长度 1–100，偏移量非负且无实现层上限；正文长度 1–100000；批量 ID 数组 1–50 项，不接受空 ID 或重复 ID。
 - JSON schema 的 default 仅是公开默认值，运行时依赖业务方法默认参数，不注入默认字段，避免改变确认快照。
 - 入口在现有审计中间件之后、业务处理之前校验原始 arguments，分发层也校验 params。未知字段、显式 null、错误类型和非法操作组合返回 `INVALID_PARAMS`，不回显输入；拒绝结果经过原审计链路，再由已有 MCP 结果封装层设置错误标志。注册处理函数不再暴露可被传入的 `_tool` 默认参数。
-- 当前注册工具仍为 28 个。人员、任务、可用性等缺失模块的业务上下限无法核实，保留原有声明。
+- 当前注册 30 个工具；实际参数和边界以当前 `tools/list` 与源码为准。
 
 ## 写操作三种请求
 
-以下字段均放在 `arguments.params` 中：
+以下字段均直接放在扁平的 `arguments` 中：
 
 | 路径 | 参数 |
 | --- | --- |
-| 预览 | lanid、name、必需业务参数，可选 idempotency_key |
-| 确认 | lanid、name、与预览一致的业务参数、operation_id、confirm_token |
-| 仅查询 | lanid、name、operation_id |
+| 预览 | lanid、必需业务参数，可选 idempotency_key |
+| 确认 | lanid、与预览一致的业务参数、operation_id、confirm_token |
+| 仅查询 | lanid、operation_id |
 
 确认仍允许携带 idempotency_key；执行绑定于预览记录。仅查询不接受业务字段、令牌或幂等键。
 
@@ -50,7 +62,7 @@ python -B -m unittest discover -s tests -v
 本地验证使用现有临时虚拟环境中的 FastMCP 2.14.7、MCP 1.29.0、exchangelib 5.6.0。
 2026-09-22：54 个测试通过，其中原有附件测试 23 个，新增合同/日历测试 31 个。
 测试使用实际 FastMCP 注册、MCP Client 内存传输、分发器、SQLite 回执存储，以及真实邮件/日历业务方法；Exchange 写方法均被替换为测试桩。
-已覆盖参数/default/枚举、AQS、公开 schema 的实际拒绝行为、预览/确认/查询、跨工具/邮箱拒绝、幂等/过期/不重复执行、日历角色及发送行为；包括建立 Exchange 连接期间预览过期时仍不得执行。
+已覆盖参数/default/枚举、公开 schema 的实际拒绝行为、预览/确认/查询、跨工具/邮箱拒绝、幂等/过期/不重复执行、日历角色及发送行为；包括建立 Exchange 连接期间预览过期时仍不得执行。
 
 当时完整 `import mcp_server` 因缺少 `utils` 失败；缺失文件包括 `utils/audit.py`、`utils/lanid_email.py`、`availability_operations.py`、`mirror.py`、`oof_operations.py`、`people_operations.py`、`task_operations.py`。这是历史恢复前的状态，当前不再依赖镜像模块。
 服务器测试仅在导入期间替换 OA、审计、Outlook 客户端依赖，没有补造生产模块。
@@ -68,7 +80,7 @@ python -B -m unittest discover -s tests -v
 | MCP 输入验证 | [MCP Tools 规范](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)要求服务端校验工具输入并实施访问控制；仅公开 schema 不等于执行校验。 |
 | FastMCP 校验模式 | [维护者文档](https://github.com/prefecthq/fastmcp/blob/main/docs/servers/tools.mdx)区分默认宽松模式与 strict_input_validation。另核对本地 FastMCP 2.14.7 的 settings.py、server/server.py、tools/tool.py：默认 strict 为 false，函数签名校验不等于自定义嵌套 schema 校验；本项目入口补校验有必要。版本结论以本地锁定版源码为准。 |
 | 三种请求、默认值 | [JSON Schema oneOf](https://json-schema.org/understanding-json-schema/reference/combining)要求恰好一个分支成立；[default 注解](https://json-schema.org/understanding-json-schema/reference/annotations)本身不填充遗漏值。当前 schema 分支和不注入默认字段的做法与此一致。 |
-| 搜索 | [exchangelib 维护者文档](https://ecederstrand.github.io/exchangelib/)明确 subject__contains 为主题包含搜索，QueryString 通过 filter 的位置参数传入且不可结合其他过滤。 |
+| 搜索 | [exchangelib 维护者文档](https://ecederstrand.github.io/exchangelib/)说明 subject__contains 为主题包含搜索。 |
 | 周期类型 | [Microsoft CalendarItemType](https://learn.microsoft.com/en-us/exchange/client-developer/web-service-reference/calendaritemtype)列出 Single、Occurrence、Exception、RecurringMaster。拒绝主事件是本项目约束，不是 EWS 不支持周期操作。 |
 | 响应角色 | [Microsoft AcceptItemType](https://learn.microsoft.com/en-us/dotnet/api/exchangewebservices.acceptitemtype?view=exchange-ews-proxy)明确组织者不能接受自己的会议；参会人邮箱精确匹配为本项目的额外检查，不代表覆盖所有别名和通讯组场景。 |
 | 取消与删除 | [Microsoft 删除预约／取消会议文档](https://learn.microsoft.com/en-us/exchange/client-developer/exchange-web-services/how-to-delete-appointments-and-cancel-meetings-by-using-ews-in-exchange)区分有参会人的会议和无参会人的预约，后者不需要发送通知。当前两条路径符合此区分。 |

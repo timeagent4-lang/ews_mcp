@@ -114,12 +114,14 @@ class SendResponseWaitTests(unittest.IsolatedAsyncioTestCase):
     def assert_processing(self, result, operation_id):
         data = result.structured_content
         self.assertFalse(result.is_error, data)
-        self.assertFalse(data["ok"])
+        self.assertNotIn("ok", data)
         self.assertEqual(data["status"], "processing")
         self.assertEqual(data["operation_id"], operation_id)
         self.assertIsNone(data["results"])
         self.assertTrue(data["wait_timed_out"])
-        self.assertTrue(data["note"])
+        self.assertEqual(data["message"], "邮箱服务不稳定 请五分钟后查看结果")
+        self.assertNotIn("error_code", data)
+        self.assertEqual(json.loads(result.content[0].text), data)
         self.assertNotIn("confirm_token", data)
         self.assertFalse(self.release.is_set())
 
@@ -145,11 +147,12 @@ class SendResponseWaitTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.store._conn.execute('SELECT COUNT(*) FROM draft_claims').fetchone()[0], 0)
             query = await self.call(client, operation_id=params["operation_id"])
             replay = await self.call(client, **params)
-        self.assertTrue(query.structured_content["ok"])
+        self.assertNotIn("ok", query.structured_content)
         self.assertEqual(query.structured_content["status"], "completed")
         self.assertTrue(replay.structured_content["replayed"])
         self.assertEqual(replay.structured_content["results"], query.structured_content["results"])
         self.assertEqual(self.sends, ["draft-1"])
+        self.assertEqual(self.store._conn.execute('SELECT COUNT(*) FROM draft_claims').fetchone()[0], 0)
 
     async def failed_background_send(self, exception, status, code):
         self.send_error = exception
@@ -165,11 +168,74 @@ class SendResponseWaitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt.structured_content["error_code"], code)
         if status == "failed":
             self.assertEqual(receipt.structured_content["exchange_code"], "ErrorAccessDenied")
+        if status == "unknown":
+            self.assertEqual(receipt.structured_content["message"], "邮箱服务不稳定 请五分钟后查看结果")
         self.assertEqual(self.sends, ["draft-1"])
 
     async def test_timeout_preserves_eventual_unknown_submission_receipt(self):
         await self.failed_background_send(TimeoutError("External submission timed out"),
                                           "unknown", "SEND_FAILED_OR_UNKNOWN")
+        self.assertEqual(self.store._conn.execute('SELECT COUNT(*) FROM draft_claims').fetchone()[0], 0)
+
+    async def test_pre_submission_reads_fail_without_poisoning_draft_claim(self):
+        self.release.set()
+        async with Client(mcp_server.mcp) as client:
+            for boundary in ("draft", "sent"):
+                with self.subTest(boundary=boundary):
+                    params = await self.preview(client)
+                    if boundary == "draft":
+                        patcher = patch.object(self.business, "_tool_item", side_effect=TimeoutError("GetItem timeout"))
+                    else:
+                        patcher = patch.object(self.business, "_tool_folder", side_effect=lambda name:
+                            (_ for _ in ()).throw(TimeoutError("GetFolder timeout")) if name == "sent"
+                            else SimpleNamespace(id=name + "-folder"))
+                    with patcher:
+                        result = await self.call(client, **params)
+                    self.assertEqual(result.structured_content["status"], "failed")
+                    self.assertEqual(result.structured_content["error_code"], "UPSTREAM_TIMEOUT")
+                    self.assertEqual(self.store._conn.execute('SELECT COUNT(*) FROM draft_claims').fetchone()[0], 0)
+                    receipt = await self.call(client, operation_id=params["operation_id"])
+                    self.assertEqual(result.structured_content, receipt.structured_content)
+        self.assertEqual(self.sends, [])
+
+    async def test_unknown_send_releases_draft_but_same_operation_never_resubmits(self):
+        self.release.set()
+        self.send_error = TimeoutError("lost SendItem response")
+        async with Client(mcp_server.mcp) as client:
+            params = await self.preview(client)
+            result = await self.call(client, **params)
+            self.assertEqual(result.structured_content["status"], "unknown")
+            self.assertEqual(result.structured_content["message"], "邮箱服务不稳定 请五分钟后查看结果")
+            self.assertEqual(self.store._conn.execute('SELECT COUNT(*) FROM draft_claims').fetchone()[0], 0)
+            replay = await self.call(client, **params)
+            self.assertEqual(replay.structured_content["status"], "unknown")
+            self.assertEqual(self.sends, ["draft-1"])
+            self.send_error = None
+            fresh = await self.preview(client)
+            completed = await self.call(client, **fresh)
+            self.assertEqual(completed.structured_content["status"], "completed")
+
+    def test_restart_releases_only_orphaned_send_claims(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "operations.db")
+            store = OperationStore(path)
+            rows = []
+            for tool in ("send_draft", "update_draft"):
+                row = store.create_preview(tool=tool, mailbox=MAILBOX, action=tool,
+                    business_params={"draft_id": tool}, items=[], details={"canonical_draft_id": tool})
+                store.begin_draft_confirm(row["operation_id"], row["confirm_token"], {"draft_id": tool},
+                    mailbox=MAILBOX, lanid="employee", worker_id="worker")
+                rows.append(row)
+            store.close()
+            reopened = OperationStore(path)
+            try:
+                self.assertEqual([reopened.get(row["operation_id"])["status"] for row in rows], ["unknown", "unknown"])
+                claims = reopened._conn.execute('SELECT canonical_draft_id FROM draft_claims').fetchall()
+                self.assertEqual([row[0] for row in claims], ["update_draft"])
+            finally:
+                reopened.close()
 
     async def test_timeout_preserves_eventual_definite_rejection_receipt(self):
         await self.failed_background_send(ErrorAccessDenied("Submission rejected"),
@@ -227,7 +293,7 @@ class SendResponseWaitTests(unittest.IsolatedAsyncioTestCase):
                                                  idempotency_key="slow-preview")
             data = result.structured_content
             self.assertTrue(result.is_error)
-            self.assertFalse(data["ok"])
+            self.assertNotIn("ok", data)
             self.assertEqual(data["error_code"], "RESPONSE_WAIT_TIMEOUT")
             self.assertNotIn("operation_id", data)
             self.assertNotIn("confirm_token", data)
@@ -244,7 +310,7 @@ class SendResponseWaitTests(unittest.IsolatedAsyncioTestCase):
             params = await self.preview(client)
             result = await self.call(client, **params)
             self.assertFalse(result.is_error)
-            self.assertTrue(result.structured_content["ok"])
+            self.assertNotIn("ok", result.structured_content)
             self.assertEqual(result.structured_content["status"], "completed")
             with patch.object(mcp_server, "resolve_identity_by_lanid",
                               side_effect=IdentityResolutionError("LANID not found")):
@@ -293,7 +359,7 @@ class SendResponseWaitTests(unittest.IsolatedAsyncioTestCase):
                 receipt = await self.call(client, operation_id=params["operation_id"])
                 replay = await self.call(client, **params)
         self.assertEqual(receipt.structured_content["status"], "completed")
-        self.assertTrue(receipt.structured_content["ok"])
+        self.assertNotIn("ok", receipt.structured_content)
         self.assertTrue(replay.structured_content["replayed"])
         self.assertEqual(replay.structured_content["results"], receipt.structured_content["results"])
         self.assertEqual(self.sends, ["draft-1"])
@@ -319,7 +385,7 @@ class SendResponseWaitTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 self.release.set()
                 limiter.total_tokens = previous_tokens
-        self.assertTrue(receipt.structured_content["ok"])
+        self.assertNotIn("ok", receipt.structured_content)
         self.assertEqual(receipt.structured_content["status"], "completed")
         self.assertEqual(self.sends, ["draft-1"])
 

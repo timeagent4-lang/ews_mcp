@@ -54,7 +54,7 @@ class FlagConfirmationTests(unittest.TestCase):
     def preview(self, **business):
         params = {"message_id": self.item.id, **business}
         pending = self.dispatch(**params)
-        self.assertTrue(pending["ok"], pending)
+        self.assertEqual(pending["status"], "pending", pending)
         self.assertTrue(pending["confirmation_required"])
         self.assertEqual(self.saved, [])
         self.assertEqual(self.item.task_due_date.isoformat(), ORIGINAL_DUE)
@@ -65,7 +65,7 @@ class FlagConfirmationTests(unittest.TestCase):
             **params, operation_id=pending["operation_id"],
             confirm_token=pending["confirm_token"],
         )
-        self.assertTrue(receipt["ok"], receipt)
+        self.assertNotIn("error_code", receipt)
         self.assertEqual(receipt["status"], "completed")
         self.assertEqual(len(self.saved), 1)
         return receipt
@@ -76,7 +76,7 @@ class FlagConfirmationTests(unittest.TestCase):
         self.assertEqual(self.store.get(operation_id)["result"], receipt["results"])
 
         query = self.dispatch(operation_id=operation_id)
-        self.assertTrue(query["ok"], query)
+        self.assertEqual(query["status"], "completed", query)
         self.assertEqual(query["results"], receipt["results"])
 
         replay = self.dispatch(
@@ -116,7 +116,7 @@ class FlagConfirmationTests(unittest.TestCase):
                     message_id=self.item.id, flag="clear", due_date=due_date,
                     idempotency_key=key,
                 )
-                self.assertFalse(result["ok"], result)
+                self.assertNotIn("status", result)
                 self.assertEqual(result["error_code"], "INVALID_PARAMS")
                 self.assertIsNone(self.store.find_by_idempotency_key(key, mailbox=MAILBOX))
                 self.assertEqual(self.saved, [])
@@ -131,7 +131,7 @@ class FlagConfirmationTests(unittest.TestCase):
             operation_id=operation_id, confirm_token=pending["confirm_token"],
         )
 
-        self.assertFalse(result["ok"], result)
+        self.assertNotIn("status", result)
         self.assertEqual(result["error_code"], "INVALID_PARAMS")
         self.assertEqual(self.store.get(operation_id)["status"], "pending")
         self.assertEqual(self.saved, [])
@@ -154,7 +154,7 @@ class FlagConfirmationTests(unittest.TestCase):
         with patch.object(mcp_server, "initialize_outlook_client",
                           side_effect=AssertionError("Receipt queries must not connect to Exchange")):
             query = self.dispatch(operation_id=operation_id)
-        self.assertFalse(query["ok"])
+        self.assertNotIn("error_code", query)
         self.assertEqual(query["status"], "pending")
         self.assertEqual(self.saved, [])
 
@@ -162,7 +162,7 @@ class FlagConfirmationTests(unittest.TestCase):
         with patch.object(mcp_server, "initialize_outlook_client",
                           side_effect=AssertionError("Receipt queries must not connect to Exchange")):
             query = self.dispatch(operation_id=operation_id)
-        self.assertTrue(query["ok"], query)
+        self.assertEqual(query["status"], "completed", query)
         self.assertEqual(query["results"], receipt["results"])
         self.assertEqual(len(self.saved), 1)
 

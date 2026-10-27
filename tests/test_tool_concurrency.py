@@ -144,13 +144,14 @@ class ToolConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 replay = await client.call_tool("set_message_flag", params, raise_on_error=False)
         self.assertEqual(status_before_cancel, "executing")
         self.assertEqual(query.structured_content["status"], "completed")
-        self.assertTrue(query.structured_content["ok"])
+        self.assertNotIn("error_code", query.structured_content)
         self.assertTrue(replay.structured_content["replayed"])
         self.assertEqual(replay.structured_content["results"], query.structured_content["results"])
         self.assertEqual(self.saved, ["flag-message"])
         records = [json.loads(call.args[0]) for call in self.audit_logger.info.call_args_list]
         self.assertEqual(len(records), 4)
-        self.assertTrue(all(record["status"] == "success" for record in records), records)
+        self.assertEqual([record["status"] for record in records].count("pending"), 1, records)
+        self.assertTrue(all(record["status"] in ("pending", "success") for record in records), records)
 
 
 if __name__ == "__main__":

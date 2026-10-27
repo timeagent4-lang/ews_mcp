@@ -5,8 +5,8 @@ Use ActiveDirectory ResolveNames; report unavailable sources as partial coverage
 
 import re
 
-from exchangelib import Contact
-from exchangelib.errors import ErrorAccessDenied, ErrorFolderNotFound
+from exchangelib import Body, Contact
+from exchangelib.errors import ErrorAccessDenied, ErrorFolderNotFound, ErrorNameResolutionNoResults
 from exchangelib.folders import Folder
 from exchangelib.folders.base import BaseFolder
 from exchangelib.indexed_properties import EmailAddress, PhoneNumber
@@ -31,14 +31,14 @@ def _primary_email(contact):
     return None
 
 
-def _primary_phone(contact):
+def _phone(contact, label="BusinessPhone"):
     entries = getattr(contact, "phone_numbers", None) or []
     by_label = {}
     for entry in entries:
         value = str(getattr(entry, "phone_number", "") or "").strip()
         if value:
             by_label[str(getattr(entry, "label", "") or "")] = value
-    return by_label.get("BusinessPhone") or next(iter(by_label.values()), None)
+    return by_label.get(label)
 
 
 def _contact_row(contact, source):
@@ -51,7 +51,9 @@ def _contact_row(contact, source):
         "job_title": getattr(contact, "job_title", None),
         "department": getattr(contact, "department", None),
         "company_name": getattr(contact, "company_name", None),
-        "phone": _primary_phone(contact),
+        "phone": _phone(contact),
+        "mobile_phone": _phone(contact, "MobilePhone"),
+        "office": getattr(contact, "office", None),
     }
 
 
@@ -107,7 +109,15 @@ class PeopleOperations:
             return_full_contact_data=True,
             search_scope=SEARCH_SCOPE_ACTIVE_DIRECTORY,
         )
-        return [entry for entry in entries if isinstance(entry, tuple)]
+        resolved = []
+        for entry in entries:
+            if isinstance(entry, ErrorNameResolutionNoResults):
+                continue
+            if isinstance(entry, Exception):
+                raise entry
+            if isinstance(entry, tuple):
+                resolved.append(entry)
+        return resolved
 
     def _open_directory(self, directory_id, *, write):
         """Authorize the employee from the administrator list before reads or creates."""
@@ -171,6 +181,7 @@ class PeopleOperations:
         sources = ("gal", "contacts") if source == "auto" else (source,)
         results = []
         coverage = {}
+        failures = []
         for name in sources:
             try:
                 if name == "contacts":
@@ -179,16 +190,27 @@ class PeopleOperations:
                         .filter(display_name__icontains=query)
                         .order_by("display_name")[:limit]
                     )
-                    coverage[name] = "ok"
-                    results.extend(_contact_row(contact, name) for contact in rows)
+                    source_rows = []
+                    for contact in rows:
+                        if isinstance(contact, Exception):
+                            raise contact
+                        source_rows.append(_contact_row(contact, name))
                 else:
                     entries = self._resolve_directory(query)
-                    coverage[name] = "ok"
-                    results.extend(
+                    source_rows = [
                         _directory_row(mailbox, contact) for mailbox, contact in entries[:limit]
-                    )
+                    ]
+                results.extend(source_rows)
+                coverage[name] = "ok"
             except Exception as exc:  # noqa: BLE001 - report per-source coverage
                 coverage[name] = "denied" if _denied(exc) else "unreachable"
+                failures.append(exc)
+        if not any(value == "ok" for value in coverage.values()):
+            label = "组织通讯录" if source == "gal" else "联系人" if source == "contacts" else "组织通讯录与联系人"
+            raise ToolOperationError(
+                "GAL_UNAVAILABLE" if source == "gal" else "DIRECTORY_UNAVAILABLE",
+                f"{label}查询失败。",
+            ) from failures[-1]
         payload = {"items": results, "sources": coverage}
         if any(status != "ok" for status in coverage.values()):
             payload["partial"] = True
@@ -199,7 +221,11 @@ class PeopleOperations:
         spec, account, folder = self._prepare_directory(directory_id, write=False)
         try:
             rows = folder.filter(display_name__icontains=query).order_by("display_name")[:limit]
-            items = [_with_directory(_contact_row(c, "contacts"), spec) for c in rows]
+            items = []
+            for contact in rows:
+                if isinstance(contact, Exception):
+                    raise contact
+                items.append(_with_directory(_contact_row(contact, "contacts"), spec))
         except Exception as exc:  # noqa: BLE001 - 目录读取失败如实上报，不伪装成空结果
             raise ToolOperationError(
                 "DIRECTORY_UNAVAILABLE", "读取团队共享目录失败。"
@@ -241,7 +267,7 @@ class PeopleOperations:
         contact = self._tool_item(value, folder_names=("contacts",))
         if type(contact) is not Contact:
             raise ToolOperationError("INVALID_CONTACT", "指定项目不是当前员工的联系人。")
-        return _contact_row(contact, "contacts")
+        return {**_contact_row(contact, "contacts"), "notes": str(contact.body) if contact.body is not None else None}
 
     def _get_from_directory(self, contact_id, directory_id):
         spec, account, folder = self._prepare_directory(directory_id, write=False)
@@ -265,15 +291,19 @@ class PeopleOperations:
                 "ITEM_OUT_OF_SCOPE", "指定项目不属于该团队共享目录。"
             )
         item.folder = folder
-        return _with_directory(_contact_row(item, "contacts"), spec)
+        return _with_directory({**_contact_row(item, "contacts"), "notes": str(item.body) if item.body is not None else None}, spec)
 
     def create_contact(
         self,
         display_name,
-        email,
+        email=None,
         phone=None,
         company_name=None,
         job_title=None,
+        department=None,
+        mobile_phone=None,
+        office=None,
+        notes=None,
         confirm=False,
         confirmation_id=None,
         directory_id=None,
@@ -287,15 +317,20 @@ class PeopleOperations:
         display_name = (display_name or "").strip()
         if not display_name:
             raise ToolOperationError("INVALID_CONTACT", "联系人姓名不能为空。")
-        email = (email or "").strip()
-        if not re.fullmatch(r"^[^\s@<>;,]+@[^\s@<>;,]+$", email):
-            raise ToolOperationError("INVALID_CONTACT_EMAIL", "联系人邮箱地址格式无效。")
+        if email is not None:
+            email = email.strip()
+            if not re.fullmatch(r"^[^\s@<>;,]+@[^\s@<>;,]+$", email):
+                raise ToolOperationError("INVALID_CONTACT_EMAIL", "联系人邮箱地址格式无效。")
         details = {
             "display_name": display_name,
             "email": email,
             "phone": phone,
             "company_name": company_name,
             "job_title": job_title,
+            "department": department,
+            "mobile_phone": mobile_phone,
+            "office": office,
+            "notes": notes,
         }
         spec = None
         prepared = None
@@ -330,14 +365,15 @@ class PeopleOperations:
             account=account,
             folder=folder,
             display_name=display_name,
-            email_addresses=[EmailAddress(label="EmailAddress1", email=email)],
-            phone_numbers=(
-                [PhoneNumber(label="BusinessPhone", phone_number=phone)]
-                if phone is not None
-                else []
-            ),
+            email_addresses=[EmailAddress(label="EmailAddress1", email=email)] if email is not None else [],
+            phone_numbers=[PhoneNumber(label=label, phone_number=value)
+                           for label, value in (("BusinessPhone", phone), ("MobilePhone", mobile_phone))
+                           if value is not None],
             company_name=company_name,
             job_title=job_title,
+            department=department,
+            office=office,
+            body=Body(notes) if notes is not None else None,
         )
         try:
             item.save()
@@ -358,9 +394,7 @@ class PeopleOperations:
             "changekey": item.changekey,
             "created": True,
             "folder": "contacts",
-            "display_name": display_name,
-            "email": email,
-            "phone": _primary_phone(item) or phone,
+            **details,
         }
         if spec is not None:
             receipt["directory_id"] = spec.directory_id

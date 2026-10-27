@@ -229,7 +229,7 @@ class OperationStore:
         record = self.get(operation_id)
         if record is None:
             raise ConfirmationError(
-                "OPERATION_UNKNOWN", "未找到该操作号，请先重新预览。"
+                "OPERATION_NOT_FOUND", "未找到 operation_id 对应的操作记录"
             )
         if not secrets.compare_digest(str(confirm_token), record["confirm_token"]):
             raise ConfirmationError(
@@ -311,7 +311,9 @@ class OperationStore:
         from tool_support import ToolOperationError
         with self.transaction() as db:
             record = self.get(operation_id)
-            if not record or record['mailbox'] != mailbox:
+            if not record:
+                raise ConfirmationError('OPERATION_NOT_FOUND', '未找到 operation_id 对应的操作记录')
+            if record['mailbox'] != mailbox:
                 raise ConfirmationError('OPERATION_SCOPE_MISMATCH', '该操作不属于当前邮箱。')
             details = record.get('details') or {}
             draft_id = details.get('canonical_draft_id')
@@ -357,7 +359,7 @@ class OperationStore:
                     db.execute('UPDATE operation_upload_refs SET kind=? WHERE operation_id=?', (kind, execution.operation_id))
                     if status == STATUS_UNKNOWN:
                         db.execute("UPDATE attachment_uploads SET state='quarantine' WHERE upload_id=?", (ref['upload_id'],))
-            if status != STATUS_UNKNOWN:
+            if status != STATUS_UNKNOWN or record['tool'] == 'send_draft':
                 db.execute('DELETE FROM draft_claims WHERE operation_id=?', (execution.operation_id,))
 
     def _key_already_consumed(self, record) -> bool:
@@ -414,6 +416,8 @@ class OperationStore:
                                "(SELECT operation_id FROM operations WHERE status='unknown')")
             self._conn.execute("UPDATE attachment_uploads SET state='failed',retained_until=0 WHERE state='receiving'")
             self._conn.execute('DELETE FROM upload_readers')
+            self._conn.execute("DELETE FROM draft_claims WHERE operation_id IN "
+                               "(SELECT operation_id FROM operations WHERE tool='send_draft')")
             self._conn.commit()
             return changed
 

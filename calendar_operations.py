@@ -55,13 +55,18 @@ def _mailbox_detail(mailbox):
 
 
 def _attendee_detail(attendee):
+    response_time = attendee.last_response_time
+    if response_time is not None:
+        parsed = parse_datetime(response_time)
+        if (parsed.year, parsed.month, parsed.day) in ((1, 1, 1), (1, 1, 2)):
+            response_time = None
     return {
         **(
             _mailbox_detail(attendee.mailbox)
             or {"name": None, "email_address": None}
         ),
         "response_type": attendee.response_type,
-        "last_response_time": iso_datetime(attendee.last_response_time),
+        "last_response_time": iso_datetime(response_time),
         "proposed_start": iso_datetime(attendee.proposed_start),
         "proposed_end": iso_datetime(attendee.proposed_end),
     }
