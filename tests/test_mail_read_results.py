@@ -49,7 +49,7 @@ class MailReadResultTests(unittest.TestCase):
                 self.mail._tool_folder = Mock(return_value=folder_with_rows(
                     [row(name) for name in ("a", "b", "c")][:count]))
                 result = self.mail.find_message(limit=2, offset=offset)
-                self.assertEqual(result, {"items": [{"id": name} for name in expected],
+                self.assertEqual(result, {"items": [{"id": name, "item_class": None} for name in expected],
                                           "next_offset": next_offset})
 
     def setup_thread(self, inbox, sent):

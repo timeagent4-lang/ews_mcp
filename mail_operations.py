@@ -1,9 +1,11 @@
 """Scoped, bounded mail reads for the already authenticated employee account."""
 
 from pathlib import PurePath
+from datetime import date, datetime
 
 from bs4 import BeautifulSoup
 from exchangelib import EWSDateTime, FileAttachment, ItemAttachment, Message
+from exchangelib.items.calendar_item import BaseMeetingItem, MeetingRequest
 from exchangelib.folders import (
     Calendar,
     Contacts,
@@ -44,6 +46,8 @@ MESSAGE_FIELDS = SIMPLE_FIELDS + (
     "is_draft",
     "categories",
 )
+_MEETING_FIELDS = ("associated_calendar_item_id", "has_been_processed", "is_out_of_date")
+_REQUEST_FIELDS = ("start", "end", "is_all_day", "location", "organizer", "meeting_request_type")
 MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
 MAX_ATTACHMENT_CHARS = 20000
 TEXT_EXTENSIONS = {".txt", ".csv", ".tsv", ".log", ".md", ".json", ".xml"}
@@ -119,7 +123,7 @@ class MailOperations:
             cache[name] = classes[name].get_distinguished(root=Root(account=self.account))
         return cache[name]
 
-    def _tool_item(self, item_id, folder_names=MAIL_FOLDERS, only_fields=None):
+    def _tool_item(self, item_id, folder_names=MAIL_FOLDERS, only_fields=None, *, include_meeting=False):
         if not isinstance(item_id, str) or not item_id.strip() or not folder_names:
             raise ToolOperationError("INVALID_ITEM_ID", "请提供有效的项目 ID。")
         # DELEGATE 下跳过无关的不可达文件夹；读取范围仍由目标父文件夹决定。
@@ -161,6 +165,10 @@ class MailOperations:
             if only_fields is None
             else list(dict.fromkeys((*only_fields, "parent_folder_id")))
         )
+        if fields is not None and include_meeting and isinstance(metadata, BaseMeetingItem):
+            fields.extend(_MEETING_FIELDS)
+            if isinstance(metadata, MeetingRequest):
+                fields.extend(_REQUEST_FIELDS)
         item = self._fetch_one(item_id, folder, fields)
         if not item.parent_folder_id or item.parent_folder_id.id != folder.id:
             raise ToolOperationError(
@@ -326,9 +334,10 @@ class MailOperations:
         items = []
         for row in rows[:limit]:
             item = self._tool_item(
-                row.id, folder_names=(folder,), only_fields=_fields(include_body)
+                row.id, folder_names=(folder,), only_fields=[*_fields(include_body), "item_class"]
             )
-            items.append(self._message_dict(item, include_body=include_body))
+            items.append({**self._message_dict(item, include_body=include_body),
+                          "item_class": getattr(item, "item_class", None)})
         return {
             "items": items,
             "next_offset": offset + limit if len(rows) > limit else None,
@@ -346,13 +355,29 @@ class MailOperations:
             raise ToolOperationError(
                 "INVALID_BODY_RANGE", "正文偏移必须非负，长度必须为 1 到 100000。"
             )
-        item = self._tool_item(message_id, only_fields=_fields())
-        return self._message_dict(
+        item = self._tool_item(message_id, only_fields=[*_fields(), "item_class"], include_meeting=True)
+        result = self._message_dict(
             item,
             clean_body=clean_body,
             max_body_chars=max_body_chars,
             body_offset=body_offset,
         )
+        result["item_class"] = item.item_class
+        if isinstance(item, BaseMeetingItem):
+            linked = item.associated_calendar_item_id
+            result.update(
+                associated_calendar_item_id=linked.id if linked is not None else None,
+                has_been_processed=item.has_been_processed,
+                is_out_of_date=item.is_out_of_date,
+            )
+        if isinstance(item, MeetingRequest):
+            for name in ("start", "end"):
+                value = getattr(item, name)
+                result[name] = (value.isoformat() if isinstance(value, date) and not isinstance(value, datetime)
+                                else iso_datetime(value))
+            result.update(is_all_day=item.is_all_day, location=item.location,
+                          organizer=_mailbox(item.organizer), meeting_request_type=item.meeting_request_type)
+        return result
 
     def get_thread(self, message_id, offset=0, limit=20):
         _page(offset, limit)
