@@ -10,7 +10,7 @@ from html import escape as _html_escape
 
 from exchangelib import FileAttachment, HTMLBody, Mailbox, Message
 from exchangelib.items.base import MOVE_TO_DELETED_ITEMS, NEVER_OVERWRITE
-from exchangelib.items.calendar_item import MeetingRequest
+from exchangelib.items.calendar_item import MeetingCancellation, MeetingRequest, MeetingResponse
 
 from mail_replies import meeting_text_reply
 
@@ -656,7 +656,15 @@ class WriteOperations:
         items, failures, snapshot = [], {}, []
         for item_id in ids:
             try:
-                item = _ordinary_message(self._tool_item(item_id))
+                item = self._tool_item(item_id)
+                meeting_read_only = (
+                    type(item) in (MeetingRequest, MeetingResponse, MeetingCancellation)
+                    and set_read is not None
+                    and categories_add is None
+                    and categories_remove is None
+                )
+                if not meeting_read_only:
+                    _ordinary_message(item)
                 items.append((item_id, item))
                 snapshot.append({"id": item_id, **_item_state(item)})
             except Exception as exc:

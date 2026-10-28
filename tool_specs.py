@@ -334,7 +334,7 @@ DESCRIPTIONS = {
     "update_draft": "Update supplied fields; empty values clear supported fields. Align the draft author with the employee. Preview snapshots the version; confirmation rejects later changes and save detects conflicts.",
     "delete_draft": "Move a draft to DeletedItems; requires access and never falls back to permanent deletion.",
     "send_draft": "Send a draft and save in employee Sent; consumes its ID. No automatic resend; idempotency survives restart. Wait at most 30 seconds: processing with wait_timed_out=true returns '邮箱服务不稳定 请五分钟后查看结果' while the same task continues. After five minutes query the original receipt and verify actual Sent; processing does not prove submission/success. Preview timeout returns RESPONSE_WAIT_TIMEOUT without sending.",
-    "update_messages": "Update read state/categories of ordinary mail; reject meeting requests/cancellations per item.",
+    "update_messages": "Update read state/categories of ordinary mail. Meeting requests, responses and cancellations support read/unread only; omit category parameters. Does not RSVP or change calendar events. Report results per item.",
     "set_message_flag": "Set an ordinary message's follow-up flag; reject meeting requests/cancellations.",
     "list_flagged_messages": "List open follow-up flags by default; status=all includes completed flags, never unflagged mail.",
     "move_messages": "Move ordinary non-draft mail between Inbox and Sent; use the returned new ID afterward.",
