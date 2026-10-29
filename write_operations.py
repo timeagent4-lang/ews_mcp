@@ -17,6 +17,7 @@ from mail_replies import meeting_text_reply
 from tool_support import (
     ToolOperationError,
     classify_submission_failure,
+    is_definite_rejection,
     require_confirmation,
     require_send,
     sanitize,
@@ -82,14 +83,18 @@ def _batch_ids(ids):
     return list(ids)
 
 
-def _failure(item_id, exc):
+def _failure(item_id, exc, *, submitted=False):
+    uncertain = submitted and not is_definite_rejection(exc)
     result = {
         "id": item_id,
         "success": False,
+        "status": "unknown" if uncertain else "failed",
         "error_code": (
-            exc.code if isinstance(exc, ToolOperationError) else "MAIL_OPERATION_FAILED"
+            exc.code if isinstance(exc, ToolOperationError) else
+            "MAIL_OPERATION_UNKNOWN" if uncertain else "MAIL_OPERATION_FAILED"
         ),
         "message": (
+            "邮件操作结果未知，请先核实实际状态，勿重复提交。" if uncertain else
             exc.public_message
             if isinstance(exc, ToolOperationError)
             else "邮件操作失败，请检查权限或稍后重试。"
@@ -686,6 +691,7 @@ class WriteOperations:
             return preview
         results = dict(failures)
         for item_id, item in items:
+            submitted = False
             try:
                 fields = []
                 if set_read is not None:
@@ -702,12 +708,13 @@ class WriteOperations:
                     )
                     fields.append("categories")
                 if fields:
+                    submitted = True
                     item.save(update_fields=fields)
                 results[item_id] = {
                     "id": item_id, "success": True, "changekey": item.changekey, "updated": bool(fields)
                 }
             except Exception as exc:
-                results[item_id] = _failure(item_id, exc)
+                results[item_id] = _failure(item_id, exc, submitted=submitted)
         return {"results": [results[item_id] for item_id in ids]}
 
     def move_messages(self, ids, to_folder, confirm=False, confirmation_id=None):
@@ -740,7 +747,9 @@ class WriteOperations:
             return preview
         results = dict(failures)
         for item_id, item in items:
+            submitted = False
             try:
+                submitted = True
                 item.move(to_folder=folder)
                 if not item.id:
                     raise ToolOperationError(
@@ -754,7 +763,7 @@ class WriteOperations:
                     "folder": to_folder,
                 }
             except Exception as exc:
-                results[item_id] = _failure(item_id, exc)
+                results[item_id] = _failure(item_id, exc, submitted=submitted)
         return {"results": [results[item_id] for item_id in ids]}
 
     def delete_messages(self, ids, confirm=False, confirmation_id=None):
@@ -779,11 +788,13 @@ class WriteOperations:
             return preview
         results = dict(failures)
         for item_id, item in items:
+            submitted = False
             try:
 
                 # move_to_trash 可恢复且会清空对象 ID；保留输入 ID 作为结果键。
+                submitted = True
                 item.move_to_trash()
                 results[item_id] = {"id": item_id, "success": True, "deleted": True}
             except Exception as exc:
-                results[item_id] = _failure(item_id, exc)
+                results[item_id] = _failure(item_id, exc, submitted=submitted)
         return {"results": [results[item_id] for item_id in ids], "delete_type": MOVE_TO_DELETED_ITEMS}

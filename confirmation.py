@@ -1,7 +1,7 @@
 """Persistent preview/confirm operations and idempotent receipts.
 
 Execution requires the preview token and identical business parameters.
-Operation ID alone is read-only. Restarts mark active operations unknown;
+Operation ID alone is read-only. Restarts mark in-flight operations unknown;
 uncertain outcomes are never retried automatically.
 """
 
@@ -402,11 +402,11 @@ class OperationStore:
             self._conn.close()
 
     def migrate_active_to_unknown(self) -> int:
-        """Mark active operations unknown after a restart."""
+        """Mark in-flight operations unknown; pending previews never submitted."""
         with self._lock:
             cursor = self._conn.execute(
-                "UPDATE operations SET status=?, updated_at=? WHERE status IN (?,?,?)",
-                (STATUS_UNKNOWN, self._now(), STATUS_PENDING, STATUS_CONFIRMED, STATUS_EXECUTING),
+                "UPDATE operations SET status=?, updated_at=? WHERE status IN (?,?)",
+                (STATUS_UNKNOWN, self._now(), STATUS_CONFIRMED, STATUS_EXECUTING),
             )
             changed = cursor.rowcount
             self._conn.execute("UPDATE operation_upload_refs SET kind='quarantine' WHERE kind='execution'")

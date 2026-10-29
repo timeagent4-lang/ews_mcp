@@ -23,7 +23,7 @@ _LOCAL_PART_PATTERN = re.compile(
 )
 _DOMAIN_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9-]+$")
 
-LOCAL_TIMEZONE = ZoneInfo(os.getenv("MAIL_LOCAL_TIMEZONE", "Asia/Shanghai"))
+LOCAL_TIMEZONE = ZoneInfo(os.getenv("MAIL_LOCAL_TIMEZONE", "").strip() or "Asia/Shanghai")
 
 
 def _format_local_datetime(value) -> Optional[str]:

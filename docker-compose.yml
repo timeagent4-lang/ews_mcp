@@ -31,7 +31,7 @@ services:
     volumes:
       - ./.env:/app/.env:ro
       - ews_mcp_data:/data/ews_mcp
-      # Pre-create this host directory for the image's appuser; see docs/logging.md.
+      # Pre-create for appuser UID + shared reader group (setgid); see docs/logging.md.
       - type: bind
         source: ${EWS_MCP_LOG_HOST_DIR:-./logs}
         target: /logs

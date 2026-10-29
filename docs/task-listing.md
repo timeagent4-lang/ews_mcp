@@ -6,7 +6,7 @@
 
 ## 参数
 
-`arguments` 为扁平对象，必须包含 `lanid`、`name`。
+`arguments` 为扁平对象，必须包含 `lanid`。邮箱仅取自 OA 按 LANID 查询的唯一结果，仍检查结果唯一性和邮箱有效性；兼容字段 `name` 可省略，传入时忽略，不用于验证或授权。
 
 | 参数 | 默认值 | 约束与含义 |
 | --- | --- | --- |
@@ -26,7 +26,6 @@
   "name": "list_tasks",
   "arguments": {
     "lanid": "example_lanid",
-    "name": "示例姓名",
     "folder": "tasks",
     "incomplete_only": true,
     "limit": 2,
@@ -58,7 +57,6 @@ MCP 结构化结果示例：
   "name": "list_tasks",
   "arguments": {
     "lanid": "example_lanid",
-    "name": "示例姓名",
     "folder": "tasks",
     "incomplete_only": true,
     "limit": 2,

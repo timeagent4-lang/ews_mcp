@@ -184,6 +184,7 @@ TOOLS: dict[str, list[dict]] = {
         _s("folder", "string", "Mail folder to list.", default="inbox", enum=["inbox", "drafts", "sent"]),
         _s("status", "string", "Flag state; all includes flagged and complete.", default="flagged", enum=["flagged", "complete", "all"]),
         _s("limit", "integer", "Max results.", default=20, minimum=1, maximum=100),
+        _s("offset", "integer", "Pagination offset; use next_offset from the previous page.", default=0, minimum=0),
     ],
     "update_messages": [
         _s("ids", "array", "Scoped message IDs (1-50).", required=True, items="string", max_items=50),
@@ -336,7 +337,7 @@ DESCRIPTIONS = {
     "send_draft": "Send a draft and save in employee Sent; consumes its ID. No automatic resend; idempotency survives restart. Wait at most 30 seconds: processing with wait_timed_out=true returns '邮箱服务不稳定 请五分钟后查看结果' while the same task continues. After five minutes query the original receipt and verify actual Sent; processing does not prove submission/success. Preview timeout returns RESPONSE_WAIT_TIMEOUT without sending.",
     "update_messages": "Update read state/categories of ordinary mail. Meeting requests, responses and cancellations support read/unread only; omit category parameters. Does not RSVP or change calendar events. Report results per item.",
     "set_message_flag": "Set an ordinary message's follow-up flag; reject meeting requests/cancellations.",
-    "list_flagged_messages": "List open follow-up flags by default; status=all includes completed flags, never unflagged mail.",
+    "list_flagged_messages": "List open follow-up flags by default; status=all includes completed flags, never unflagged mail. Page using offset/limit and the returned has_more/next_offset.",
     "move_messages": "Move ordinary non-draft mail between Inbox and Sent; use the returned new ID afterward.",
     "delete_messages": "Move ordinary mail to DeletedItems; no soft/permanent deletion or automatic retries. Report failed/uncertain batch items.",
     "list_events": "List expanded calendar occurrences with pagination. has_more hints at a full page; the next may be empty.",

@@ -94,7 +94,8 @@ class ToolConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.business.list_folders = lambda: {"thread": threading.get_ident()}
         async with Client(mcp_server.mcp) as client:
             result = await client.call_tool("list_folders", IDENTITY)
-        records = [json.loads(call.args[0]) for call in self.audit_logger.info.call_args_list]
+        records = [json.loads(call.args[0]) for call in self.audit_logger.info.call_args_list
+                   if json.loads(call.args[0]).get('event_type') == 'tool.finished']
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["identity_assurance"], "oa_lanid_resolved")
         self.assertEqual(records[0]["status"], "success")
@@ -148,10 +149,12 @@ class ToolConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(replay.structured_content["replayed"])
         self.assertEqual(replay.structured_content["results"], query.structured_content["results"])
         self.assertEqual(self.saved, ["flag-message"])
-        records = [json.loads(call.args[0]) for call in self.audit_logger.info.call_args_list]
+        records = [json.loads(call.args[0]) for call in self.audit_logger.info.call_args_list
+                   if json.loads(call.args[0]).get('event_type') in ('tool.finished', 'tool.failed', 'tool.cancelled')]
         self.assertEqual(len(records), 4)
         self.assertEqual([record["status"] for record in records].count("pending"), 1, records)
-        self.assertTrue(all(record["status"] in ("pending", "success") for record in records), records)
+        self.assertTrue(all(record.get("status") in ("pending", "completed", "cancelled") for record in records), records)
+        self.assertGreaterEqual(sum(record.get('status') == 'completed' for record in records), 2)
 
 
 if __name__ == "__main__":

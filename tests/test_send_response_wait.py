@@ -128,6 +128,35 @@ class SendResponseWaitTests(unittest.IsolatedAsyncioTestCase):
     async def wait_for_receipt(self, operation_id, status):
         await self.eventually(lambda: self.store.get(operation_id)["status"] == status)
 
+    async def test_dispatch_callback_records_returned_business_failure(self):
+        result = mcp_server.json_result({
+            "operation_id": "log-operation", "status": "failed",
+            "error_code": "SEND_FAILED", "results": None,
+        })
+        task = asyncio.get_running_loop().create_future()
+        task.set_result(result)
+        with patch.object(mcp_server, "emit_event", create=True) as emit:
+            mcp_server._send_dispatch_done(task)
+        events = [call for call in emit.call_args_list if call.args[0] == "dispatch.finished"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kwargs["status"], "failed")
+        self.assertTrue(events[0].kwargs["is_error"])
+        self.assertEqual(events[0].kwargs["operation_id"], "log-operation")
+
+    async def test_dispatch_callback_does_not_call_a_preview_an_executed_operation(self):
+        task = asyncio.get_running_loop().create_future()
+        task.set_result(mcp_server.json_result({
+            "operation_id": "preview-operation", "status": "pending",
+            "confirmation_required": True, "confirm_token": "NOT_FOR_LOGS",
+        }))
+        with patch.object(mcp_server, "emit_event", create=True) as emit:
+            mcp_server._send_dispatch_done(task)
+        events = [call for call in emit.call_args_list if call.args[0] == "dispatch.finished"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kwargs["status"], "pending")
+        self.assertFalse(events[0].kwargs["is_error"])
+        self.assertFalse(any(call.args[0] == "operation.finished" for call in emit.call_args_list))
+
     async def test_blocked_send_returns_processing_then_receipt_and_reconfirmation_send_once(self):
         async with Client(mcp_server.mcp) as client:
             params = await self.preview(client)
@@ -140,10 +169,28 @@ class SendResponseWaitTests(unittest.IsolatedAsyncioTestCase):
             quick = await client.call_tool("list_folders", IDENTITY)
             self.assertFalse(quick.is_error)
             self.assertEqual(quick.structured_content["results"], {"folders": ["drafts", "sent"]})
-            processing_audits = [json.loads(call.args[0]) for call in self.audit_logger.info.call_args_list]
+            processing_audits = [json.loads(call.args[0]) for call in self.audit_logger.info.call_args_list
+                                 if json.loads(call.args[0]).get('event_type') == 'tool.finished']
             self.assertEqual(sum(record["status"] == "processing" for record in processing_audits), 1)
+            processing_event = next(record for record in processing_audits if record['status'] == 'processing')
             self.release.set()
             await self.wait_for_receipt(params["operation_id"], "completed")
+            await self.eventually(lambda: any(
+                json.loads(call.args[0]).get('event_type') == 'dispatch.finished'
+                and json.loads(call.args[0]).get('operation_id') == params['operation_id']
+                and json.loads(call.args[0]).get('status') == 'completed'
+                for call in self.audit_logger.info.call_args_list))
+            operation_events = [json.loads(call.args[0]) for call in self.audit_logger.info.call_args_list
+                                if json.loads(call.args[0]).get('event_type') == 'operation.finished']
+            self.assertEqual(len(operation_events), 1)
+            self.assertEqual(operation_events[0]['status'], 'completed')
+            self.assertEqual(operation_events[0]['origin_call_id'], processing_event['call_id'])
+            self.assertEqual(operation_events[0]['operation_id'], params['operation_id'])
+            dispatch_events = [json.loads(call.args[0]) for call in self.audit_logger.info.call_args_list
+                               if json.loads(call.args[0]).get('event_type') == 'dispatch.finished'
+                               and json.loads(call.args[0]).get('operation_id') == params['operation_id']]
+            self.assertEqual(dispatch_events[0]['caller']['verified_lanid'], 'employee')
+            self.assertEqual(dispatch_events[0]['caller']['identity_assurance'], 'oa_lanid_resolved')
             self.assertEqual(self.store._conn.execute('SELECT COUNT(*) FROM draft_claims').fetchone()[0], 0)
             query = await self.call(client, operation_id=params["operation_id"])
             replay = await self.call(client, **params)
@@ -191,6 +238,12 @@ class SendResponseWaitTests(unittest.IsolatedAsyncioTestCase):
                             else SimpleNamespace(id=name + "-folder"))
                     with patcher:
                         result = await self.call(client, **params)
+                    # This case checks submission safety, not response latency.
+                    # Under load the deadline may win before the failed worker
+                    # runs; inspect its eventual durable receipt in that case.
+                    if result.structured_content['status'] == 'processing':
+                        await self.wait_for_receipt(params['operation_id'], 'failed')
+                        result = await self.call(client, operation_id=params['operation_id'])
                     self.assertEqual(result.structured_content["status"], "failed")
                     self.assertEqual(result.structured_content["error_code"], "UPSTREAM_TIMEOUT")
                     self.assertEqual(self.store._conn.execute('SELECT COUNT(*) FROM draft_claims').fetchone()[0], 0)

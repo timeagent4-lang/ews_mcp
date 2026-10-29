@@ -4,16 +4,18 @@
 
 - 公开 30 个工具（见 [tool_specs.py](tool_specs.py)）；`arguments` 为扁平对象，必填 `lanid` 及工具所需业务参数。邮箱仅取自 OA 按 LANID 查询的唯一结果，仍检查结果唯一性和邮箱有效性；兼容字段 `name` 可省略，传入时忽略，不用于验证或授权。
 - 结果同时放入 `structuredContent` 和内容相同的 JSON `TextContent`。写操作用 `status` 表达生命周期，普通读取不增加该状态；MCP 外层保留 `isError`，不返回重复的 `ok`。
-- 写操作先预览，再携原业务参数、`operation_id` 和 `confirm_token` 确认，可选 `idempotency_key`。原操作号可查询本地尝试记录，不自动重试业务写入。
+- 写操作先预览，再携原业务参数、`operation_id` 和 `confirm_token` 确认，可选 `idempotency_key`。重启保留未过期的待确认预览；日历更新、响应和取消确认须匹配预览时的事件版本。原操作号可查询本地尝试记录，不自动重试业务写入。
+- 批量写入区分确定失败与结果未知，逐项保留结果；存在未知项时整体返回 `unknown`。先核实未知项的实际状态，只重试确定未执行的失败项，勿整批重发。
 - `send_draft` 最多等待 30 秒；仍无结果时返回 `processing`，提示“邮箱服务不稳定 请五分钟后查看结果”，原后台任务继续一次。调用方五分钟后查询实际已发送邮件核实，不能仅凭本地 `unknown` 或未找到副本判定发送失败。详见 [发送等待上限](docs/send-response-wait.md)。
 - `EWS_MCP_SEND_ENABLED` 默认关闭，限制真实发送、会议通知及 OOF 执行；预览仍可用。
 - `prepare_attachment_download` 返回内网 HTTP 签名链接，供 AI 执行器 GET 下载；响应不含附件字节。
 - `prepare_attachment_upload` 授权执行器 HTTP PUT 上传，`attach_draft_attachment` 经预览和确认附加到现有草稿，支持普通附件和 PNG/JPEG CID。附加后须重新预览发送；旧发送预览拒绝草稿变化。配置、执行器及恢复说明见 [附件上传](docs/attachment-uploads.md)。
 - `check_availability` 返回各邮箱的忙闲区间，由调用方 Agent 选择公共时段；`interval_minutes` 为采样间隔（默认 30，范围 5–1440），不是会议时长。参数与迁移说明见 [忙闲查询](docs/availability.md)。
 - `list_tasks` 默认先筛选未完成任务，再按到期日降序分页；用返回的 `next_offset` 取后续页。参数、空结果和分页边界见 [任务列表](docs/task-listing.md)。
+- `list_flagged_messages` 支持 `offset` 分页，每页最多 100 条；`has_more=true` 时将返回的 `next_offset` 作为下一次的 `offset`。
 - `create_contact` 的 `display_name` 必填，邮箱选填；支持部门、手机号、办公室和备注。会议邀请可用 `create_draft` 的 `reply/reply_all` 创建文字回复，不改变参会状态；参会响应仍使用 `respond_to_event`。
 - 审计日志的 `input_arguments` 保存校验前的实际参数，保留字段、类型及嵌套结构，失败调用也记录。正文、附件及令牌等敏感值脱敏，超长输入标记截断（上限 16 KiB）。
-- 错误与审计日志按日期分别落盘，保留最近30个自然日；宿主机目录、权限和控制台降噪见 [日志说明](docs/logging.md)。
+- 详细调用审计与错误日志按日期落盘，最近30天原文件、更早gzip永久归档；宿主机共享组读取、日期/操作号查询及权限准备见 [日志说明](docs/logging.md)。
 
 接入、验收及回滚见 [内网接入说明](docs/intranet-integration.md)，变量见 [.env.example](.env.example)。服务账号用 `OUTLOOK_ADMIN_LANID`；`EWS_MCP_DATA_DIR` 保存回执及附件缓存。
 

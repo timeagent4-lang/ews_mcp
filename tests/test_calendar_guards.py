@@ -19,6 +19,8 @@ class CalendarGuardTests(unittest.TestCase):
     def invoke(self, tool, confirm=False):
         extra = {"subject": "new"} if tool == "update_event" else (
             {"response": "accept"} if tool == "respond_to_event" else {})
+        if confirm:
+            extra["expected_version"] = {"id": "e", "changekey": "v"}
         return getattr(self.ops, tool)("e", confirm=confirm, confirmation_id="token", **extra)
 
     def test_recurring_masters_rejected_for_preview_and_confirm(self):
@@ -107,8 +109,9 @@ class CalendarGuardTests(unittest.TestCase):
         for notify in (False, True):
             self.event.subject = "old"
             with patch("calendar_operations.require_send") as gate, patch.object(CalendarItem, "save") as save:
-                self.ops.update_event("e", subject="new", notify_attendees=notify, confirm=True, confirmation_id="token")
-                save.assert_called_once_with(update_fields=["subject"], send_meeting_invitations=(
+                self.ops.update_event("e", subject="new", notify_attendees=notify, confirm=True,
+                                      confirmation_id="token", expected_version={"id": "e", "changekey": "v"})
+                save.assert_called_once_with(update_fields=["subject"], conflict_resolution="NeverOverwrite", send_meeting_invitations=(
                     "SendToAllAndSaveCopy" if notify else "SendToNone"))
                 self.assertEqual(gate.call_count, int(notify))
         with patch("calendar_operations.require_send") as gate, patch.object(CalendarItem, "cancel") as cancel, \

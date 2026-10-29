@@ -6,7 +6,7 @@
 
 ## 参数
 
-`arguments` 为扁平对象，仍须包含 `lanid`、`name`。
+`arguments` 为扁平对象，必须包含 `lanid` 及下列必填业务参数。邮箱仅取自 OA 按 LANID 查询的唯一结果，仍检查结果唯一性和邮箱有效性。兼容字段 `name` 可省略，传入时忽略，不用于验证或授权。
 
 | 参数 | 约束与含义 |
 | --- | --- |
@@ -22,7 +22,6 @@
   "name": "check_availability",
   "arguments": {
     "lanid": "test.employee",
-    "name": "测试员工",
     "start": "2026-10-12T09:00:00+08:00",
     "end": "2026-10-12T10:30:00+08:00",
     "attendees": ["alice@example.com", "bob@example.com"],

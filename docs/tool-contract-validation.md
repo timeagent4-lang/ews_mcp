@@ -4,10 +4,13 @@
 
 历史合同修复阶段仅修改 `tool_specs.py`、`mcp_server.py`、`calendar_operations.py`；以下注明日期的测试数量仍为历史记录。
 
-## 当前结果合同（2026-10-27）
+## 当前结果合同（2026-10-29）
 
 - `structuredContent` 的同一对象完整序列化为 JSON `TextContent`；MCP 外层保留 `isError`，业务结果不返回重复的 `ok`。
 - 写预览为 `pending`；`confirmed`、`executing`、`processing` 表示尚未完成，无 `error_code`、`isError=false`。`completed` 无错误码；`failed`、`partial`、`unknown` 保留具体错误码且 `isError=true`。
+- 首次预览与同幂等键重放使用相同结构，业务条目均位于 `preview.preview.items`；附件 CID、摘要等内容保持一致。
+- 批量写入的未知项标记 `status=unknown`，与确定失败分别计入 `unknown_count`、`failed_count`。存在未知项时整体为 `unknown/BATCH_OUTCOME_UNKNOWN`；确认、查询和重放保留逐项结果，不再次提交。
+- 重启保留未执行的 `pending` 预览及其原有效期；仅将 `confirmed/executing` 转为 `unknown`。确定的 `ErrorIrresolvableConflict` 作为失败释放草稿占用，超时等未知结果仍保留占用；历史 `unknown` 不自动修改。
 - 参数、权限或令牌拒绝只表示本次调用被拒绝，不把原操作标为失败。缺少操作记录为 `OPERATION_NOT_FOUND`，不同于执行结果未知；首次返回、查询和重复确认使用一致的已记录结果。
 - 普通读取不增加生命周期 `status`。联系人及线程查询区分成功零匹配、部分完成和全部来源失败：部分可用时保留结果及覆盖信息，`partial=true`、`isError=false`；全部失败返回具体错误。`list_folders` 返回访问情况探测报告，即使全部不可访问也不伪装为探测失败。
 - `message` 只说明具体缺参、类型、范围或确认参数组合，例如“缺少必填参数 lanid，请传入当前登录用户的 LANID”。不增加缺失字段列表，不回显敏感参数值。
@@ -19,6 +22,8 @@
 ## 公开参数与调用入口
 
 - 当前调用合同：`arguments` 为扁平对象，必填 `lanid` 及工具所需业务参数，不使用 `params` 包裹。邮箱仅来自 OA 按 LANID 查询的唯一结果，仍检查结果唯一性和邮箱有效性；兼容字段 `name` 可省略，传入时忽略，不用于验证或授权。以下历史测试结论不能替代此合同的重新验证。
+- 内部操作和上传归属统一使用小写 LANID；传给 OA 的原始身份参数不变。
+- `list_flagged_messages` 新增可选 `offset=0`，返回 `offset/limit/has_more/next_offset`；原 `limit` 默认值和位置参数不变。列表变化时偏移分页可能重复或遗漏，未提供跨请求快照。
 - `respond_to_event.response`、`create_draft.mode`、`find_message.folder`、`list_flagged_messages.folder/status` 采用公开 schema 的枚举。
 - `find_message.query` 可省略，默认空串，只做主题包含搜索，可结合文件夹、时间、已读及附件条件。
 - 回复、回复全部、转发草稿必须给 `reply_to`；默认新建模式不接受原邮件引用。
@@ -48,6 +53,7 @@
 更新、响应、取消均拒绝周期主事件，只接受明确的 Single、Occurrence 或 Exception；类型缺失时拒绝操作。
 更新和取消要求员工邮箱与组织者邮箱匹配。响应拒绝组织者，并要求员工出现在必需、可选或资源参会人列表中。
 这些检查在预览和确认时都执行，发生在任何写入前。
+预览保存事件ID与ChangeKey，确认前不匹配则返回`EVENT_CHANGED`并要求重新预览；旧预览缺少版本时返回`PREVIEW_VERSION_REQUIRED`。更新使用`NeverOverwrite`，避免读取后发生的冲突覆盖他人修改。
 保留发送开关、通知参数，以及无参会人个人预约移至已删除项目的行为。
 身份匹配使用 Exchange 返回的邮箱地址，不新增别名解析能力；缺少可匹配地址时拒绝操作。
 

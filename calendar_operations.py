@@ -4,6 +4,7 @@ from datetime import date, datetime, time, timedelta
 
 from exchangelib import Attendee, CalendarItem, EWSDate, EWSDateTime, HTMLBody, Mailbox
 from exchangelib.items import SEND_TO_ALL_AND_SAVE_COPY, SEND_TO_NONE
+from exchangelib.items.base import NEVER_OVERWRITE
 from exchangelib.items.calendar_item import EXCEPTION, OCCURRENCE, RECURRING_MASTER, SINGLE
 
 from mail_operations import _page
@@ -110,6 +111,24 @@ def _boundary(value, *, end=False):
     return parse_datetime(value)
 
 
+def _event_version(event):
+    return {"id": event.id, "changekey": event.changekey}
+
+
+def _check_event_version(event, expected_version):
+    if not isinstance(expected_version, dict) or any(
+        not isinstance(expected_version.get(field), str) or not expected_version[field]
+        for field in ("id", "changekey")
+    ):
+        raise ToolOperationError(
+            "PREVIEW_VERSION_REQUIRED", "请重新预览日程后再确认。"
+        )
+    if _event_version(event) != expected_version:
+        raise ToolOperationError(
+            "EVENT_CHANGED", "日程在预览后发生变化，本次未执行；请重新预览。"
+        )
+
+
 def _require_single_or_occurrence(event):
     if event.type == RECURRING_MASTER:
         raise ToolOperationError(
@@ -167,8 +186,11 @@ class CalendarOperations:
         notify_attendees=False,
         confirm=False,
         confirmation_id=None,
+        expected_version=None,
     ):
         event = self._calendar_item(event_id)
+        if confirm:
+            _check_event_version(event, expected_version)
         _require_single_or_occurrence(event)
         _require_organizer(event, self.config.email)
         changes = {
@@ -210,18 +232,13 @@ class CalendarOperations:
             for name, value in changes.items()
             if value != getattr(event, name)
         }
-        if not changes:
-            return {
-                "id": event.id,
-                "changekey": event.changekey,
-                "updated_fields": [],
-            }
         # Confirmation is required even when attendees are not notified.
         preview = require_confirmation(
             mailbox=self.config.email,
             action="update_event",
             items=[_event_detail(event)],
             details={
+                "version": _event_version(event),
                 "changes": {
                     name: (
                         _event_time(value)
@@ -237,12 +254,19 @@ class CalendarOperations:
         )
         if preview is not None:
             return preview
+        if not changes:
+            return {
+                "id": event.id,
+                "changekey": event.changekey,
+                "updated_fields": [],
+            }
         if notify_attendees:
             require_send("发送日程更新通知")
         for name, value in changes.items():
             setattr(event, name, value)
         event.save(
             update_fields=list(changes),
+            conflict_resolution=NEVER_OVERWRITE,
             send_meeting_invitations=(
                 SEND_TO_ALL_AND_SAVE_COPY if notify_attendees else SEND_TO_NONE
             ),
@@ -254,7 +278,8 @@ class CalendarOperations:
         }
 
     def respond_to_event(
-        self, event_id, response, message=None, confirm=False, confirmation_id=None
+        self, event_id, response, message=None, confirm=False, confirmation_id=None,
+        expected_version=None,
     ):
         methods = {
             "accept": "accept",
@@ -266,13 +291,15 @@ class CalendarOperations:
                 "INVALID_RESPONSE", "日程响应必须是 accept、tentative 或 decline。"
             )
         event = self._calendar_item(event_id)
+        if confirm:
+            _check_event_version(event, expected_version)
         _require_single_or_occurrence(event)
         _require_attendee(event, self.config.email)
         preview = require_confirmation(
             mailbox=self.config.email,
             action="respond_to_event",
             items=[_event_detail(event)],
-            details={"response": response, "message": message},
+            details={"response": response, "message": message, "version": _event_version(event)},
             confirm=confirm,
             confirmation_id=confirmation_id,
         )
@@ -286,8 +313,13 @@ class CalendarOperations:
         )
         return {"id": event_id, "response": response, "responded": True}
 
-    def cancel_event(self, event_id, message=None, confirm=False, confirmation_id=None):
+    def cancel_event(
+        self, event_id, message=None, confirm=False, confirmation_id=None,
+        expected_version=None,
+    ):
         event = self._calendar_item(event_id)
+        if confirm:
+            _check_event_version(event, expected_version)
         _require_single_or_occurrence(event)
         _require_organizer(event, self.config.email)
         # Decide from attendee data before submission: delete appointments, notify meetings.
@@ -306,6 +338,7 @@ class CalendarOperations:
             action="cancel_event",
             items=[_event_detail(event)],
             details={
+                "version": _event_version(event),
                 "message": message,
                 "delivery": "cancel_notice" if is_meeting else "delete",
                 "attendee_count": attendee_count,

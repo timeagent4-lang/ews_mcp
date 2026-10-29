@@ -186,8 +186,17 @@ def load_server():
     """Stub deployment adapters only while importing the real MCP server."""
     audit = ModuleType("utils.audit")
     audit.AUDIT_IDENTITY_STATE_KEY = "identity"
-    audit.ToolAuditMiddleware = Middleware
+    class OfflineAudit(Middleware):
+        def __init__(self):
+            self.logger = Mock()
+    audit.ToolAuditMiddleware = OfflineAudit
     audit.install_tool_audit_fallback = lambda *args: None
+    audit.current_audit_context = lambda: {}
+    audit.update_audit_context = lambda **fields: fields
+    audit.emit_event = lambda *args, **fields: fields
+    audit.exception_for_log = lambda exc: {'type': type(exc).__name__}
+    audit.result_for_log = lambda result, **kw: {'structured_content': getattr(result, 'structured_content', None)}
+    audit._classify_result = lambda result: (getattr(result, 'structured_content', {}).get('status', 'success'), None, None)
     identity = ModuleType("utils.lanid_email")
     identity.IdentityResolutionError = type("IdentityResolutionError", (ValueError,), {})
     identity.normalize_lanid = lambda value: value.strip().lower()
@@ -199,7 +208,7 @@ def load_server():
     )
     server = importlib.util.module_from_spec(spec)
     with patch.dict(sys.modules, {
-        "utils": ModuleType("utils"), "utils.audit": audit,
+        "utils.audit": audit,
         "utils.lanid_email": identity, "outlook_client": outlook,
     }):
         spec.loader.exec_module(server)

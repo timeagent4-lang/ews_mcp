@@ -88,6 +88,7 @@ UNKNOWN_OUTCOME_CODES = frozenset(
         "OOF_WRITE_UNAVAILABLE",
         "CONTACT_RECEIPT_INCOMPLETE",
         "TASK_RECEIPT_INCOMPLETE",
+        "MOVE_RESULT_UNKNOWN",
         "CONFIRMATION_MISMATCH",
     }
 )
@@ -101,6 +102,7 @@ _DEFINITE_REJECTION_ERRORS = frozenset(
         "ErrorInvalidRecipients",
         "ErrorMissingRecipients",
         "ErrorInvalidArgument",
+        "ErrorIrresolvableConflict",
         "ErrorInvalidValueForProperty",
         "ErrorMailRecipientNotFound",
         "ErrorItemNotFound",

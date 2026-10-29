@@ -82,6 +82,17 @@ def load_server(*, audit_logger=None):
     return module
 
 
+def audit_outcome(test, logger):
+    records = [json.loads(call.args[0]) for call in logger.info.call_args_list]
+    starts = [row for row in records if row.get('event_type') == 'tool.started']
+    outcomes = [row for row in records
+                if row.get('event_type') in ('tool.finished', 'tool.failed', 'tool.cancelled')]
+    test.assertEqual(len(starts), 1, records)
+    test.assertEqual(len(outcomes), 1, records)
+    test.assertEqual(starts[0]['call_id'], outcomes[0]['call_id'])
+    return outcomes[0]
+
+
 class PublicSchemaTests(unittest.TestCase):
     def valid(self, tool, **params):
         return Draft202012Validator(SPECS[tool]["inputSchema"]).is_valid(
@@ -285,14 +296,11 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(result.structured_content["results"], {"marker": tool})
                     if tool != 'prepare_attachment_upload':
                         self.assertEqual(self.business.requester_lanid, "employee")
-                    self.server.tool_audit.logger.info.assert_called_once()
-                    event = json.loads(self.server.tool_audit.logger.info.call_args.args[0])
+                    event = audit_outcome(self, self.server.tool_audit.logger)
                     self.assertEqual(event["identity_assurance"], "oa_lanid_resolved")
                     self.assertEqual(event["status"], "success")
                     self.assertIn("input_arguments", event)
                     audited = {**IDENTITY, **business}
-                    if tool == 'prepare_attachment_upload':
-                        audited['filename'] = {'redacted':True, 'type':'string', 'length':10}
                     self.assertEqual(event["input_arguments"], audited)
                     self.assertIn("input_summary", event)
                     if tool == "check_availability":
@@ -455,7 +463,9 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(payload["success_count"], successes)
                             self.assertEqual(payload["failed_count"], failures)
                         event = json.loads(self.server.tool_audit.logger.info.call_args.args[0])
-                        self.assertEqual(event["status"], "failure" if failures else "success")
+                        self.assertEqual(event["status"], status)
+                        self.assertEqual(event['is_error'], failures != 0)
+                        self.assertEqual(event['mcp_is_error'], result.is_error)
                         self.assertEqual(event["error_code"], code)
                     self.assertEqual(self.store.get(preview["operation_id"])["status"], status)
                     self.business.update_messages.assert_called_once()
@@ -559,7 +569,7 @@ class MCPContractTests(unittest.IsolatedAsyncioTestCase):
             result = await self.call(client, "get_server_status", lanid=" DOMAIN\\Employee ")
         self.assertFalse(result.is_error)
         self.assertEqual(result.structured_content["results"], {"ready": True})
-        self.assertEqual(self.business.requester_lanid, "Employee")
+        self.assertEqual(self.business.requester_lanid, "employee")
         self.server.resolve_identity_by_lanid.assert_called_once_with(" DOMAIN\\Employee ")
 
     async def test_receipt_confirmation_and_terminal_replay_are_scoped(self):
@@ -818,8 +828,7 @@ class AuditEntryTests(unittest.IsolatedAsyncioTestCase):
                         result = await client.call_tool("check_availability", arguments, raise_on_error=False)
                         self.assertTrue(result.is_error)
                         self.assertEqual(result.structured_content["error_code"], "INVALID_PARAMS")
-                        audit_logger.info.assert_called_once()
-                        event = json.loads(audit_logger.info.call_args.args[0])
+                        event = audit_outcome(self, audit_logger)
                         self.assertEqual(event["status"], "failure")
                         self.assertEqual(event["error_code"], "INVALID_PARAMS")
                         self.assertIn("input_arguments", event)
@@ -853,9 +862,8 @@ class AuditEntryTests(unittest.IsolatedAsyncioTestCase):
                         self.assertTrue(result.is_error)
                         self.assertEqual(result.structured_content["error_code"], code)
                         self.assertNotIn("SECRET_TOKEN", str(result))
-                        audit_logger.info.assert_called_once()
-                        serialized = audit_logger.info.call_args.args[0]
-                        event = json.loads(serialized)
+                        event = audit_outcome(self, audit_logger)
+                        serialized = json.dumps(event)
                         self.assertEqual(event["tool"], tool)
                         self.assertEqual(event["error_code"], code)
                         self.assertEqual(event["status"], "failure")

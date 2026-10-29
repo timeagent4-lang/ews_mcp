@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 import uuid
@@ -42,11 +43,17 @@ from confirmation import (
 from outlook_client import OutlookClient
 import team_directories
 from tool_specs import READ_TOOLS, SPECS, TOOL_NAMES
-from tool_support import ToolOperationError, is_definite_rejection, sanitize
+from tool_support import ToolOperationError, is_definite_rejection, require_confirmation, sanitize
 from utils.audit import (
     AUDIT_IDENTITY_STATE_KEY,
     ToolAuditMiddleware,
     install_tool_audit_fallback,
+    current_audit_context,
+    update_audit_context,
+    emit_event,
+    exception_for_log,
+    result_for_log,
+    _classify_result,
 )
 from utils.lanid_email import (
     IdentityResolutionError,
@@ -68,7 +75,17 @@ _ATTACHMENT_SLOTS = threading.BoundedSemaphore(MAX_ATTACHMENTS_IN_FLIGHT)
 _DRAFT_WRITES = frozenset(('update_draft', 'send_draft', 'attach_draft_attachment'))
 tool_audit = ToolAuditMiddleware()
 mcp.add_middleware(tool_audit)
-install_tool_audit_fallback(mcp, tool_audit)
+
+
+def _audit_event(event_type, **fields):
+    """Observation must never change a submitted business action's outcome."""
+    try:
+        return emit_event(event_type, logger=tool_audit.logger, **fields)
+    except Exception:
+        try:
+            sys.stderr.write('EWS_LOG_WRITE_FAILED event_emission\n')
+        except Exception:
+            pass
 
 CONTROL_FIELDS = frozenset(("lanid", "name", "operation_id", "confirm_token", "idempotency_key"))
 _INPUT_VALIDATORS = {
@@ -213,6 +230,7 @@ def _set_identity_assurance(ctx: Context, value: str) -> None:
 
 def _resolve_mailbox(params: dict, ctx: Context | None) -> str:
     """Resolve the LANID through OA on every call, including receipt queries."""
+    _audit_event('tool.stage', stage='identity.lookup')
     try:
         identity = resolve_identity_by_lanid(params.get("lanid"))
     except IdentityResolutionError:
@@ -224,6 +242,12 @@ def _resolve_mailbox(params: dict, ctx: Context | None) -> str:
     if not mailbox or "@" not in mailbox:
         raise ValueError("缺少或无效的目标邮箱")
     _set_identity_assurance(ctx, "oa_lanid_resolved")
+    update_audit_context(identity_assurance='oa_lanid_resolved',
+                         caller={'verified_lanid': requester_lanid(params),
+                                 'mailbox': mailbox, 'identity_assurance': 'oa_lanid_resolved'})
+    _audit_event('tool.stage', stage='identity.verified',
+                 identity_assurance='oa_lanid_resolved', mailbox=mailbox,
+                 verified_lanid=requester_lanid(params))
     return mailbox
 
 
@@ -233,7 +257,7 @@ def requester_lanid(params: dict) -> str:
     Invalid identities return an empty value so directory access stays closed.
     """
     try:
-        return normalize_lanid(params.get("lanid"))
+        return normalize_lanid(params.get("lanid")).lower()
     except IdentityResolutionError:
         return ""
 
@@ -273,21 +297,12 @@ def _snake(name: str) -> str:
 
 
 def _log_tool_error(tool_name: str, exc: Exception, error_kind: str = None) -> None:
-    if error_kind == "program":
-        # Keep the full traceback server-side; callers only get INTERNAL_ERROR.
-        logger.exception(
-            "%s 执行失败(程序异常): error_type=%s", tool_name, exc.__class__.__name__
-        )
-        return
     cause = _exchange_cause(exc)
-    logger.error(
-        "%s 执行失败: error_code=%s error_type=%s exchange_code=%s detail=%s",
-        tool_name,
-        getattr(exc, 'code', exc.__class__.__name__),
-        exc.__class__.__name__,
-        cause.__class__.__name__ if cause is not None else None,
-        sanitize(str(cause if cause is not None else exc), 200),
-    )
+    _audit_event('tool.error', tool=tool_name, stage='business.error', status='error',
+                 is_error=True, error_kind=error_kind,
+                 error_code=getattr(exc, 'code', exc.__class__.__name__),
+                 exchange_code=cause.__class__.__name__ if cause is not None else None,
+                 error=exception_for_log(exc))
 
 
 def _exchange_cause(exc: Exception):
@@ -494,6 +509,7 @@ def _receipt(tool_name: str, record, *, mailbox, lanid=None, replay=False) -> To
     _require_record_scope(tool_name, mailbox, record)
     _require_upload_owner(tool_name, record, lanid)
     _require_directory_read(record, lanid)
+    update_audit_context(operation_id=record['operation_id'], operation_id_source='verified')
     status = record["status"]
     result = record["result"]
     stored_failure = (
@@ -509,7 +525,7 @@ def _receipt(tool_name: str, record, *, mailbox, lanid=None, replay=False) -> To
         if _is_batch_result(result)
         and result["results"]
         and not stored_failure
-        and status in (STATUS_FAILED, STATUS_PARTIAL)
+        and status in (STATUS_FAILED, STATUS_PARTIAL, STATUS_UNKNOWN)
         else None
     )
     payload = {
@@ -529,18 +545,23 @@ def _receipt(tool_name: str, record, *, mailbox, lanid=None, replay=False) -> To
             payload["message"] = stored_failure["message"]
     elif batch is not None:
         rows = batch["results"]
-        failed = sum(row.get("success") is False for row in rows)
+        unknown = sum(row.get("status") == STATUS_UNKNOWN for row in rows)
+        failed = sum(row.get("success") is False and row.get("status") != STATUS_UNKNOWN for row in rows)
         payload["error_code"] = (
+            "BATCH_OUTCOME_UNKNOWN" if unknown else
             "BATCH_FAILED" if failed == len(rows) else "BATCH_PARTIAL_FAILURE"
         )
-        payload["success_count"] = len(rows) - failed
+        payload["success_count"] = len(rows) - failed - unknown
         payload["failed_count"] = failed
+        payload["unknown_count"] = unknown
     elif status == STATUS_PARTIAL:
         payload["error_code"] = "BATCH_PARTIAL_FAILURE"
     elif status in (STATUS_UNKNOWN, STATUS_FAILED):
         payload["error_code"] = "OPERATION_UNKNOWN" if status == STATUS_UNKNOWN else "OPERATION_FAILED"
     if status == STATUS_COMPLETED:
         note = None
+    elif batch is not None and payload.get("unknown_count"):
+        note = "有条目结果未知，请先核实其实际状态，勿重试这些条目或整批重发；仅确定未执行的失败条目可重试。"
     elif status == STATUS_PARTIAL:
         note = "部分成功：请仅对失败条目重试，勿整批重发。"
     elif status == STATUS_FAILED:
@@ -597,12 +618,19 @@ def _preview_replay(tool_name: str, record, *, mailbox, lanid=None) -> ToolResul
     _require_record_scope(tool_name, mailbox, record)
     _require_upload_owner(tool_name, record, lanid)
     _require_directory_read(record, lanid)
+    update_audit_context(operation_id=record['operation_id'], operation_id_source='verified')
+    details = record["details"]
+    if tool_name == 'attach_draft_attachment' and isinstance(details, dict):
+        # The storage deadline is not part of the original user-visible preview.
+        details = {key: value for key, value in details.items() if key != 'expires_at'}
+    preview = require_confirmation(mailbox=record["mailbox"], action=record["action"],
+                                   items=record["items"], details=details)
     return json_result({
             "status": STATUS_PENDING,
             "confirmation_required": True,
             "operation_id": record["operation_id"],
             "confirm_token": record["confirm_token"],
-            "preview": {"items": record["items"], "details": record["details"]},
+            "preview": preview,
             "replayed": True,
         })
 
@@ -614,6 +642,8 @@ def _is_batch_result(result) -> bool:
 def _classify_write_result(result):
     if _is_batch_result(result):
         rows = result["results"]
+        if any(row.get("status") == STATUS_UNKNOWN for row in rows):
+            return STATUS_UNKNOWN, result
         failed = sum(row.get("success") is False for row in rows)
         if failed == 0:
             return STATUS_COMPLETED, result
@@ -658,6 +688,9 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
             raise ConfirmationError("OPERATION_NOT_FOUND", "未找到 operation_id 对应的操作记录")
         _require_record_scope(tool_name, mailbox, existing)
         _require_upload_owner(tool_name, existing, lanid)
+        update_audit_context(operation_id=operation_id, operation_id_source='verified')
+        _audit_event('tool.stage', tool=tool_name, stage='confirmation.check',
+                     operation_id=operation_id)
         if existing is not None and (
             not secrets.compare_digest(confirm_token.encode("utf-8"), existing["confirm_token"].encode("utf-8"))
             or business != existing["business_params"]
@@ -697,6 +730,8 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
             return _tool_failure(tool_name, exc=exc, operation_id=operation_id)
         if execution:
             client.submission_started = False
+        _audit_event('tool.stage', tool=tool_name, stage='operation.execute',
+                     operation_id=operation_id, status=STATUS_EXECUTING)
         try:
             execute = {**business, "confirm": True, "confirmation_id": confirm_token}
             recorded_version = (existing.get("details") or {}).get("version")
@@ -728,11 +763,21 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
                     store.finish_draft_operation(execution, status, _failure_record(exc), definitely_not_applied=not ambiguous)
                 else:
                     store.mark(operation_id, status, result=_failure_record(exc))
-            except Exception:
+            except Exception as persist_exc:
                 logger.error('write_receipt_persistence_failed tool=%s', tool_name)
+                _audit_event('operation.finished', tool=tool_name, operation_id=operation_id,
+                             origin_call_id=current_audit_context().get('call_id'),
+                             stage='receipt.persist_failed', status=STATUS_UNKNOWN,
+                             is_error=True, error_code='OPERATION_UNKNOWN',
+                             error=exception_for_log(persist_exc))
                 return _tool_failure(tool_name, error_code='OPERATION_UNKNOWN', operation_id=operation_id)
             _log_tool_error(tool_name, exc, _classify_exception(exc)[1])
-            return _receipt(tool_name, store.get(operation_id), mailbox=mailbox, lanid=lanid)
+            receipt = _receipt(tool_name, store.get(operation_id), mailbox=mailbox, lanid=lanid)
+            _audit_event('operation.finished', tool=tool_name, operation_id=operation_id,
+                         origin_call_id=current_audit_context().get('call_id'),
+                         stage='receipt.persisted', status=status, is_error=True,
+                         error=exception_for_log(exc), result=result_for_log(receipt, tool=tool_name))
+            return receipt
         # Keep post-write bookkeeping outside the submission exception handler:
         # a later failure must not make the write retryable.
         status, final_result = _classify_write_result(result)
@@ -741,10 +786,21 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
                 store.finish_draft_operation(execution, status, final_result)
             else:
                 store.mark(operation_id, status, result=final_result)
-        except Exception:
+        except Exception as persist_exc:
             logger.error('write_receipt_persistence_failed tool=%s', tool_name)
+            _audit_event('operation.finished', tool=tool_name, operation_id=operation_id,
+                         origin_call_id=current_audit_context().get('call_id'),
+                         stage='receipt.persist_failed', status=STATUS_UNKNOWN,
+                         is_error=True, error_code='OPERATION_UNKNOWN',
+                         error=exception_for_log(persist_exc))
             return _tool_failure(tool_name, error_code='OPERATION_UNKNOWN', operation_id=operation_id)
-        return _receipt(tool_name, store.get(operation_id), mailbox=mailbox, lanid=lanid)
+        receipt = _receipt(tool_name, store.get(operation_id), mailbox=mailbox, lanid=lanid)
+        _audit_event('operation.finished', tool=tool_name, operation_id=operation_id,
+                     origin_call_id=current_audit_context().get('call_id'),
+                     stage='receipt.persisted', status=status,
+                     is_error=result_is_error(receipt.structured_content),
+                     result=result_for_log(receipt, tool=tool_name))
+        return receipt
 
     # Preview handlers are read-only; persist their result for confirmation.
     client = initialize_outlook_client(params, ctx, mailbox=mailbox)
@@ -773,6 +829,9 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
             canonical_draft_id=details['canonical_draft_id'], expires_at=time.time() + preview_ttl_seconds())
     else:
         record = store.create_preview(**preview_args)
+    update_audit_context(operation_id=record['operation_id'], operation_id_source='verified')
+    _audit_event('operation.preview_created', tool=tool_name,
+                 operation_id=record['operation_id'], status=STATUS_PENDING)
     return json_result({
             "status": STATUS_PENDING,
             "confirmation_required": True,
@@ -784,7 +843,9 @@ def _run_write(tool_name: str, params: dict, ctx: Context) -> ToolResult:
 
 def _dispatch(tool_name: str, params: dict, ctx: Context) -> ToolResult:
     try:
+        _audit_event('tool.stage', tool=tool_name, stage='arguments.validation')
         _validate_arguments(tool_name, params)
+        _audit_event('tool.stage', tool=tool_name, stage='business.dispatch')
         if tool_name in READ_TOOLS:
             return _invoke_read(tool_name, params, ctx)
         return _run_write(tool_name, params, ctx)
@@ -792,12 +853,30 @@ def _dispatch(tool_name: str, params: dict, ctx: Context) -> ToolResult:
         return _tool_failure(tool_name, exc=exc)
 
 
-def _send_dispatch_done(task):
+def _send_dispatch_done(task, *, context=None, started=None):
     _SEND_DISPATCH_TASKS.discard(task)
-    if not task.cancelled():
-        exc = task.exception()
-        if exc is not None:
-            logger.error("发送后台处理异常: error_type=%s", exc.__class__.__name__)
+    context = context if context is not None else current_audit_context()
+    common = dict(context=context, tool='send_draft',
+                  origin_call_id=context.get('call_id'),
+                  duration_ms=round((time.perf_counter() - started) * 1000) if started is not None else None)
+    if task.cancelled():
+        _audit_event('dispatch.finished', **common, call_status='cancelled',
+                     status='cancelled', is_error=False)
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("发送后台处理异常: error_type=%s", exc.__class__.__name__)
+        _audit_event('dispatch.finished', **common, call_status='error',
+                     status='error', is_error=True, error=exception_for_log(exc))
+        return
+    result = task.result()
+    status, error_code, result_count = _classify_result(result)
+    data = getattr(result, 'structured_content', None)
+    _audit_event('dispatch.finished', **common, call_status='returned', status=status,
+                 is_error=result_is_error(data) if isinstance(data, dict) else bool(error_code),
+                 operation_id=data.get('operation_id') if isinstance(data, dict) else None,
+                 error_code=error_code, result_count=result_count,
+                 result=result_for_log(result, tool='send_draft'))
 
 
 def _send_wait_expired(params) -> ToolResult:
@@ -828,9 +907,12 @@ def _make_handler(tool_name):
         # Keep synchronous OA/Exchange work off the loop; finish writes after cancellation.
         if tool_name != "send_draft":
             return await to_thread.run_sync(_dispatch, tool_name, params, ctx)
+        dispatch_started = time.perf_counter()
         task = asyncio.create_task(to_thread.run_sync(_dispatch, tool_name, params, ctx))
         _SEND_DISPATCH_TASKS.add(task)
-        task.add_done_callback(_send_dispatch_done)
+        # add_done_callback retains this ContextVar carrier, including identity
+        # enrichment by the worker after the request has returned processing.
+        task.add_done_callback(lambda done: _send_dispatch_done(done, started=dispatch_started))
         try:
             # Timeout the shielded wait, not the dispatch. Keeping its AnyIO
             # limiter token also prevents timed-out sends from spawning extra
@@ -857,6 +939,7 @@ _register_all()
 register_download_route(mcp)
 register_upload_route(mcp)
 install_failure_envelope(mcp)
+install_tool_audit_fallback(mcp, tool_audit)
 
 
 @mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
@@ -905,6 +988,12 @@ def main():
     if not api_key.strip():
         raise ValueError("缺少 EWS_MCP_API_KEY")
     logger.info("EWS MCP listening on %s:%s", host, port)
+    _audit_event('service.started', host=host, port=port,
+                 log_directory=str(os.path.abspath(os.getenv('EWS_MCP_LOG_DIR', '').strip()
+                                                  or os.path.join(data_dir(), 'logs'))),
+                 uid=getattr(os, 'getuid', lambda: None)(),
+                 gid=getattr(os, 'getgid', lambda: None)())
+    atexit.register(_audit_event, 'service.stopping', reason='normal_shutdown')
     mcp.run(
         transport="streamable-http",
         host=host,

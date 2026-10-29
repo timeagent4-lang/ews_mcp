@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -172,12 +173,16 @@ class AttachmentMCPTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.structured_content['status'], 'completed')
             self.assertEqual(self.calls, 1)
 
-    async def test_prepare_invalid_filename_is_redacted_before_validation(self):
+    async def test_prepare_invalid_filename_is_recorded_before_validation(self):
         async with Client(mcp_server.mcp) as client:
             result = await self.call(client, 'prepare_attachment_upload', filename='C:\\SENSITIVE_DIR\\report.txt', size='bad', sha256='a'*64)
             self.assertTrue(result.is_error)
         output = '\n'.join(str(c.args) for c in self.audits.info.call_args_list)
-        self.assertNotIn('SENSITIVE_DIR', output)
+        self.assertIn('SENSITIVE_DIR', output)
+        starts = [json.loads(c.args[0]) for c in self.audits.info.call_args_list
+                  if json.loads(c.args[0]).get('event_type') == 'tool.started']
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0]['input_arguments']['filename'], 'C:\\SENSITIVE_DIR\\report.txt')
 
     async def test_same_idempotency_key_cannot_replay_a_different_upload(self):
         async with Client(mcp_server.mcp) as client:

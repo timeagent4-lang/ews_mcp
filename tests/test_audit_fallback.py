@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
-from fastmcp import FastMCP
+from fastmcp import Client, Context, FastMCP
 from mcp import types as mcp_types
 
 from utils.audit import ToolAuditMiddleware, install_tool_audit_fallback
@@ -47,7 +47,11 @@ class AuditFallbackTests(unittest.IsolatedAsyncioTestCase):
         return self.server._mcp_server.request_handlers[mcp_types.CallToolRequest]
 
     def assert_snapshot(self, *, status, error_code):
-        self.logger.info.assert_called_once()
+        self.assertEqual(self.logger.info.call_count, 2)
+        events = [json.loads(call.args[0]) for call in self.logger.info.call_args_list]
+        self.assertEqual([event['event_type'] for event in events], ['tool.started', 'tool.finished' if status != 'error' else 'tool.failed'])
+        self.assertEqual(events[0]['call_id'], events[1]['call_id'])
+        self.assertNotEqual(events[0]['event_id'], events[1]['event_id'])
         serialized = self.logger.info.call_args.args[0]
         event = json.loads(serialized)
         self.assertEqual(event["tool"], "check_availability")
@@ -125,6 +129,35 @@ class AuditFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(result, self.error_result)
         self.assert_snapshot(status="failure", error_code="MCP_TOOL_ERROR")
+
+    async def test_fallback_terminal_retains_worker_verified_identity(self):
+        state = {}
+        fast_context = SimpleNamespace(set_state=lambda key, value: state.__setitem__(key, value),
+                                       get_state=lambda key: state.get(key))
+        async def call_next(context):
+            state['mail_mcp.identity_assurance'] = 'oa_lanid_resolved'
+            return self.error_result
+        async def original_handler(request):
+            return await self.middleware.on_call_tool(SimpleNamespace(message=request.params,
+                fastmcp_context=fast_context), call_next)
+        await self.install(original_handler)(self.request)
+        event = json.loads(self.logger.info.call_args.args[0])
+        self.assertEqual(event['identity_assurance'], 'oa_lanid_resolved')
+
+    async def test_real_client_and_middleware_share_one_transport_call(self):
+        self.server.add_middleware(self.middleware)
+        @self.server.tool()
+        async def echo(lanid: str, ctx: Context) -> dict:
+            ctx.set_state('mail_mcp.identity_assurance', 'oa_lanid_resolved')
+            return {'subject': lanid, 'status': 'completed'}
+        install_tool_audit_fallback(self.server, self.middleware)
+        async with Client(self.server) as client:
+            result = await client.call_tool('echo', {'lanid': 'employee'})
+        events = [json.loads(call.args[0]) for call in self.logger.info.call_args_list]
+        self.assertEqual([event['event_type'] for event in events], ['tool.started', 'tool.finished'])
+        self.assertEqual(events[0]['call_id'], events[1]['call_id'])
+        self.assertEqual(events[1]['identity_assurance'], 'oa_lanid_resolved')
+        self.assertEqual(result.structured_content['subject'], 'employee')
 
 
 if __name__ == "__main__":

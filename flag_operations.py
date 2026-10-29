@@ -210,15 +210,18 @@ class FlagOperations:
             "updated_fields": list(changes),
         }
 
-    def list_flagged_messages(self, folder="inbox", status="flagged", limit=20):
+    def list_flagged_messages(self, folder="inbox", status="flagged", limit=20, offset=0):
         if folder not in ("inbox", "drafts", "sent"):
             raise ToolOperationError("INVALID_FOLDER", "仅支持 inbox, drafts, sent 文件夹。")
         if status not in ("flagged", "complete", "all"):
             raise ToolOperationError(
                 "INVALID_FLAG_STATUS", "status 必须是 flagged, complete 或 all。"
             )
-        if type(limit) is not int or not 1 <= limit <= 100:
-            raise ToolOperationError("INVALID_PAGINATION", "limit 必须为 1 到 100。")
+        if (type(limit) is not int or not 1 <= limit <= 100
+                or type(offset) is not int or offset < 0):
+            raise ToolOperationError(
+                "INVALID_PAGINATION", "offset 必须非负且 limit 必须为 1 到 100。"
+            )
         target = self._tool_folder(folder)
         if status == "flagged":
             query = Q(flag_status=FLAG_FLAGGED)
@@ -236,10 +239,19 @@ class FlagOperations:
         rows = list(
             target.filter(query)
             .only(*LIST_FIELDS)
-            .order_by("-" + time_field)[:limit]
+            .order_by("-" + time_field)[offset : offset + limit + 1]
         )
+        # Check the lookahead too: a failed read must not look like the final page.
+        for row in rows:
+            if isinstance(row, Exception):
+                raise row
+        has_more = len(rows) > limit
         return {
-            "items": [_list_row(row, time_field) for row in rows],
+            "items": [_list_row(row, time_field) for row in rows[:limit]],
             "folder": folder,
             "status": status,
+            "offset": offset,
+            "limit": limit,
+            "has_more": has_more,
+            "next_offset": offset + limit if has_more else None,
         }
