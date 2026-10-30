@@ -4,6 +4,7 @@ import inspect
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from xml.etree import ElementTree
 
 from exchangelib.properties import FreeBusyView
 from exchangelib.services import GetUserAvailability
@@ -24,8 +25,9 @@ class AvailabilityFactsTests(unittest.TestCase):
     def setUp(self):
         self.version = Version(build=Build(15, 2, 0, 0))
         self.ops = AvailabilityOperations()
-        self.ops.account = SimpleNamespace(protocol=SimpleNamespace(version=self.version))
+        self.ops.account = SimpleNamespace(protocol=SimpleNamespace(version=self.version, credentials=None))
         self.payloads = []
+        self.envelopes = []
 
     def query(self, responses, *, start=START, end=END, attendees=None, **kwargs):
         # The SDK constructs the actual request and parses actual response XML;
@@ -38,6 +40,7 @@ class AvailabilityFactsTests(unittest.TestCase):
 
         def offline_transport(service, payload):
             self.payloads.append(payload)
+            self.envelopes.append(ElementTree.fromstring(service.wrap(payload, self.version.api_version)))
             return iter(elements)
 
         with patch.object(GetUserAvailability, "_get_elements", offline_transport):
@@ -140,23 +143,41 @@ class AvailabilityFactsTests(unittest.TestCase):
         self.assertEqual([node.text for node in self.payloads[-1].findall(".//t:Email/t:Address", NS)],
                          ["a@example.com", "b@example.com"])
 
-    def test_shanghai_timezone_and_utc_inputs_generate_equivalent_complete_ews_payloads(self):
+    def test_local_and_utc_inputs_use_one_utc_timezone_in_the_complete_soap_request(self):
         local = self.query([FreeBusyView(merged="00")])
         utc = self.query([FreeBusyView(merged="00")],
                          start="2026-10-09T01:00:00Z", end="2026-10-09T02:00:00Z")
         self.assertEqual(local, utc)
+        naive = self.query([FreeBusyView(merged="00")],
+                           start="2026-10-09T09:00:00", end="2026-10-09T10:00:00")
+        self.assertEqual(local, naive)
+        for envelope in self.envelopes:
+            self.assertEqual(envelope.find(".//t:TimeZoneContext/t:TimeZoneDefinition", NS).get("Id"), "UTC")
         for payload in self.payloads:
-            self.assertEqual(payload.find("t:TimeZone/t:Bias", NS).text, "-480")
+            self.assertEqual(payload.find("t:TimeZone/t:Bias", NS).text, "0")
             for name in ("StandardTime", "DaylightTime"):
                 transition = payload.find(f"t:TimeZone/t:{name}", NS)
                 self.assertIsNotNone(transition)
                 self.assertEqual({node.tag.rsplit("}", 1)[-1]: node.text for node in transition}, {
                     "Bias": "0", "Time": "00:00:00", "DayOrder": "0", "Month": "0", "DayOfWeek": "Sunday",
                 })
-            self.assertEqual(payload.find(".//t:TimeWindow/t:StartTime", NS).text, START)
-            self.assertEqual(payload.find(".//t:TimeWindow/t:EndTime", NS).text, END)
+            self.assertEqual(payload.find(".//t:TimeWindow/t:StartTime", NS).text, "2026-10-09T01:00:00Z")
+            self.assertEqual(payload.find(".//t:TimeWindow/t:EndTime", NS).text, "2026-10-09T02:00:00Z")
             self.assertEqual(payload.find(".//t:MergedFreeBusyIntervalInMinutes", NS).text, "30")
             self.assertEqual(payload.find(".//t:RequestedView", NS).text, "MergedOnly")
+
+    def test_busy_slot_returns_0950_local_across_the_utc_date_boundary(self):
+        result = self.query([FreeBusyView(merged="0" * 19 + "20")],
+                            start="2026-10-30T00:20:00+08:00", end="2026-10-30T10:50:00+08:00")
+        self.assertEqual(self.payloads[-1].find(".//t:TimeWindow/t:StartTime", NS).text,
+                         "2026-10-29T16:20:00Z")
+        self.assertEqual(self.payloads[-1].find(".//t:TimeWindow/t:EndTime", NS).text,
+                         "2026-10-30T02:50:00Z")
+        self.assertEqual(result["attendees"][0]["intervals"], [
+            {"start": "2026-10-30T00:20:00+08:00", "end": "2026-10-30T09:50:00+08:00", "status": "free"},
+            {"start": "2026-10-30T09:50:00+08:00", "end": "2026-10-30T10:20:00+08:00", "status": "busy"},
+            {"start": "2026-10-30T10:20:00+08:00", "end": "2026-10-30T10:50:00+08:00", "status": "free"},
+        ])
 
     def test_interval_bounds_serialize_and_return_the_selected_sampling_resolution(self):
         for minutes, merged in ((5, "0" * 12), (1440, "0")):

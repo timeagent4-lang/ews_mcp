@@ -28,7 +28,11 @@ _MERGED_STATUSES = {
 
 
 def _interval(start_dt, end_dt, status):
-    return {"start": start_dt.isoformat(), "end": end_dt.isoformat(), "status": status}
+    return {
+        "start": start_dt.astimezone(LOCAL_TIMEZONE).isoformat(),
+        "end": end_dt.astimezone(LOCAL_TIMEZONE).isoformat(),
+        "status": status,
+    }
 
 
 def _busy_intervals(merged, start_dt, end_dt, step):
@@ -47,10 +51,11 @@ def _busy_intervals(merged, start_dt, end_dt, step):
         slot_start = start_dt + index * step
         slot_end = min(slot_start + step, end_dt)
         status = _MERGED_STATUSES[digit]
+        interval = _interval(slot_start, slot_end, status)
         if intervals and intervals[-1]["status"] == status:
-            intervals[-1]["end"] = slot_end.isoformat()
+            intervals[-1]["end"] = interval["end"]
         else:
-            intervals.append(_interval(slot_start, slot_end, status))
+            intervals.append(interval)
     return intervals
 
 
@@ -61,9 +66,9 @@ def _window_status(intervals):
     return "free" if statuses == {"free"} else "busy"
 
 
-def _requester_timezone(start_dt):
-    # EWS Bias is added to local time to obtain UTC. Shanghai has no current DST;
-    # both transition elements are still required, with Month=0 for no transition.
+def _requester_timezone():
+    # Match the UTC SOAP header and time window. Both transition elements remain
+    # required; Month=0 means no daylight-saving transition.
     transition = {
         "bias": 0,
         "time": time(0, 0),
@@ -71,9 +76,8 @@ def _requester_timezone(start_dt):
         "iso_month": 0,
         "weekday": "Sunday",
     }
-    offset_minutes = int(start_dt.utcoffset().total_seconds() // 60)
     return TimeZone(
-        bias=-offset_minutes,
+        bias=0,
         standard_time=StandardTime(**transition),
         daylight_time=DaylightTime(**transition),
     )
@@ -103,17 +107,18 @@ class AvailabilityOperations:
                 continue
             seen.add(email)
             mailbox_data.append(MailboxData(email=Email(email_address=email)))
-        time_window = TimeWindow(
-            start=EWSDateTime.from_datetime(start_dt),
-            end=EWSDateTime.from_datetime(end_dt),
-        )
+        # Keep all wire-level timezone representations aligned, including hybrid
+        # Exchange requests. Convert to local time only when formatting results.
+        tzinfo_arg = EWSTimeZone("UTC")
+        start_utc = EWSDateTime.from_datetime(start_dt).astimezone(tzinfo_arg)
+        end_utc = EWSDateTime.from_datetime(end_dt).astimezone(tzinfo_arg)
+        time_window = TimeWindow(start=start_utc, end=end_utc)
         view_options = FreeBusyViewOptions(
             time_window=time_window,
             merged_free_busy_interval=interval_minutes,
             requested_view="MergedOnly",
         )
-        requester_tz = _requester_timezone(start_dt)
-        tzinfo_arg = EWSTimeZone.from_zoneinfo(LOCAL_TIMEZONE)
+        requester_tz = _requester_timezone()
         try:
             # Consume the lazy response here so transport/EWS failures are wrapped.
             views = list(
@@ -142,7 +147,7 @@ class AvailabilityOperations:
                 if response is not None and not isinstance(response, Exception)
                 else None
             )
-            intervals = _busy_intervals(merged, start_dt, end_dt, step)
+            intervals = _busy_intervals(merged, start_utc, end_utc, step)
             results.append({
                 "email": data.email.email_address,
                 "status": _window_status(intervals),
